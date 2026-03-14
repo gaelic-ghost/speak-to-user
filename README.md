@@ -1,74 +1,163 @@
 # speak-to-user
 
-`speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server that gives coding agents a reliable text-to-speech path for local user-facing playback. It wraps the [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) model, manages model lifecycle in-process, writes generated audio to disk, and can optionally play the result locally.
+`speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server for coding agents that need a dependable, host-local text-to-speech path for user-facing replies.
 
-The server is designed for agent workflows where spoken feedback should be available by default, but where runtime state still needs to be inspectable and controllable through MCP tools.
+It wraps [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), keeps model lifecycle management inside the server process, writes generated audio to disk, and can optionally play that audio directly on the host machine.
 
-## Features
+The current focus is simple and practical: give an agent one reliable way to speak to a local user without introducing a large framework surface or a remote service dependency.
 
-- FastMCP tool server with a small, focused TTS tool surface
-- Background model preload on startup instead of blocking server boot
+## Why This Exists
+
+Agent workflows often end with text output even when spoken output would be more natural, faster to consume, or more accessible. This server gives agents a small MCP tool surface for:
+
+- checking runtime readiness
+- loading and unloading the TTS model
+- generating local audio files
+- speaking a response out loud on the host machine
+
+That makes it useful as a local building block for Codex-style workflows, agent tooling experiments, accessibility support, and hands-free feedback loops.
+
+## Current Capabilities
+
+- FastMCP server with a focused TTS-oriented tool surface
+- Background model preload on startup
 - Automatic idle unloading to reclaim memory after inactivity
-- Runtime status introspection, including preload timestamps and the last error
-- Local audio generation in `wav` or `flac`
-- Local playback through the host machine for spoken replies
+- Runtime status inspection, including preload timing and last-error visibility
+- Local file generation in `wav` and `flac`
+- Local playback on macOS through the host machine
+- Host-local configuration through environment variables
 
 ## Requirements
 
 - macOS
 - [uv](https://docs.astral.sh/uv/)
 - Python 3.12
-- Enough local RAM / VRAM for the Qwen TTS model
+- Enough local memory for the Qwen TTS runtime
 
-## Install
+## Installation
 
 ```bash
 uv sync
 ```
 
-## Run The Server
+## Running The Server
 
 ```bash
 uv run python app/server.py
 ```
 
-When the server starts, it creates a `TTSRuntime`, starts an idle-unload watchdog, and kicks off model preload in a background thread. Startup does not fail just because preload is still running; use the `tts_status` tool to confirm readiness and inspect any preload error.
+On startup, the server:
+
+1. builds a `TTSRuntime` from environment configuration
+2. starts the idle-unload watchdog
+3. begins background preload of the TTS model
+
+Startup is intentionally non-blocking. If preload is still in progress, the server still comes up, and agents can inspect readiness through `tts_status`.
 
 ## MCP Tools
 
-The server exposes the following tools:
+### `health`
 
-- `health`: lightweight smoke check with a UTC timestamp
-- `tts_status`: reports runtime readiness, device, model state, preload timestamps, output directory, and `last_error`
-- `load_model`: loads the TTS model into memory on demand
-- `unload_model`: unloads the model manually
-- `set_idle_unload_timeout`: updates the automatic idle-unload threshold in seconds
-- `generate_audio`: synthesizes one local audio file and returns metadata
-- `speak_text`: synthesizes audio and plays it locally on the machine
+Returns a lightweight health payload with a UTC timestamp.
+
+### `tts_status`
+
+Returns current runtime state, including:
+
+- whether the model is loaded
+- whether preload is in progress
+- the resolved device
+- the configured model ID
+- idle-unload settings
+- key lifecycle timestamps
+- output directory
+- the last recorded error, if any
+
+### `load_model`
+
+Loads the TTS model into memory. If preload is already running, the call waits for preload to finish before deciding whether another load is needed.
+
+### `unload_model`
+
+Unloads the model manually and reports updated runtime state.
+
+### `set_idle_unload_timeout`
+
+Updates the automatic idle-unload timeout in seconds.
+
+### `generate_audio`
+
+Synthesizes a single audio file and returns metadata including:
+
+- output path
+- format
+- sample rate
+- sample count
+- duration
+- model ID
+- resolved device
+- normalized language
+
+### `speak_text`
+
+Generates audio and plays it locally on the host machine. This tool is registered as a FastMCP task and reports progress for:
+
+- generation
+- local playback
+- completion
 
 ## Configuration
 
 Environment variables:
 
-- `SPEAK_TO_USER_MODEL_ID`: model ID to load
+- `SPEAK_TO_USER_MODEL_ID`
   Default: `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
-- `SPEAK_TO_USER_IDLE_UNLOAD_SECONDS`: idle timeout before automatic unload
+- `SPEAK_TO_USER_IDLE_UNLOAD_SECONDS`
   Default: `1200`
-- `SPEAK_TO_USER_OUTPUT_DIR`: directory for generated audio files
+- `SPEAK_TO_USER_OUTPUT_DIR`
   Default: `generated-audio`
-- `SPEAK_TO_USER_DEVICE`: device preference
+- `SPEAK_TO_USER_DEVICE`
   Allowed values: `auto`, `mps`, `cpu`
   Default: `auto`
+
+## Output Behavior
+
+- Generated audio is written to the configured output directory.
+- Relative output directories are resolved from the repository root at runtime.
+- When no `filename_stem` is provided, files get a UTC timestamp-based name.
+- `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
+
+## Language And Voice Inputs
+
+The current runtime expects:
+
+- `text`: the speech content to synthesize
+- `voice_description`: an instruction-style description of the desired voice
+- `language`: defaults to `en`
+
+Some language aliases are normalized internally:
+
+- `en` and `english` become `English`
+- `zh` and `chinese` become `Chinese`
+- `auto` becomes `Auto`
+
+## Design Notes
+
+- The server is intentionally local-first.
+- Errors are captured in runtime state and surfaced via `tts_status` instead of crashing the process whenever possible.
+- The model can be unloaded after inactivity to reduce resource usage on a development machine.
+- The tool surface is deliberately small right now so agent integrations stay easy to reason about.
 
 ## Development
 
 Project layout:
 
 - `app/server.py`: FastMCP entrypoint and tool registration
-- `app/runtime.py`: model lifecycle, preload, idle unload, generation, and playback
-- `app/tools.py`: tool adapters that translate runtime operations into MCP payloads
+- `app/runtime.py`: runtime lifecycle, preload, idle unloading, generation, and playback
+- `app/tools.py`: tool adapters between FastMCP context and runtime operations
+- `tests/test_runtime.py`: runtime tests
 - `tests/test_server.py`: server and tool behavior tests
-- `tests/test_runtime.py`: runtime lifecycle and generation tests
+- `ROADMAP.md`: planned future work
 
 Validation commands:
 
@@ -78,8 +167,22 @@ uv run ruff check .
 uv run mypy .
 ```
 
-## Notes
+## Future Work
 
-- Generated audio is written under the configured output directory, which defaults to `generated-audio/` in the repository root.
-- `speak_text` is intended for local use on the host machine; it plays audio on the host instead of returning a remote-streaming session.
-- If preload fails, the error is recorded in runtime state and surfaced through `tts_status` rather than crashing the server process.
+Planned work currently includes:
+
+- queue-based speech generation
+- persistent file storage for batch generation
+- agent-facing guidance through MCP Prompts and Resources
+- guidance for chunking long replies
+- voice description profile support
+- voice profile selection through MCP user elicitation
+- automatic voice profile switching using FastMCP Context
+- FastMCP Apps and UI support
+- a related agent skill for consistent usage guidance
+- support for additional TTS runtimes
+- packaging and distribution on PyPI
+- composition with a FastAPI service
+- distribution as a macOS `MenuBarExtra` app
+
+Those plans are intentionally aspirational, not committed API guarantees. The current implementation is still centered on a compact, local MCP speech server.
