@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import datetime
-from pathlib import Path
 from typing import cast
 
 from fastmcp import Context
@@ -27,12 +26,6 @@ def _runtime_from_context(ctx: Context) -> TTSRuntime:
     if runtime is None:
         raise RuntimeError("TTS runtime is unavailable in lifespan context")
     return cast(TTSRuntime, runtime)
-
-
-def _delete_generated_audio(path: str) -> None:
-    audio_path = Path(path)
-    if audio_path.exists():
-        audio_path.unlink()
 
 
 # MARK: Tool Adapters
@@ -105,7 +98,7 @@ async def speak_text(
     chunk_queue = deque(chunks)
     chunk_count = len(chunks)
     generated_chunks: list[dict[str, object]] = []
-    total_steps = 1 + (chunk_count * 2)
+    total_steps = 1 + chunk_count
 
     await progress.set_total(total_steps)
     await progress.set_message(f"Queued {chunk_count} chunk(s) for speech generation")
@@ -116,21 +109,13 @@ async def speak_text(
         chunk_index += 1
         chunk_text = chunk_queue.popleft()
 
-        await progress.set_message(f"Generating chunk {chunk_index} of {chunk_count}")
-        generation_result = await asyncio.to_thread(
-            runtime.generate_audio,
+        await progress.set_message(f"Speaking chunk {chunk_index} of {chunk_count}")
+        playback_result = await asyncio.to_thread(
+            runtime.speak_text,
             text=chunk_text,
             voice_description=voice_description,
             language=language,
-            output_format="wav",
         )
-        await progress.increment()
-
-        try:
-            await progress.set_message(f"Playing chunk {chunk_index} of {chunk_count}")
-            playback_result = await asyncio.to_thread(runtime.play_audio, generation_result["path"])
-        finally:
-            await asyncio.to_thread(_delete_generated_audio, generation_result["path"])
         await progress.increment()
 
         generated_chunks.append(
@@ -138,13 +123,13 @@ async def speak_text(
                 "index": chunk_index,
                 "text": chunk_text,
                 "text_length": len(chunk_text),
-                "format": generation_result["format"],
-                "sample_rate": generation_result["sample_rate"],
-                "sample_count": generation_result["sample_count"],
-                "duration_seconds": generation_result["duration_seconds"],
-                "model_id": generation_result["model_id"],
-                "device": generation_result["device"],
-                "language": generation_result["language"],
+                "format": playback_result["format"],
+                "sample_rate": playback_result["sample_rate"],
+                "sample_count": playback_result["sample_count"],
+                "duration_seconds": playback_result["duration_seconds"],
+                "model_id": playback_result["model_id"],
+                "device": playback_result["device"],
+                "language": playback_result["language"],
                 "played": playback_result["played"],
                 "player": playback_result["player"],
             }

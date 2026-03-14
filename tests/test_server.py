@@ -32,8 +32,7 @@ class StubRuntime:
             "last_error": None,
         }
         self.generated_texts: list[str] = []
-        self.played_paths: list[str] = []
-        self.deleted_paths: list[str] = []
+        self.spoken_texts: list[str] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
@@ -66,9 +65,21 @@ class StubRuntime:
             **kwargs,
         }
 
-    def play_audio(self, path: str) -> dict[str, object]:
-        self.played_paths.append(path)
-        return {"result": "success", "path": path, "played": True, "player": "afplay"}
+    def speak_text(self, **kwargs: object) -> dict[str, object]:
+        text = str(kwargs.get("text", ""))
+        self.spoken_texts.append(text)
+        return {
+            "result": "success",
+            "format": "wav",
+            "sample_rate": 24000,
+            "sample_count": len(text),
+            "duration_seconds": 0.001,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": kwargs.get("language", "en"),
+            "played": True,
+            "player": "sounddevice",
+        }
 
 
 class StubProgress:
@@ -201,12 +212,11 @@ def test_speak_text_reports_progress_and_plays_audio() -> None:
 
     assert result["result"] == "success"
     assert result["played"] is True
-    assert progress.total == 3
-    assert progress.current == 3
+    assert progress.total == 2
+    assert progress.current == 2
     assert progress.messages == [
         "Queued 1 chunk(s) for speech generation",
-        "Generating chunk 1 of 1",
-        "Playing chunk 1 of 1",
+        "Speaking chunk 1 of 1",
         "Playback complete",
     ]
 
@@ -234,36 +244,6 @@ def test_speak_text_chunks_and_plays_in_fifo_order(monkeypatch) -> None:
     assert result["result"] == "success"
     assert result["chunked"] is True
     assert result["chunk_count"] == 3
-    assert runtime.generated_texts == chunked_text
-    assert runtime.played_paths == [
-        "/tmp/generated-audio/test-1.wav",
-        "/tmp/generated-audio/test-2.wav",
-        "/tmp/generated-audio/test-3.wav",
-    ]
-    assert progress.total == 7
-    assert progress.current == 7
-
-
-def test_speak_text_deletes_generated_audio_after_playback(monkeypatch) -> None:
-    runtime = StubRuntime()
-    ctx = StubContext(runtime)
-    progress = StubProgress()
-    deleted_paths: list[str] = []
-
-    monkeypatch.setattr("app.tools.Path.exists", lambda self: True)
-    monkeypatch.setattr("app.tools.Path.unlink", lambda self: deleted_paths.append(str(self)))
-
-    async def run() -> dict[str, object]:
-        from app.tools import speak_text as speak_text_tool
-
-        return await speak_text_tool(
-            cast(Context, ctx),
-            cast(Progress, progress),
-            text="hello there",
-            voice_description="warm",
-        )
-
-    result = asyncio.run(run())
-
-    assert result["result"] == "success"
-    assert deleted_paths == ["/tmp/generated-audio/test-1.wav"]
+    assert runtime.spoken_texts == chunked_text
+    assert progress.total == 4
+    assert progress.current == 4

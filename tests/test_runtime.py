@@ -158,6 +158,36 @@ def test_generate_audio_reloads_after_idle_unload(
     assert load_count["value"] == 2
 
 
+def test_speak_text_plays_audio_from_memory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    fake_model = FakeModel()
+    played: list[dict[str, object]] = []
+    waited = {"called": False}
+
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
+    monkeypatch.setattr(
+        "app.runtime.sd.play",
+        lambda waveform, sample_rate: played.append(
+            {"waveform": list(waveform), "sample_rate": sample_rate}
+        ),
+    )
+    monkeypatch.setattr("app.runtime.sd.wait", lambda: waited.__setitem__("called", True))
+
+    result = runtime.speak_text(
+        text="Hello there",
+        voice_description="Warm and calm",
+        language="en",
+    )
+
+    assert result["result"] == "success"
+    assert result["player"] == "sounddevice"
+    assert played == [{"waveform": [0.0, 0.1, 0.2], "sample_rate": 24000}]
+    assert waited["called"] is True
+
+
 def test_watchdog_unloads_after_idle_threshold(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

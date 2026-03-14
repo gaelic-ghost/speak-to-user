@@ -2,7 +2,7 @@
 
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server for coding agents that need a dependable, host-local text-to-speech path for user-facing replies.
 
-It wraps [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), keeps model lifecycle management inside the server process, writes generated audio to disk, and can optionally play that audio directly on the host machine.
+It wraps [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), keeps model lifecycle management inside the server process, writes generated audio to disk when explicitly requested, and can play speech directly from memory on the host machine.
 
 The current focus is simple and practical: give an agent one reliable way to speak to a local user without introducing a large framework surface or a remote service dependency.
 
@@ -100,10 +100,9 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it synthesizes temporary audio only long enough to play it, then deletes that audio after playback. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. Long text is automatically chunked into paragraph-oriented FIFO playback units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
+Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it synthesizes each chunk into an in-memory audio buffer and plays that buffer directly, instead of persisting a temporary file. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. Long text is automatically chunked into paragraph-oriented FIFO playback units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
 
-- generation
-- local playback
+- chunk playback
 - completion
 
 ## Configuration
@@ -122,11 +121,11 @@ Environment variables:
 
 ## Output Behavior
 
-- Generated audio is written to the configured output directory.
+- Generated audio is written to the configured output directory only for `generate_audio`.
 - Relative output directories are resolved from the repository root at runtime.
 - When no `filename_stem` is provided, files get a UTC timestamp-based name.
 - `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
-- `speak_text` is the exception: it uses temporary generated audio for local playback and then deletes it instead of exposing a saved file result.
+- `speak_text` is the exception: it keeps playback in memory and does not persist chunk audio to disk.
 
 ## Language And Voice Inputs
 

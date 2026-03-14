@@ -6,12 +6,13 @@ import datetime as dt
 import gc
 import os
 from pathlib import Path
-import subprocess
 import sys
 import threading
 import time
 from typing import Any
 
+import numpy as np
+import sounddevice as sd  # type: ignore[import-untyped]
 import soundfile as sf  # type: ignore[import-untyped]
 
 # MARK: Constants
@@ -296,63 +297,62 @@ class TTSRuntime:
         normalized_language = _normalize_language(language)
         output_path = self._build_output_path(filename_stem, normalized_format)
 
-        with self._lock:
-            if self._model is None:
-                self.load_model()
-
-            assert self._model is not None
-            try:
-                wavs, sample_rate = self._model.generate_voice_design(
-                    text=normalized_text,
-                    language=normalized_language,
-                    instruct=normalized_description,
-                )
-            except Exception as exc:
-                self._last_error = str(exc)
-                raise
-
-            waveform = self._coerce_waveform(wavs[0])
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            sf.write(output_path, waveform, sample_rate)
-
-            now = _utc_now()
-            self._last_error = None
-            self._touch_locked(now)
-
-            sample_count = len(waveform)
-            duration_seconds = round(sample_count / sample_rate, 3) if sample_rate else None
-            return {
-                "result": "success",
-                "path": str(output_path),
-                "format": normalized_format,
-                "sample_rate": sample_rate,
-                "sample_count": sample_count,
-                "duration_seconds": duration_seconds,
-                "model_id": self.model_id,
-                "device": self._resolved_device,
-                "language": normalized_language,
-            }
-
-    def play_audio(self, path: str | Path) -> dict[str, Any]:
-        audio_path = Path(path).expanduser().resolve()
-        if not audio_path.exists():
-            raise FileNotFoundError(f"audio file not found: {audio_path}")
-
-        completed = subprocess.run(
-            ["afplay", str(audio_path)],
-            check=False,
-            capture_output=True,
-            text=True,
+        synthesis_result = self._synthesize_audio(
+            text=normalized_text,
+            voice_description=normalized_description,
+            language=normalized_language,
         )
-        if completed.returncode != 0:
-            stderr = completed.stderr.strip() or "afplay failed"
-            raise RuntimeError(stderr)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        sf.write(output_path, synthesis_result["waveform"], synthesis_result["sample_rate"])
 
         return {
             "result": "success",
-            "path": str(audio_path),
+            "path": str(output_path),
+            "format": normalized_format,
+            "sample_rate": synthesis_result["sample_rate"],
+            "sample_count": synthesis_result["sample_count"],
+            "duration_seconds": synthesis_result["duration_seconds"],
+            "model_id": synthesis_result["model_id"],
+            "device": synthesis_result["device"],
+            "language": synthesis_result["language"],
+        }
+
+    def speak_text(
+        self,
+        *,
+        text: str,
+        voice_description: str,
+        language: str = "en",
+    ) -> dict[str, Any]:
+        normalized_text = text.strip()
+        if not normalized_text:
+            raise ValueError("text must not be empty")
+
+        normalized_description = voice_description.strip()
+        if not normalized_description:
+            raise ValueError("voice_description must not be empty")
+
+        normalized_language = _normalize_language(language)
+        synthesis_result = self._synthesize_audio(
+            text=normalized_text,
+            voice_description=normalized_description,
+            language=normalized_language,
+        )
+
+        sd.play(synthesis_result["waveform"], synthesis_result["sample_rate"])
+        sd.wait()
+
+        return {
+            "result": "success",
+            "format": "wav",
+            "sample_rate": synthesis_result["sample_rate"],
+            "sample_count": synthesis_result["sample_count"],
+            "duration_seconds": synthesis_result["duration_seconds"],
+            "model_id": synthesis_result["model_id"],
+            "device": synthesis_result["device"],
+            "language": synthesis_result["language"],
             "played": True,
-            "player": "afplay",
+            "player": "sounddevice",
         }
 
     def _watchdog_loop(self) -> None:
@@ -400,6 +400,45 @@ class TTSRuntime:
 
     def _build_output_path(self, filename_stem: str | None, output_format: str) -> Path:
         return self.output_dir / f"{_normalize_filename_stem(filename_stem)}.{output_format}"
+
+    def _synthesize_audio(
+        self,
+        *,
+        text: str,
+        voice_description: str,
+        language: str,
+    ) -> dict[str, Any]:
+        with self._lock:
+            if self._model is None:
+                self.load_model()
+
+            assert self._model is not None
+            try:
+                wavs, sample_rate = self._model.generate_voice_design(
+                    text=text,
+                    language=language,
+                    instruct=voice_description,
+                )
+            except Exception as exc:
+                self._last_error = str(exc)
+                raise
+
+            waveform = self._coerce_waveform(wavs[0])
+            now = _utc_now()
+            self._last_error = None
+            self._touch_locked(now)
+
+            sample_count = len(waveform)
+            duration_seconds = round(sample_count / sample_rate, 3) if sample_rate else None
+            return {
+                "waveform": waveform,
+                "sample_rate": sample_rate,
+                "sample_count": sample_count,
+                "duration_seconds": duration_seconds,
+                "model_id": self.model_id,
+                "device": self._resolved_device,
+                "language": language,
+            }
 
     def _load_model_impl(self) -> Any:
         with _suppress_default_stdout_prints_for_current_thread():
@@ -459,4 +498,7 @@ class TTSRuntime:
             waveform = waveform.cpu()
         if hasattr(waveform, "numpy"):
             waveform = waveform.numpy()
-        return waveform
+        waveform_array = np.asarray(waveform, dtype=np.float32)
+        if waveform_array.ndim > 1:
+            waveform_array = np.squeeze(waveform_array)
+        return waveform_array
