@@ -1,7 +1,7 @@
 [project]
-name = "speak-to-gale"
+name = "speak-to-user"
 version = "0.1.0"
-description = "A localhost FastMCP server for coding agents to interact with Gale via text to speech."
+description = "A localhost FastMCP server for coding agents to interact with users via text to speech."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 dependencies = [

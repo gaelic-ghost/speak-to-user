@@ -47,7 +47,7 @@ def _timestamp_value(value: dt.datetime | None) -> str | None:
 def _normalize_device(raw: str | None) -> str:
     value = (raw or "auto").strip().lower()
     if value not in {"auto", "cpu", "mps"}:
-        raise ValueError("SPEAK_TO_GALE_DEVICE must be one of: auto, cpu, mps")
+        raise ValueError("SPEAK_TO_USER_DEVICE must be one of: auto, cpu, mps")
     return value
 
 
@@ -145,20 +145,20 @@ class TTSRuntime:
     @classmethod
     def from_env(cls) -> TTSRuntime:
         idle_unload_seconds = int(
-            os.getenv("SPEAK_TO_GALE_IDLE_UNLOAD_SECONDS", str(DEFAULT_IDLE_UNLOAD_SECONDS))
+            os.getenv("SPEAK_TO_USER_IDLE_UNLOAD_SECONDS", str(DEFAULT_IDLE_UNLOAD_SECONDS))
         )
         if idle_unload_seconds <= 0:
-            raise ValueError("SPEAK_TO_GALE_IDLE_UNLOAD_SECONDS must be a positive integer")
+            raise ValueError("SPEAK_TO_USER_IDLE_UNLOAD_SECONDS must be a positive integer")
 
-        output_dir = Path(os.getenv("SPEAK_TO_GALE_OUTPUT_DIR", "generated-audio")).expanduser()
+        output_dir = Path(os.getenv("SPEAK_TO_USER_OUTPUT_DIR", "generated-audio")).expanduser()
         if not output_dir.is_absolute():
             output_dir = (Path.cwd() / output_dir).resolve()
 
         return cls(
-            model_id=os.getenv("SPEAK_TO_GALE_MODEL_ID", DEFAULT_MODEL_ID),
+            model_id=os.getenv("SPEAK_TO_USER_MODEL_ID", DEFAULT_MODEL_ID),
             idle_unload_seconds=idle_unload_seconds,
             output_dir=output_dir,
-            device_preference=_normalize_device(os.getenv("SPEAK_TO_GALE_DEVICE")),
+            device_preference=_normalize_device(os.getenv("SPEAK_TO_USER_DEVICE")),
         )
 
     def start_watchdog(self) -> None:
@@ -167,7 +167,7 @@ class TTSRuntime:
                 return
             self._watchdog_thread = threading.Thread(
                 target=self._watchdog_loop,
-                name="speak-to-gale-idle-watchdog",
+                name="speak-to-user-idle-watchdog",
                 daemon=True,
             )
             self._watchdog_started = True
@@ -188,7 +188,7 @@ class TTSRuntime:
             self._preload_complete.clear()
             self._preload_thread = threading.Thread(
                 target=self._background_preload_worker,
-                name="speak-to-gale-preload",
+                name="speak-to-user-preload",
                 daemon=True,
             )
             self._preload_thread.start()
@@ -422,7 +422,7 @@ class TTSRuntime:
             return "cpu"
         if self.device_preference == "mps":
             if not torch_module.backends.mps.is_available():
-                raise RuntimeError("SPEAK_TO_GALE_DEVICE=mps but torch MPS is unavailable")
+                raise RuntimeError("SPEAK_TO_USER_DEVICE=mps but torch MPS is unavailable")
             return "mps"
 
         if torch_module.backends.mps.is_available():

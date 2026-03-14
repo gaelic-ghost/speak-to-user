@@ -39,7 +39,7 @@ cache_store = MemoryStore()
 current_context = CurrentContext()
 task_progress = Progress()
 mcp = FastMCP(
-    "speak-to-gale",
+    "speak-to-user",
     lifespan=app_lifespan,
     session_state_store=cache_store,
 )

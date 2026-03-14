@@ -162,7 +162,7 @@ def test_server_module_imports_when_loaded_from_file_path() -> None:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    assert module.mcp.name == "speak-to-gale"
+    assert module.mcp.name == "speak-to-user"
 
 
 def test_speak_text_reports_progress_and_plays_audio() -> None:

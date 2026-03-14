@@ -1,1 +1,1 @@
-"""speak-to-gale FastMCP server package."""
+"""speak-to-user FastMCP server package."""

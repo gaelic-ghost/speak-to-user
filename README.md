@@ -1,6 +1,6 @@
-# speak-to-gale
+# speak-to-user
 
-`speak-to-gale` is a local [FastMCP](https://gofastmcp.com/) server that gives coding agents a reliable text-to-speech path on Gale's Mac. It wraps the [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) model, manages model lifecycle in-process, writes generated audio to disk, and can optionally play the result locally.
+`speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server that gives coding agents a reliable text-to-speech path for local user-facing playback. It wraps the [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) model, manages model lifecycle in-process, writes generated audio to disk, and can optionally play the result locally.
 
 The server is designed for agent workflows where spoken feedback should be available by default, but where runtime state still needs to be inspectable and controllable through MCP tools.
 
@@ -50,13 +50,13 @@ The server exposes the following tools:
 
 Environment variables:
 
-- `SPEAK_TO_GALE_MODEL_ID`: model ID to load
+- `SPEAK_TO_USER_MODEL_ID`: model ID to load
   Default: `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
-- `SPEAK_TO_GALE_IDLE_UNLOAD_SECONDS`: idle timeout before automatic unload
+- `SPEAK_TO_USER_IDLE_UNLOAD_SECONDS`: idle timeout before automatic unload
   Default: `1200`
-- `SPEAK_TO_GALE_OUTPUT_DIR`: directory for generated audio files
+- `SPEAK_TO_USER_OUTPUT_DIR`: directory for generated audio files
   Default: `generated-audio`
-- `SPEAK_TO_GALE_DEVICE`: device preference
+- `SPEAK_TO_USER_DEVICE`: device preference
   Allowed values: `auto`, `mps`, `cpu`
   Default: `auto`
 
@@ -81,5 +81,5 @@ uv run mypy .
 ## Notes
 
 - Generated audio is written under the configured output directory, which defaults to `generated-audio/` in the repository root.
-- `speak_text` is intended for local use on Gale's machine; it plays audio on the host instead of returning a remote-streaming session.
+- `speak_text` is intended for local use on the host machine; it plays audio on the host instead of returning a remote-streaming session.
 - If preload fails, the error is recorded in runtime state and surfaced through `tts_status` rather than crashing the server process.
