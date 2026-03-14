@@ -7,6 +7,7 @@ if __package__ in {None, ""}:
 from fastmcp import Context, FastMCP
 from fastmcp.dependencies import CurrentContext, Progress
 from fastmcp.server.lifespan import lifespan
+from fastmcp.server.tasks import TaskConfig
 from key_value.aio.stores.memory import MemoryStore
 
 from app.runtime import TTSRuntime
@@ -98,7 +99,7 @@ def generate_audio(
     )
 
 
-@mcp.tool(task=True)
+@mcp.tool(task=TaskConfig(mode="required"))
 async def speak_text(
     text: str,
     voice_description: str,

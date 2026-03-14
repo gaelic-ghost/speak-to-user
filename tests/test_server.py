@@ -165,6 +165,16 @@ def test_server_module_imports_when_loaded_from_file_path() -> None:
     assert module.mcp.name == "speak-to-user"
 
 
+def test_speak_text_requires_background_task_mode() -> None:
+    async def run() -> None:
+        tool = await server.mcp.get_tool("speak_text")
+        assert tool is not None
+        assert tool.task_config is not None
+        assert tool.task_config.mode == "required"
+
+    asyncio.run(run())
+
+
 def test_speak_text_reports_progress_and_plays_audio() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
