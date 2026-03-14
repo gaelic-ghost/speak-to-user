@@ -158,6 +158,7 @@ Project layout:
 - `tests/test_runtime.py`: runtime tests
 - `tests/test_server.py`: server and tool behavior tests
 - `ROADMAP.md`: planned future work
+- `WORKFLOWS.md`: end-to-end tool and data-shape flow reference
 
 Validation commands:
 
