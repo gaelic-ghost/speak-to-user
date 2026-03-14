@@ -31,6 +31,8 @@ class StubRuntime:
             "output_dir": "/tmp/generated-audio",
             "last_error": None,
         }
+        self.generated_texts: list[str] = []
+        self.played_paths: list[str] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
@@ -47,12 +49,15 @@ class StubRuntime:
         return payload
 
     def generate_audio(self, **kwargs: object) -> dict[str, object]:
+        text = str(kwargs.get("text", ""))
+        chunk_number = len(self.generated_texts) + 1
+        self.generated_texts.append(text)
         return {
             "result": "success",
-            "path": "/tmp/generated-audio/test.wav",
+            "path": f"/tmp/generated-audio/test-{chunk_number}.wav",
             "format": "wav",
             "sample_rate": 24000,
-            "sample_count": 3,
+            "sample_count": len(text),
             "duration_seconds": 0.001,
             "model_id": "Qwen/test-model",
             "device": "cpu",
@@ -61,6 +66,7 @@ class StubRuntime:
         }
 
     def play_audio(self, path: str) -> dict[str, object]:
+        self.played_paths.append(path)
         return {"result": "success", "path": path, "played": True, "player": "afplay"}
 
 
@@ -195,7 +201,41 @@ def test_speak_text_reports_progress_and_plays_audio() -> None:
     assert progress.total == 3
     assert progress.current == 3
     assert progress.messages == [
-        "Generating audio",
-        "Playing audio locally",
+        "Queued 1 chunk(s) for speech generation",
+        "Generating chunk 1 of 1",
+        "Playing chunk 1 of 1",
         "Playback complete",
     ]
+
+
+def test_speak_text_chunks_and_plays_in_fifo_order(monkeypatch) -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+    progress = StubProgress()
+    chunked_text = ["First chunk.", "Second chunk.", "Third chunk."]
+
+    monkeypatch.setattr("app.tools.chunk_text_for_tts", lambda text: list(chunked_text))
+
+    async def run() -> dict[str, object]:
+        from app.tools import speak_text as speak_text_tool
+
+        return await speak_text_tool(
+            cast(Context, ctx),
+            cast(Progress, progress),
+            text="ignored",
+            voice_description="warm",
+        )
+
+    result = asyncio.run(run())
+
+    assert result["result"] == "success"
+    assert result["chunked"] is True
+    assert result["chunk_count"] == 3
+    assert runtime.generated_texts == chunked_text
+    assert runtime.played_paths == [
+        "/tmp/generated-audio/test-1.wav",
+        "/tmp/generated-audio/test-2.wav",
+        "/tmp/generated-audio/test-3.wav",
+    ]
+    assert progress.total == 7
+    assert progress.current == 7

@@ -100,7 +100,7 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Generates audio and plays it locally on the host machine. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. It reports progress for:
+Generates audio and plays it locally on the host machine. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. Long text is automatically chunked into paragraph-oriented FIFO playback units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
 
 - generation
 - local playback
