@@ -446,15 +446,11 @@ class TTSRuntime:
             from qwen_tts import Qwen3TTSModel  # type: ignore[import-untyped]
 
             resolved_device = self._resolve_device(torch)
-            kwargs: dict[str, Any] = {"device_map": resolved_device}
-
-            if resolved_device == "mps":
-                kwargs["dtype"] = torch.float16
-            elif resolved_device == "cpu":
-                kwargs["dtype"] = torch.float32
-
             self._resolved_device = resolved_device
-            return Qwen3TTSModel.from_pretrained(self.model_id, **kwargs)
+            return Qwen3TTSModel.from_pretrained(
+                self.model_id,
+                device_map=resolved_device,
+            )
 
     def _resolve_device(self, torch_module: Any) -> str:
         if self.device_preference == "cpu":
