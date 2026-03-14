@@ -1,0 +1,2 @@
+- bootstrap uv project with FastMCP
+- 

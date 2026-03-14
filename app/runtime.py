@@ -1,0 +1,462 @@
+from __future__ import annotations
+
+import builtins
+import contextlib
+import datetime as dt
+import gc
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import time
+from typing import Any
+
+import soundfile as sf  # type: ignore[import-untyped]
+
+# MARK: Constants
+
+DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+DEFAULT_IDLE_UNLOAD_SECONDS = 1200
+ALLOWED_OUTPUT_FORMATS = {"wav", "flac"}
+LANGUAGE_ALIASES = {
+    "auto": "Auto",
+    "en": "English",
+    "english": "English",
+    "zh": "Chinese",
+    "chinese": "Chinese",
+}
+
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+_ORIGINAL_PRINT = builtins.print
+_PRINT_REDIRECT_LOCK = threading.RLock()
+_PRINT_REDIRECT_THREAD_COUNTS: dict[int, int] = {}
+_ACTIVE_PRINT_REDIRECTS = 0
+
+
+# MARK: Module Helpers
+
+def _utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.UTC)
+
+
+def _timestamp_value(value: dt.datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _normalize_device(raw: str | None) -> str:
+    value = (raw or "auto").strip().lower()
+    if value not in {"auto", "cpu", "mps"}:
+        raise ValueError("SPEAK_TO_GALE_DEVICE must be one of: auto, cpu, mps")
+    return value
+
+
+def _normalize_language(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("language must not be empty")
+    return LANGUAGE_ALIASES.get(normalized.lower(), normalized)
+
+
+def _normalize_filename_stem(value: str | None) -> str:
+    if not value:
+        return _utc_now().strftime("%Y%m%d-%H%M%S")
+
+    cleaned = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "-" for ch in value.strip())
+    cleaned = cleaned.strip("-_")
+    if not cleaned:
+        raise ValueError("filename_stem must contain at least one alphanumeric character")
+    return cleaned[:80]
+
+
+def safe_print(*args: Any, **kwargs: Any) -> None:
+    file = kwargs.get("file")
+    thread_id = threading.get_ident()
+    with _PRINT_REDIRECT_LOCK:
+        should_redirect = _PRINT_REDIRECT_THREAD_COUNTS.get(thread_id, 0) > 0
+
+    if should_redirect and (file is None or file is sys.stdout):
+        kwargs["file"] = sys.stderr
+
+    _ORIGINAL_PRINT(*args, **kwargs)
+
+
+@contextlib.contextmanager
+def _suppress_default_stdout_prints_for_current_thread() -> Any:
+    thread_id = threading.get_ident()
+    global _ACTIVE_PRINT_REDIRECTS
+
+    with _PRINT_REDIRECT_LOCK:
+        _PRINT_REDIRECT_THREAD_COUNTS[thread_id] = (
+            _PRINT_REDIRECT_THREAD_COUNTS.get(thread_id, 0) + 1
+        )
+        _ACTIVE_PRINT_REDIRECTS += 1
+        builtins.print = safe_print
+    try:
+        yield
+    finally:
+        with _PRINT_REDIRECT_LOCK:
+            remaining = _PRINT_REDIRECT_THREAD_COUNTS[thread_id] - 1
+            if remaining > 0:
+                _PRINT_REDIRECT_THREAD_COUNTS[thread_id] = remaining
+            else:
+                del _PRINT_REDIRECT_THREAD_COUNTS[thread_id]
+
+            _ACTIVE_PRINT_REDIRECTS -= 1
+            if _ACTIVE_PRINT_REDIRECTS == 0:
+                builtins.print = _ORIGINAL_PRINT
+
+
+# MARK: TTS Runtime
+
+
+class TTSRuntime:
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        idle_unload_seconds: int,
+        output_dir: Path,
+        device_preference: str,
+    ) -> None:
+        self.model_id = model_id
+        self.idle_unload_seconds = idle_unload_seconds
+        self.output_dir = output_dir
+        self.device_preference = device_preference
+
+        self._lock = threading.RLock()
+        self._watchdog_started = False
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._preload_complete = threading.Event()
+        self._preload_thread: threading.Thread | None = None
+        self._preload_in_progress = False
+
+        self._model: Any | None = None
+        self._resolved_device: str | None = None
+        self._last_error: str | None = None
+        self._last_used_monotonic: float | None = None
+        self._last_used_at: dt.datetime | None = None
+        self._last_loaded_at: dt.datetime | None = None
+        self._last_unloaded_at: dt.datetime | None = None
+        self._preload_started_at: dt.datetime | None = None
+        self._preload_completed_at: dt.datetime | None = None
+
+    @classmethod
+    def from_env(cls) -> TTSRuntime:
+        idle_unload_seconds = int(
+            os.getenv("SPEAK_TO_GALE_IDLE_UNLOAD_SECONDS", str(DEFAULT_IDLE_UNLOAD_SECONDS))
+        )
+        if idle_unload_seconds <= 0:
+            raise ValueError("SPEAK_TO_GALE_IDLE_UNLOAD_SECONDS must be a positive integer")
+
+        output_dir = Path(os.getenv("SPEAK_TO_GALE_OUTPUT_DIR", "generated-audio")).expanduser()
+        if not output_dir.is_absolute():
+            output_dir = (Path.cwd() / output_dir).resolve()
+
+        return cls(
+            model_id=os.getenv("SPEAK_TO_GALE_MODEL_ID", DEFAULT_MODEL_ID),
+            idle_unload_seconds=idle_unload_seconds,
+            output_dir=output_dir,
+            device_preference=_normalize_device(os.getenv("SPEAK_TO_GALE_DEVICE")),
+        )
+
+    def start_watchdog(self) -> None:
+        with self._lock:
+            if self._watchdog_started:
+                return
+            self._watchdog_thread = threading.Thread(
+                target=self._watchdog_loop,
+                name="speak-to-gale-idle-watchdog",
+                daemon=True,
+            )
+            self._watchdog_started = True
+            self._watchdog_thread.start()
+
+    def preload(self) -> None:
+        self.start_background_preload()
+
+    def start_background_preload(self) -> bool:
+        self.start_watchdog()
+        with self._lock:
+            if self._model is not None or self._preload_in_progress:
+                return False
+
+            self._preload_in_progress = True
+            self._preload_started_at = _utc_now()
+            self._preload_completed_at = None
+            self._preload_complete.clear()
+            self._preload_thread = threading.Thread(
+                target=self._background_preload_worker,
+                name="speak-to-gale-preload",
+                daemon=True,
+            )
+            self._preload_thread.start()
+            return True
+
+    def shutdown(self) -> None:
+        self._watchdog_stop.set()
+        preload_thread = self._preload_thread
+        if preload_thread is not None:
+            preload_thread.join(timeout=1)
+        thread = self._watchdog_thread
+        if thread is not None:
+            thread.join(timeout=1)
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return self._status_payload_locked()
+
+    def load_model(self) -> dict[str, Any]:
+        wait_for_preload = False
+        with self._lock:
+            if (
+                self._preload_in_progress
+                and self._preload_thread is not None
+                and self._preload_thread.ident != threading.get_ident()
+            ):
+                wait_for_preload = True
+
+        if wait_for_preload:
+            self._preload_complete.wait()
+
+        with self._lock:
+            if self._model is not None:
+                self._touch_locked()
+                return {
+                    "result": "success",
+                    "loaded": True,
+                    "info": "model already loaded",
+                    **self._status_payload_locked(),
+                }
+
+            try:
+                self._model = self._load_model_impl()
+            except Exception as exc:
+                self._last_error = str(exc)
+                raise
+
+            now = _utc_now()
+            self._last_error = None
+            self._last_loaded_at = now
+            self._touch_locked(now)
+            return {
+                "result": "success",
+                "loaded": True,
+                "info": "model loaded",
+                **self._status_payload_locked(),
+            }
+
+    def unload_model(self, reason: str = "manual") -> dict[str, Any]:
+        with self._lock:
+            if self._model is None:
+                return {
+                    "result": "success",
+                    "loaded": False,
+                    "info": "model already unloaded",
+                    **self._status_payload_locked(),
+                }
+
+            self._unload_locked(reason=reason)
+            return {
+                "result": "success",
+                "loaded": False,
+                "info": f"model unloaded ({reason})",
+                **self._status_payload_locked(),
+            }
+
+    def set_idle_unload_timeout(self, seconds: int) -> dict[str, Any]:
+        if seconds <= 0:
+            raise ValueError("seconds must be greater than zero")
+        with self._lock:
+            self.idle_unload_seconds = seconds
+            return self._status_payload_locked()
+
+    def generate_audio(
+        self,
+        *,
+        text: str,
+        voice_description: str,
+        language: str = "en",
+        output_format: str = "wav",
+        filename_stem: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_text = text.strip()
+        if not normalized_text:
+            raise ValueError("text must not be empty")
+
+        normalized_description = voice_description.strip()
+        if not normalized_description:
+            raise ValueError("voice_description must not be empty")
+
+        normalized_format = output_format.strip().lower()
+        if normalized_format not in ALLOWED_OUTPUT_FORMATS:
+            raise ValueError("output_format must be one of: wav, flac")
+
+        normalized_language = _normalize_language(language)
+        output_path = self._build_output_path(filename_stem, normalized_format)
+
+        with self._lock:
+            if self._model is None:
+                self.load_model()
+
+            assert self._model is not None
+            try:
+                wavs, sample_rate = self._model.generate_voice_design(
+                    text=normalized_text,
+                    language=normalized_language,
+                    instruct=normalized_description,
+                )
+            except Exception as exc:
+                self._last_error = str(exc)
+                raise
+
+            waveform = self._coerce_waveform(wavs[0])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            sf.write(output_path, waveform, sample_rate)
+
+            now = _utc_now()
+            self._last_error = None
+            self._touch_locked(now)
+
+            sample_count = len(waveform)
+            duration_seconds = round(sample_count / sample_rate, 3) if sample_rate else None
+            return {
+                "result": "success",
+                "path": str(output_path),
+                "format": normalized_format,
+                "sample_rate": sample_rate,
+                "sample_count": sample_count,
+                "duration_seconds": duration_seconds,
+                "model_id": self.model_id,
+                "device": self._resolved_device,
+                "language": normalized_language,
+            }
+
+    def play_audio(self, path: str | Path) -> dict[str, Any]:
+        audio_path = Path(path).expanduser().resolve()
+        if not audio_path.exists():
+            raise FileNotFoundError(f"audio file not found: {audio_path}")
+
+        completed = subprocess.run(
+            ["afplay", str(audio_path)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0:
+            stderr = completed.stderr.strip() or "afplay failed"
+            raise RuntimeError(stderr)
+
+        return {
+            "result": "success",
+            "path": str(audio_path),
+            "played": True,
+            "player": "afplay",
+        }
+
+    def _watchdog_loop(self) -> None:
+        while not self._watchdog_stop.wait(timeout=5):
+            with self._lock:
+                if self._model is None or self._last_used_monotonic is None:
+                    continue
+                idle_seconds = time.monotonic() - self._last_used_monotonic
+                if idle_seconds >= self.idle_unload_seconds:
+                    self._unload_locked(reason="idle timeout exceeded")
+
+    def _background_preload_worker(self) -> None:
+        try:
+            try:
+                self.load_model()
+            except Exception:
+                # load_model() already records last_error for status reporting
+                pass
+        finally:
+            with self._lock:
+                self._preload_in_progress = False
+                self._preload_completed_at = _utc_now()
+                self._preload_complete.set()
+
+    def _status_payload_locked(self) -> dict[str, Any]:
+        return {
+            "ready": self._last_error is None,
+            "model_loaded": self._model is not None,
+            "preload_in_progress": self._preload_in_progress,
+            "device": self._resolved_device,
+            "model_id": self.model_id,
+            "idle_unload_seconds": self.idle_unload_seconds,
+            "last_used_at": _timestamp_value(self._last_used_at),
+            "last_loaded_at": _timestamp_value(self._last_loaded_at),
+            "last_unloaded_at": _timestamp_value(self._last_unloaded_at),
+            "preload_started_at": _timestamp_value(self._preload_started_at),
+            "preload_completed_at": _timestamp_value(self._preload_completed_at),
+            "output_dir": str(self.output_dir),
+            "last_error": self._last_error,
+        }
+
+    def _touch_locked(self, value: dt.datetime | None = None) -> None:
+        self._last_used_at = value or _utc_now()
+        self._last_used_monotonic = time.monotonic()
+
+    def _build_output_path(self, filename_stem: str | None, output_format: str) -> Path:
+        return self.output_dir / f"{_normalize_filename_stem(filename_stem)}.{output_format}"
+
+    def _load_model_impl(self) -> Any:
+        with _suppress_default_stdout_prints_for_current_thread():
+            import torch
+            from qwen_tts import Qwen3TTSModel  # type: ignore[import-untyped]
+
+            resolved_device = self._resolve_device(torch)
+            kwargs: dict[str, Any] = {"device_map": resolved_device}
+
+            if resolved_device == "mps":
+                kwargs["dtype"] = torch.float16
+            elif resolved_device == "cpu":
+                kwargs["dtype"] = torch.float32
+
+            self._resolved_device = resolved_device
+            return Qwen3TTSModel.from_pretrained(self.model_id, **kwargs)
+
+    def _resolve_device(self, torch_module: Any) -> str:
+        if self.device_preference == "cpu":
+            return "cpu"
+        if self.device_preference == "mps":
+            if not torch_module.backends.mps.is_available():
+                raise RuntimeError("SPEAK_TO_GALE_DEVICE=mps but torch MPS is unavailable")
+            return "mps"
+
+        if torch_module.backends.mps.is_available():
+            return "mps"
+        return "cpu"
+
+    def _unload_locked(self, *, reason: str) -> None:
+        self._model = None
+        self._last_unloaded_at = _utc_now()
+        gc.collect()
+
+        try:
+            import torch
+        except ImportError:
+            return
+
+        if (
+            self._resolved_device == "mps"
+            and hasattr(torch, "mps")
+            and hasattr(torch.mps, "empty_cache")
+        ):
+            torch.mps.empty_cache()
+        elif (
+            self._resolved_device is not None
+            and self._resolved_device.startswith("cuda")
+            and torch.cuda.is_available()
+        ):
+            torch.cuda.empty_cache()
+
+    def _coerce_waveform(self, waveform: Any) -> Any:
+        if hasattr(waveform, "detach"):
+            waveform = waveform.detach()
+        if hasattr(waveform, "cpu"):
+            waveform = waveform.cpu()
+        if hasattr(waveform, "numpy"):
+            waveform = waveform.numpy()
+        return waveform
