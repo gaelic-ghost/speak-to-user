@@ -52,7 +52,7 @@ On startup, the server:
 2. starts the idle-unload watchdog
 3. begins background preload of the TTS model
 
-Startup is intentionally non-blocking. If preload is still in progress, the server still comes up, and agents can inspect readiness through `tts_status`.
+Startup is intentionally non-blocking. If preload is still in progress, the server still comes up, and agents can inspect readiness through `tts_status`. The `ready` field only flips to `true` once the model is actually loaded and no runtime error is recorded.
 
 ## MCP Tools
 
@@ -100,7 +100,7 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text, sends the full chunk list through one batched `generate_voice_design(...)` call, concatenates the returned waveform list into one in-memory audio buffer, and plays that single buffer directly instead of persisting temporary files. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
+Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text, sends the full chunk list through one batched `generate_voice_design(...)` call, concatenates the returned waveform list into one in-memory audio buffer, and plays that single buffer directly instead of persisting temporary files. This tool supports FastMCP background task execution and can also be called synchronously by clients that do not send task metadata, which improves compatibility with simpler MCP tool runners. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
 
 - generation
 - buffer concatenation
@@ -124,7 +124,7 @@ Environment variables:
 ## Output Behavior
 
 - Generated audio is written to the configured output directory only for `generate_audio`.
-- Relative output directories are resolved from the repository root at runtime.
+- Relative output directories are resolved from the current working directory at runtime.
 - When no `filename_stem` is provided, files get a UTC timestamp-based name.
 - `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
 - `speak_text` is the exception: it keeps playback in memory and does not persist chunk audio to disk.

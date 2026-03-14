@@ -128,6 +128,7 @@ class TTSRuntime:
         self._lock = threading.RLock()
         self._watchdog_started = False
         self._watchdog_stop = threading.Event()
+        self._shutdown_requested = threading.Event()
         self._watchdog_thread: threading.Thread | None = None
         self._preload_complete = threading.Event()
         self._preload_thread: threading.Thread | None = None
@@ -180,6 +181,8 @@ class TTSRuntime:
     def start_background_preload(self) -> bool:
         self.start_watchdog()
         with self._lock:
+            if self._shutdown_requested.is_set():
+                return False
             if self._model is not None or self._preload_in_progress:
                 return False
 
@@ -196,10 +199,14 @@ class TTSRuntime:
             return True
 
     def shutdown(self) -> None:
+        self._shutdown_requested.set()
         self._watchdog_stop.set()
         preload_thread = self._preload_thread
         if preload_thread is not None:
             preload_thread.join(timeout=1)
+        with self._lock:
+            if self._model is not None:
+                self._unload_locked(reason="server shutdown")
         thread = self._watchdog_thread
         if thread is not None:
             thread.join(timeout=1)
@@ -211,6 +218,8 @@ class TTSRuntime:
     def load_model(self) -> dict[str, Any]:
         wait_for_preload = False
         with self._lock:
+            if self._shutdown_requested.is_set():
+                raise RuntimeError("runtime is shutting down")
             if (
                 self._preload_in_progress
                 and self._preload_thread is not None
@@ -232,12 +241,24 @@ class TTSRuntime:
                 }
 
             try:
-                self._model = self._load_model_impl()
+                loaded_model = self._load_model_impl()
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
             now = _utc_now()
+            if self._shutdown_requested.is_set():
+                self._release_model_resources(loaded_model, resolved_device=self._resolved_device)
+                self._resolved_device = None
+                self._last_unloaded_at = now
+                return {
+                    "result": "success",
+                    "loaded": False,
+                    "info": "model load aborted during shutdown",
+                    **self._status_payload_locked(),
+                }
+
+            self._model = loaded_model
             self._last_error = None
             self._last_loaded_at = now
             self._touch_locked(now)
@@ -391,7 +412,7 @@ class TTSRuntime:
 
     def _status_payload_locked(self) -> dict[str, Any]:
         return {
-            "ready": self._last_error is None,
+            "ready": self._model is not None and self._last_error is None,
             "model_loaded": self._model is not None,
             "preload_in_progress": self._preload_in_progress,
             "device": self._resolved_device,
@@ -513,8 +534,14 @@ class TTSRuntime:
         return "cpu"
 
     def _unload_locked(self, *, reason: str) -> None:
+        model = self._model
+        resolved_device = self._resolved_device
         self._model = None
         self._last_unloaded_at = _utc_now()
+        self._release_model_resources(model, resolved_device=resolved_device)
+
+    def _release_model_resources(self, model: Any | None, *, resolved_device: str | None) -> None:
+        del model
         gc.collect()
 
         try:
@@ -522,15 +549,11 @@ class TTSRuntime:
         except ImportError:
             return
 
-        if (
-            self._resolved_device == "mps"
-            and hasattr(torch, "mps")
-            and hasattr(torch.mps, "empty_cache")
-        ):
+        if resolved_device == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
             torch.mps.empty_cache()
         elif (
-            self._resolved_device is not None
-            and self._resolved_device.startswith("cuda")
+            resolved_device is not None
+            and resolved_device.startswith("cuda")
             and torch.cuda.is_available()
         ):
             torch.cuda.empty_cache()

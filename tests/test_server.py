@@ -161,10 +161,6 @@ def test_app_lifespan_starts_background_preload_and_shuts_down(monkeypatch) -> N
             events.append("background-preload")
             return True
 
-        def unload_model(self, reason: str = "manual") -> dict[str, object]:
-            events.append(f"unload:{reason}")
-            return {"result": "success"}
-
         def shutdown(self) -> None:
             events.append("shutdown")
 
@@ -177,7 +173,7 @@ def test_app_lifespan_starts_background_preload_and_shuts_down(monkeypatch) -> N
 
     asyncio.run(run_lifespan())
 
-    assert events == ["background-preload", "yielded", "unload:server shutdown", "shutdown"]
+    assert events == ["background-preload", "yielded", "shutdown"]
 
 
 def test_server_module_imports_when_loaded_from_file_path() -> None:
@@ -198,7 +194,7 @@ def test_speak_text_requires_background_task_mode() -> None:
         tool = await server.mcp.get_tool("speak_text")
         assert tool is not None
         assert tool.task_config is not None
-        assert tool.task_config.mode == "required"
+        assert tool.task_config.mode == "optional"
         assert "output_format" not in tool.parameters
         assert "filename_stem" not in tool.parameters
 

@@ -30,10 +30,7 @@ async def app_lifespan(_server: FastMCP):
     try:
         yield {"runtime": runtime}
     finally:
-        try:
-            runtime.unload_model(reason="server shutdown")
-        finally:
-            runtime.shutdown()
+        runtime.shutdown()
 
 
 cache_store = MemoryStore()
@@ -99,7 +96,7 @@ def generate_audio(
     )
 
 
-@mcp.tool(task=TaskConfig(mode="required"))
+@mcp.tool(task=TaskConfig(mode="optional"))
 async def speak_text(
     text: str,
     voice_description: str,

@@ -363,6 +363,56 @@ def test_background_preload_worker_records_error_without_raising(
     assert status["last_error"] == "preload failed"
 
 
+def test_status_ready_requires_loaded_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+
+    assert runtime.status()["ready"] is False
+
+    runtime._preload_in_progress = True
+    assert runtime.status()["ready"] is False
+
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
+    runtime._preload_in_progress = False
+    runtime.load_model()
+
+    assert runtime.status()["ready"] is True
+
+    runtime.unload_model()
+    assert runtime.status()["ready"] is False
+
+
+def test_load_model_releases_model_when_shutdown_requested_mid_load(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    released: list[tuple[object | None, str | None]] = []
+
+    def load_impl() -> FakeModel:
+        runtime._shutdown_requested.set()
+        return FakeModel()
+
+    monkeypatch.setattr(runtime, "_load_model_impl", load_impl)
+    monkeypatch.setattr(
+        runtime,
+        "_release_model_resources",
+        lambda model, *, resolved_device: released.append((model, resolved_device)),
+    )
+
+    result = runtime.load_model()
+
+    assert result["result"] == "success"
+    assert result["loaded"] is False
+    assert result["info"] == "model load aborted during shutdown"
+    assert runtime.status()["model_loaded"] is False
+    assert len(released) == 1
+    assert isinstance(released[0][0], FakeModel)
+    assert released[0][1] is None
+
+
 def test_status_reports_timestamps(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
     fake_now = dt.datetime(2026, 3, 14, 17, 0, tzinfo=dt.UTC)
