@@ -100,9 +100,11 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it synthesizes each chunk into an in-memory audio buffer and plays that buffer directly, instead of persisting a temporary file. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. Long text is automatically chunked into paragraph-oriented FIFO playback units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
+Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text, sends the full chunk list through one batched `generate_voice_design(...)` call, concatenates the returned waveform list into one in-memory audio buffer, and plays that single buffer directly instead of persisting temporary files. This tool is registered as a FastMCP background task and requires task execution instead of foreground execution, which helps clients avoid request timeouts during synthesis and playback. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
 
-- chunk playback
+- generation
+- buffer concatenation
+- buffer playback
 - completion
 
 ## Configuration

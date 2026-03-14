@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from collections import deque
 import datetime
 from typing import cast
 
@@ -95,65 +94,36 @@ async def speak_text(
     if not chunks:
         raise ValueError("text must not be empty")
 
-    chunk_queue = deque(chunks)
     chunk_count = len(chunks)
-    generated_chunks: list[dict[str, object]] = []
-    total_steps = 1 + chunk_count
+    total_steps = 4
 
     await progress.set_total(total_steps)
     await progress.set_message(f"Queued {chunk_count} chunk(s) for speech generation")
     await progress.increment()
 
-    chunk_index = 0
-    while chunk_queue:
-        chunk_index += 1
-        chunk_text = chunk_queue.popleft()
+    await progress.set_message("Generating speech chunks")
+    await progress.increment()
 
-        await progress.set_message(f"Speaking chunk {chunk_index} of {chunk_count}")
-        playback_result = await asyncio.to_thread(
-            runtime.speak_text,
-            text=chunk_text,
-            voice_description=voice_description,
-            language=language,
-        )
-        await progress.increment()
+    await progress.set_message("Concatenating audio buffer")
+    buffer_result = await asyncio.to_thread(
+        runtime.generate_speech_buffer,
+        chunks=chunks,
+        voice_description=voice_description,
+        language=language,
+    )
+    await progress.increment()
 
-        generated_chunks.append(
-            {
-                "index": chunk_index,
-                "text": chunk_text,
-                "text_length": len(chunk_text),
-                "format": playback_result["format"],
-                "sample_rate": playback_result["sample_rate"],
-                "sample_count": playback_result["sample_count"],
-                "duration_seconds": playback_result["duration_seconds"],
-                "model_id": playback_result["model_id"],
-                "device": playback_result["device"],
-                "language": playback_result["language"],
-                "played": playback_result["played"],
-                "player": playback_result["player"],
-            }
-        )
+    await progress.set_message("Playing audio buffer")
+    playback_result = await asyncio.to_thread(
+        runtime.play_audio_buffer,
+        buffer_result["waveform"],
+        cast(int, buffer_result["sample_rate"]),
+    )
+    await progress.increment()
 
     await progress.set_message("Playback complete")
-
-    last_chunk = generated_chunks[-1]
-    total_duration_seconds = round(
-        sum(cast(float, chunk["duration_seconds"]) for chunk in generated_chunks),
-        3,
-    )
     return {
         "result": "success",
-        "chunked": chunk_count > 1,
-        "chunk_count": chunk_count,
-        "chunks": generated_chunks,
-        "format": last_chunk["format"],
-        "sample_rate": last_chunk["sample_rate"],
-        "sample_count": last_chunk["sample_count"],
-        "duration_seconds": total_duration_seconds,
-        "model_id": last_chunk["model_id"],
-        "device": last_chunk["device"],
-        "language": last_chunk["language"],
-        "played": True,
-        "player": last_chunk["player"],
+        **{key: value for key, value in buffer_result.items() if key != "waveform"},
+        **playback_result,
     }

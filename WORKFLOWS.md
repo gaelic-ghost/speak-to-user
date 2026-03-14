@@ -254,20 +254,18 @@ flowchart LR
     B --> D["chunk_text_for_tts(text)"]
     D --> E["_chunk_sentences(...) / _chunk_words(...) / _split_long_word(...)"]
     D --> F["list[str] chunks"]
-    F --> G["deque[str] chunk_queue"]
-    G --> H["async Progress setup"]
-    H --> I["loop over FIFO chunks"]
-    I --> J["asyncio.to_thread(runtime.speak_text, chunk, ...)"]
-    J --> K["runtime.speak_text(...)"]
-    K --> L["normalize text/voice_description/language"]
-    L --> M["_synthesize_audio(...)"]
-    M --> N["np.ndarray waveform + sample_rate"]
-    N --> O["sd.play(waveform, sample_rate)"]
-    O --> P["sd.wait()"]
-    P --> Q["playback_result dict[str, object]"]
-    Q --> R["append per-chunk record"]
-    R --> S["list[dict[str, object]] generated_chunks"]
-    S --> T["aggregate final success payload"]
+    F --> G["async Progress setup"]
+    G --> H["asyncio.to_thread(runtime.generate_speech_buffer, chunks, ...)"]
+    H --> I["runtime.generate_speech_buffer(...)"]
+    I --> J["normalize chunks/voice_description/language"]
+    J --> K["_synthesize_audio_batch(...)"]
+    K --> L["list[np.ndarray] waveforms + sample_rate"]
+    L --> M["_concatenate_waveforms(...)"]
+    M --> N["single np.ndarray audio buffer"]
+    N --> O["asyncio.to_thread(runtime.play_audio_buffer, waveform, sample_rate)"]
+    O --> P["sd.play(waveform, sample_rate)"]
+    P --> Q["sd.wait()"]
+    Q --> R["aggregate final success payload"]
 ```
 
 ### Flow
@@ -279,34 +277,22 @@ The adapter layer:
 1. resolves the runtime from context
 2. chunks the input text
 3. initializes FastMCP task progress
-4. iterates over the chunk queue in FIFO order
-5. hands each chunk to `runtime.speak_text()` through `asyncio.to_thread(...)`
-6. accumulates per-chunk playback metadata
-7. assembles one aggregate result payload after the last chunk
-
-The runtime path for each chunk:
-
-1. validates and normalizes the chunk input
-2. synthesizes audio in memory through `_synthesize_audio()`
-3. passes the waveform buffer directly to `sounddevice`
-4. waits for playback completion
-5. returns chunk playback metadata
+4. sends the full chunk list to `runtime.generate_speech_buffer()` through `asyncio.to_thread(...)`
+5. sends the concatenated waveform buffer to `runtime.play_audio_buffer()` through `asyncio.to_thread(...)`
+6. assembles one aggregate result payload
 
 Unlike older disk-backed playback designs, this path does not persist temporary audio files.
 
 ### Data Shape Transitions
 
 - input `text: str` -> `list[str]` chunk list
-- `list[str]` -> `deque[str]`
-- `deque[str]` -> one chunk `str` per loop iteration
 - async task state -> progress side effects through `Progress.set_total()`, `set_message()`, and `increment()`
-- chunk `str` -> worker-thread runtime call through `asyncio.to_thread(...)`
-- normalized chunk inputs -> runtime synthesis metadata `dict[str, object]`
-- model output `(wavs, sample_rate)` -> `np.ndarray[np.float32]` waveform + `int` sample rate
-- waveform buffer + sample rate -> host playback side effect through `sd.play()` / `sd.wait()`
-- runtime playback result `dict[str, object]` -> per-chunk record `dict[str, object]` with adapter-added `index`, `text`, and `text_length`
-- `list[dict[str, object]]` -> final aggregate success payload `dict[str, object]`
-- per-chunk durations `list[float]` -> summed `duration_seconds: float`
+- `list[str]` -> worker-thread runtime call through `asyncio.to_thread(...)`
+- normalized chunk inputs -> batched model inputs `text: list[str]`, `language: list[str]`, `instruct: list[str]`
+- model output `(wavs, sample_rate)` -> `list[np.ndarray[np.float32]]` + `int`
+- `list[np.ndarray]` -> single concatenated `np.ndarray[np.float32]`
+- concatenated waveform buffer + sample rate -> host playback side effect through `sd.play()` / `sd.wait()`
+- runtime buffer result `dict[str, object]` + playback result `dict[str, object]` -> final aggregate success payload `dict[str, object]`
 
 ### Errors
 

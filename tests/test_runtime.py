@@ -24,12 +24,13 @@ class FakeModel:
     def generate_voice_design(
         self,
         *,
-        text: str,
-        language: str,
-        instruct: str,
+        text: str | list[str],
+        language: str | list[str],
+        instruct: str | list[str],
     ) -> tuple[list[list[float]], int]:
         self.calls.append({"text": text, "language": language, "instruct": instruct})
-        return [self.waveform], self.sample_rate
+        batch_size = len(text) if isinstance(text, list) else 1
+        return [list(self.waveform) for _ in range(batch_size)], self.sample_rate
 
 
 def make_runtime(tmp_path: Path) -> TTSRuntime:
@@ -132,7 +133,7 @@ def test_generate_audio_writes_file_and_returns_metadata(
     assert result["sample_rate"] == 24000
     assert result["sample_count"] == 3
     assert cast(Path, writes[0]["path"]).name == "greeting.wav"
-    assert fake_model.calls[0]["language"] == "English"
+    assert fake_model.calls[0]["language"] == ["English"]
 
 
 def test_generate_audio_reloads_after_idle_unload(
@@ -158,16 +159,42 @@ def test_generate_audio_reloads_after_idle_unload(
     assert load_count["value"] == 2
 
 
-def test_speak_text_plays_audio_from_memory(
+def test_generate_speech_buffer_batches_chunks(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
     fake_model = FakeModel()
+
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
+
+    result = runtime.generate_speech_buffer(
+        chunks=["Hello there", "General Kenobi"],
+        voice_description="Warm and calm",
+        language="en",
+    )
+
+    assert result["result"] == "success"
+    assert result["chunk_count"] == 2
+    waveform = cast(runtime_module.np.ndarray, result["waveform"])
+    assert waveform.tolist() == [0.0, 0.1, 0.2, 0.0, 0.1, 0.2]
+    assert fake_model.calls == [
+        {
+            "text": ["Hello there", "General Kenobi"],
+            "language": ["English", "English"],
+            "instruct": ["Warm and calm", "Warm and calm"],
+        }
+    ]
+
+
+def test_play_audio_buffer_uses_sounddevice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
     played: list[dict[str, object]] = []
     waited = {"called": False}
 
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
     monkeypatch.setattr(
         "app.runtime.sd.play",
         lambda waveform, sample_rate: played.append(
@@ -176,14 +203,10 @@ def test_speak_text_plays_audio_from_memory(
     )
     monkeypatch.setattr("app.runtime.sd.wait", lambda: waited.__setitem__("called", True))
 
-    result = runtime.speak_text(
-        text="Hello there",
-        voice_description="Warm and calm",
-        language="en",
-    )
+    waveform = runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32)
+    result = runtime.play_audio_buffer(waveform, 24000)
 
-    assert result["result"] == "success"
-    assert result["player"] == "sounddevice"
+    assert result == {"result": "success", "played": True, "player": "sounddevice"}
     assert played == [{"waveform": [0.0, 0.1, 0.2], "sample_rate": 24000}]
     assert waited["called"] is True
 

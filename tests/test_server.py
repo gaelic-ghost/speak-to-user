@@ -32,7 +32,8 @@ class StubRuntime:
             "last_error": None,
         }
         self.generated_texts: list[str] = []
-        self.spoken_texts: list[str] = []
+        self.generated_batches: list[list[str]] = []
+        self.played_buffers: list[dict[str, object]] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
@@ -65,18 +66,27 @@ class StubRuntime:
             **kwargs,
         }
 
-    def speak_text(self, **kwargs: object) -> dict[str, object]:
-        text = str(kwargs.get("text", ""))
-        self.spoken_texts.append(text)
+    def generate_speech_buffer(self, **kwargs: object) -> dict[str, object]:
+        chunks = list(cast(list[str], kwargs.get("chunks", [])))
+        self.generated_batches.append(chunks)
         return {
             "result": "success",
             "format": "wav",
             "sample_rate": 24000,
-            "sample_count": len(text),
-            "duration_seconds": 0.001,
+            "chunked": len(chunks) > 1,
+            "chunk_count": len(chunks),
+            "sample_count": sum(len(chunk) for chunk in chunks),
+            "duration_seconds": 0.003,
             "model_id": "Qwen/test-model",
             "device": "cpu",
             "language": kwargs.get("language", "en"),
+            "waveform": [0.1] * max(sum(len(chunk) for chunk in chunks), 1),
+        }
+
+    def play_audio_buffer(self, waveform: object, sample_rate: int) -> dict[str, object]:
+        self.played_buffers.append({"waveform": waveform, "sample_rate": sample_rate})
+        return {
+            "result": "success",
             "played": True,
             "player": "sounddevice",
         }
@@ -212,11 +222,14 @@ def test_speak_text_reports_progress_and_plays_audio() -> None:
 
     assert result["result"] == "success"
     assert result["played"] is True
-    assert progress.total == 2
-    assert progress.current == 2
+    assert result["chunk_count"] == 1
+    assert progress.total == 4
+    assert progress.current == 4
     assert progress.messages == [
         "Queued 1 chunk(s) for speech generation",
-        "Speaking chunk 1 of 1",
+        "Generating speech chunks",
+        "Concatenating audio buffer",
+        "Playing audio buffer",
         "Playback complete",
     ]
 
@@ -244,6 +257,7 @@ def test_speak_text_chunks_and_plays_in_fifo_order(monkeypatch) -> None:
     assert result["result"] == "success"
     assert result["chunked"] is True
     assert result["chunk_count"] == 3
-    assert runtime.spoken_texts == chunked_text
+    assert runtime.generated_batches == [chunked_text]
+    assert runtime.played_buffers
     assert progress.total == 4
     assert progress.current == 4

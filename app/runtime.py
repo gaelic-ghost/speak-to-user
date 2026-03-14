@@ -317,40 +317,52 @@ class TTSRuntime:
             "language": synthesis_result["language"],
         }
 
-    def speak_text(
+    def generate_speech_buffer(
         self,
         *,
-        text: str,
+        chunks: list[str],
         voice_description: str,
         language: str = "en",
     ) -> dict[str, Any]:
-        normalized_text = text.strip()
-        if not normalized_text:
-            raise ValueError("text must not be empty")
+        if not chunks:
+            raise ValueError("chunks must not be empty")
 
         normalized_description = voice_description.strip()
         if not normalized_description:
             raise ValueError("voice_description must not be empty")
 
         normalized_language = _normalize_language(language)
-        synthesis_result = self._synthesize_audio(
-            text=normalized_text,
+        normalized_chunks = self._normalize_chunks(chunks)
+        batch_result = self._synthesize_audio_batch(
+            texts=normalized_chunks,
             voice_description=normalized_description,
             language=normalized_language,
         )
-
-        sd.play(synthesis_result["waveform"], synthesis_result["sample_rate"])
-        sd.wait()
+        waveform = self._concatenate_waveforms(batch_result["waveforms"])
 
         return {
             "result": "success",
             "format": "wav",
-            "sample_rate": synthesis_result["sample_rate"],
-            "sample_count": synthesis_result["sample_count"],
-            "duration_seconds": synthesis_result["duration_seconds"],
-            "model_id": synthesis_result["model_id"],
-            "device": synthesis_result["device"],
-            "language": synthesis_result["language"],
+            "chunked": len(normalized_chunks) > 1,
+            "chunk_count": len(normalized_chunks),
+            "sample_rate": batch_result["sample_rate"],
+            "sample_count": len(waveform),
+            "duration_seconds": round(len(waveform) / batch_result["sample_rate"], 3),
+            "model_id": batch_result["model_id"],
+            "device": batch_result["device"],
+            "language": batch_result["language"],
+            "waveform": waveform,
+        }
+
+    def play_audio_buffer(
+        self,
+        waveform: np.ndarray,
+        sample_rate: int,
+    ) -> dict[str, Any]:
+        sd.play(waveform, sample_rate)
+        sd.wait()
+        return {
+            "result": "success",
             "played": True,
             "player": "sounddevice",
         }
@@ -401,10 +413,42 @@ class TTSRuntime:
     def _build_output_path(self, filename_stem: str | None, output_format: str) -> Path:
         return self.output_dir / f"{_normalize_filename_stem(filename_stem)}.{output_format}"
 
+    def _normalize_chunks(self, chunks: list[str]) -> list[str]:
+        normalized_chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
+        if not normalized_chunks:
+            raise ValueError("chunks must not be empty")
+        return normalized_chunks
+
     def _synthesize_audio(
         self,
         *,
         text: str,
+        voice_description: str,
+        language: str,
+    ) -> dict[str, Any]:
+        batch_result = self._synthesize_audio_batch(
+            texts=[text],
+            voice_description=voice_description,
+            language=language,
+        )
+        waveform = batch_result["waveforms"][0]
+        sample_rate = batch_result["sample_rate"]
+        sample_count = len(waveform)
+        duration_seconds = round(sample_count / sample_rate, 3) if sample_rate else None
+        return {
+            "waveform": waveform,
+            "sample_rate": sample_rate,
+            "sample_count": sample_count,
+            "duration_seconds": duration_seconds,
+            "model_id": batch_result["model_id"],
+            "device": batch_result["device"],
+            "language": batch_result["language"],
+        }
+
+    def _synthesize_audio_batch(
+        self,
+        *,
+        texts: list[str],
         voice_description: str,
         language: str,
     ) -> dict[str, Any]:
@@ -415,30 +459,31 @@ class TTSRuntime:
             assert self._model is not None
             try:
                 wavs, sample_rate = self._model.generate_voice_design(
-                    text=text,
-                    language=language,
-                    instruct=voice_description,
+                    text=texts,
+                    language=[language] * len(texts),
+                    instruct=[voice_description] * len(texts),
                 )
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
-            waveform = self._coerce_waveform(wavs[0])
+            waveforms = [self._coerce_waveform(waveform) for waveform in wavs]
             now = _utc_now()
             self._last_error = None
             self._touch_locked(now)
 
-            sample_count = len(waveform)
-            duration_seconds = round(sample_count / sample_rate, 3) if sample_rate else None
             return {
-                "waveform": waveform,
+                "waveforms": waveforms,
                 "sample_rate": sample_rate,
-                "sample_count": sample_count,
-                "duration_seconds": duration_seconds,
                 "model_id": self.model_id,
                 "device": self._resolved_device,
                 "language": language,
             }
+
+    def _concatenate_waveforms(self, waveforms: list[Any]) -> np.ndarray:
+        if not waveforms:
+            raise ValueError("waveforms must not be empty")
+        return np.concatenate([np.asarray(waveform, dtype=np.float32) for waveform in waveforms])
 
     def _load_model_impl(self) -> Any:
         with _suppress_default_stdout_prints_for_current_thread():
