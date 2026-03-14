@@ -8,6 +8,7 @@ from fastmcp import Context, FastMCP
 from fastmcp.dependencies import CurrentContext
 from fastmcp.server.lifespan import lifespan
 
+from app.resources import speak_text_process_resource
 from app.runtime import TTSRuntime
 from app.tools import (
     generate_audio as generate_audio_tool,
@@ -40,6 +41,16 @@ mcp = FastMCP(
 def health() -> dict[str, str]:
     """Return a lightweight health payload for smoke testing."""
     return health_payload()
+
+
+@mcp.resource(
+    "info://speak-text-process",
+    name="speak_text process",
+    description="Agent-facing explanation of the detached local playback path used by speak_text.",
+    mime_type="text/markdown",
+)
+def speak_text_process() -> str:
+    return speak_text_process_resource()
 
 
 @mcp.tool

@@ -205,6 +205,17 @@ def test_server_module_imports_when_loaded_from_file_path() -> None:
     assert module.mcp.name == "speak-to-user"
 
 
+def test_speak_text_process_resource_is_registered() -> None:
+    async def run() -> None:
+        resource = await server.mcp.get_resource("info://speak-text-process")
+        assert resource is not None
+        assert resource.mime_type == "text/markdown"
+        assert resource.name == "speak_text process"
+        assert "detached local playback path" in (resource.description or "")
+
+    asyncio.run(run())
+
+
 def test_speak_text_is_plain_tool() -> None:
     async def run() -> None:
         tool = await server.mcp.get_tool("speak_text")
