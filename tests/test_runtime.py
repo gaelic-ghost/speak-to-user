@@ -37,6 +37,7 @@ def make_runtime(tmp_path: Path) -> TTSRuntime:
     return TTSRuntime(
         model_id="Qwen/test-model",
         idle_unload_seconds=10,
+        speech_queue_maxsize=4,
         output_dir=tmp_path / "generated-audio",
         device_preference="cpu",
     )
@@ -232,6 +233,68 @@ def test_enqueue_speech_returns_queue_metadata(
     assert result["language"] == "English"
     assert result["speech_jobs_queued"] == 1
     assert result["speech_queue_depth"] == 1
+    assert result["speech_queue_maxsize"] == 4
+
+
+def test_enqueue_speech_rejects_when_queue_is_full(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = TTSRuntime(
+        model_id="Qwen/test-model",
+        idle_unload_seconds=10,
+        speech_queue_maxsize=1,
+        output_dir=tmp_path / "generated-audio",
+        device_preference="cpu",
+    )
+
+    class FakeThread:
+        ident = 999
+
+        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self) -> None:
+            return None
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+    monkeypatch.setattr("app.runtime.threading.Thread", FakeThread)
+
+    runtime.enqueue_speech(
+        chunks=["Hello there"],
+        voice_description="Warm and calm",
+        language="en",
+    )
+
+    with pytest.raises(RuntimeError, match="pending speak_text job\\(s\\) are already waiting"):
+        runtime.enqueue_speech(
+            chunks=["General Kenobi"],
+            voice_description="Warm and calm",
+            language="en",
+        )
+
+    status = runtime.status()
+    assert status["speech_jobs_queued"] == 1
+    assert status["speech_queue_depth"] == 1
+
+
+def test_enqueue_speech_rejects_after_shutdown_starts(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime._shutdown_requested.set()
+
+    with pytest.raises(RuntimeError, match="not accepting new speak_text jobs"):
+        runtime.enqueue_speech(
+            chunks=["Hello there"],
+            voice_description="Warm and calm",
+            language="en",
+        )
 
 
 def test_speech_worker_processes_queued_job(

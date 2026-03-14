@@ -30,6 +30,7 @@ class StubRuntime:
             "preload_completed_at": None,
             "output_dir": "/tmp/generated-audio",
             "last_error": None,
+            "speech_queue_maxsize": 4,
         }
         self.generated_texts: list[str] = []
         self.generated_batches: list[list[str]] = []
@@ -112,6 +113,7 @@ class StubRuntime:
             "speech_in_progress": False,
             "speech_current_job_id": None,
             "speech_queue_depth": 1,
+            "speech_queue_maxsize": 4,
             "speech_jobs_queued": len(self.enqueued_jobs),
             "speech_jobs_completed": 0,
             "speech_jobs_failed": 0,
@@ -226,6 +228,8 @@ def test_speak_text_requires_background_task_mode() -> None:
         assert tool.task_config.mode == "optional"
         assert "output_format" not in tool.parameters
         assert "filename_stem" not in tool.parameters
+        assert "One queue slot equals one full `speak_text` request" in (tool.description or "")
+        assert "try again later" in (tool.description or "")
 
     asyncio.run(run())
 

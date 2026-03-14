@@ -104,7 +104,12 @@ async def speak_text(
     ctx: Context = current_context,
     progress: Progress = task_progress,
 ) -> dict[str, object]:
-    """Generate audio and play it locally on this machine."""
+    """Queue one speech job for local playback on this machine.
+
+    One queue slot equals one full `speak_text` request, including its full chunk list.
+    If too many requests are already pending, the tool rejects the new job and the client
+    should try again later.
+    """
     return await speak_text_tool(
         ctx,
         progress,

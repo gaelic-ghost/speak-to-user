@@ -23,6 +23,7 @@ That makes it useful as a local building block for Codex-style workflows, agent 
 - Background model preload on startup
 - Automatic idle unloading to reclaim memory after inactivity
 - Runtime status inspection, including preload timing and last-error visibility
+- Bounded speech queue with backpressure instead of unbounded in-memory growth
 - Local file generation in `wav` and `flac`
 - Local playback on macOS through the host machine
 - Host-local configuration through environment variables
@@ -73,6 +74,7 @@ Returns current runtime state, including:
 - output directory
 - the last recorded error, if any
 - queued speech worker activity and queue depth
+- queued speech worker capacity
 
 ### `load_model`
 
@@ -101,7 +103,7 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Queues speech for local playback on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text and hands the chunk list to one in-process playback worker thread, which then performs synthesis and playback outside the foreground tool call. This keeps `speak_text` compatible with simpler MCP tool runners that do not request FastMCP task execution and helps avoid foreground timeouts on longer replies. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
+Queues speech for local playback on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text and hands the chunk list to one in-process playback worker thread, which then performs synthesis and playback outside the foreground tool call. This keeps `speak_text` compatible with simpler MCP tool runners that do not request FastMCP task execution and helps avoid foreground timeouts on longer replies. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. The queue is intentionally bounded; if too many speech jobs are already pending, the call fails instead of allowing unbounded memory growth. One queue slot equals one `speak_text` request, carrying that request's full chunk list plus voice/language metadata. When the queue is full, clients should treat that as a temporary backpressure signal and retry later. It reports progress for:
 
 - chunk preparation
 - queue handoff
@@ -120,6 +122,9 @@ Environment variables:
 - `SPEAK_TO_USER_DEVICE`
   Allowed values: `auto`, `mps`, `cpu`
   Default: `auto`
+- `SPEAK_TO_USER_SPEECH_QUEUE_MAXSIZE`
+  Default: `4`
+  Meaning: at most `4` pending `speak_text` jobs may wait in the in-process queue at once; this is a job count, not a chunk count or byte limit
 
 ## Output Behavior
 
@@ -129,6 +134,9 @@ Environment variables:
 - `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
 - `speak_text` is the exception: it keeps playback in memory and does not persist chunk audio to disk.
 - `speak_text` now returns after the speech job is queued; playback continues asynchronously on the host machine.
+- `speak_text` rejects new jobs once shutdown begins, and it rejects excess queued jobs once the configured queue limit is reached.
+- The queue limit applies per queued request. A single queued request may still contain many text chunks, so the queue bound limits request count rather than total memory bytes.
+- Queue-full failures are intentionally retryable: clients should wait and try again later rather than treating them as permanent input errors.
 
 ## Language And Voice Inputs
 

@@ -20,6 +20,7 @@ import soundfile as sf  # type: ignore[import-untyped]
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 DEFAULT_IDLE_UNLOAD_SECONDS = 1200
+DEFAULT_SPEECH_QUEUE_MAXSIZE = 4
 ALLOWED_OUTPUT_FORMATS = {"wav", "flac"}
 LANGUAGE_ALIASES = {
     "auto": "Auto",
@@ -118,11 +119,16 @@ class TTSRuntime:
         *,
         model_id: str,
         idle_unload_seconds: int,
+        speech_queue_maxsize: int,
         output_dir: Path,
         device_preference: str,
     ) -> None:
+        if speech_queue_maxsize <= 0:
+            raise ValueError("speech_queue_maxsize must be greater than zero")
+
         self.model_id = model_id
         self.idle_unload_seconds = idle_unload_seconds
+        self.speech_queue_maxsize = speech_queue_maxsize
         self.output_dir = output_dir
         self.device_preference = device_preference
 
@@ -134,7 +140,9 @@ class TTSRuntime:
         self._preload_complete = threading.Event()
         self._preload_thread: threading.Thread | None = None
         self._preload_in_progress = False
-        self._speech_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._speech_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
+            maxsize=speech_queue_maxsize
+        )
         self._speech_worker_started = False
         self._speech_worker_thread: threading.Thread | None = None
         self._speech_in_progress = False
@@ -163,6 +171,11 @@ class TTSRuntime:
         )
         if idle_unload_seconds <= 0:
             raise ValueError("SPEAK_TO_USER_IDLE_UNLOAD_SECONDS must be a positive integer")
+        speech_queue_maxsize = int(
+            os.getenv("SPEAK_TO_USER_SPEECH_QUEUE_MAXSIZE", str(DEFAULT_SPEECH_QUEUE_MAXSIZE))
+        )
+        if speech_queue_maxsize <= 0:
+            raise ValueError("SPEAK_TO_USER_SPEECH_QUEUE_MAXSIZE must be a positive integer")
 
         output_dir = Path(os.getenv("SPEAK_TO_USER_OUTPUT_DIR", "generated-audio")).expanduser()
         if not output_dir.is_absolute():
@@ -171,6 +184,7 @@ class TTSRuntime:
         return cls(
             model_id=os.getenv("SPEAK_TO_USER_MODEL_ID", DEFAULT_MODEL_ID),
             idle_unload_seconds=idle_unload_seconds,
+            speech_queue_maxsize=speech_queue_maxsize,
             output_dir=output_dir,
             device_preference=_normalize_device(os.getenv("SPEAK_TO_USER_DEVICE")),
         )
@@ -187,10 +201,12 @@ class TTSRuntime:
             self._watchdog_started = True
             self._watchdog_thread.start()
 
-    def start_speech_worker(self) -> None:
+    def start_speech_worker(self) -> bool:
         with self._lock:
+            if self._shutdown_requested.is_set():
+                return False
             if self._speech_worker_started:
-                return
+                return False
             self._speech_worker_thread = threading.Thread(
                 target=self._speech_worker_loop,
                 name="speak-to-user-speech-worker",
@@ -198,6 +214,7 @@ class TTSRuntime:
             )
             self._speech_worker_started = True
             self._speech_worker_thread.start()
+            return True
 
     def preload(self) -> None:
         self.start_background_preload()
@@ -224,10 +241,22 @@ class TTSRuntime:
             return True
 
     def shutdown(self) -> None:
-        self._shutdown_requested.set()
-        self._watchdog_stop.set()
-        if self._speech_worker_started:
-            self._speech_queue.put(None)
+        with self._lock:
+            self._shutdown_requested.set()
+            self._watchdog_stop.set()
+            speech_worker_started = self._speech_worker_started
+
+        if speech_worker_started:
+            while True:
+                try:
+                    self._speech_queue.put_nowait(None)
+                    break
+                except queue.Full:
+                    speech_thread = self._speech_worker_thread
+                    if speech_thread is None or not speech_thread.is_alive():
+                        break
+                    time.sleep(0.05)
+
         preload_thread = self._preload_thread
         if preload_thread is not None:
             preload_thread.join(timeout=1)
@@ -337,24 +366,32 @@ class TTSRuntime:
             raise ValueError("voice_description must not be empty")
         normalized_language = _normalize_language(language)
 
-        self.start_speech_worker()
-
         with self._lock:
-            self._speech_jobs_queued += 1
-            job_id = self._speech_jobs_queued
+            if self._shutdown_requested.is_set():
+                raise RuntimeError(
+                    "runtime is shutting down and is not accepting new speak_text jobs; "
+                    "try again after the server is ready"
+                )
+            self.start_speech_worker()
+            if self._speech_queue.full():
+                raise RuntimeError(
+                    "speech queue is full: "
+                    f"{self.speech_queue_maxsize} pending speak_text job(s) are already waiting; "
+                    "try again later"
+                )
+
+            job_id = self._speech_jobs_queued + 1
             enqueued_at = _utc_now()
+            self._speech_queue.put_nowait(
+                {
+                    "job_id": job_id,
+                    "chunks": normalized_chunks,
+                    "voice_description": normalized_description,
+                    "language": normalized_language,
+                }
+            )
+            self._speech_jobs_queued = job_id
             self._speech_last_enqueued_at = enqueued_at
-
-        self._speech_queue.put(
-            {
-                "job_id": job_id,
-                "chunks": normalized_chunks,
-                "voice_description": normalized_description,
-                "language": normalized_language,
-            }
-        )
-
-        with self._lock:
             return {
                 "result": "success",
                 "queued": True,
@@ -505,6 +542,7 @@ class TTSRuntime:
             "speech_in_progress": self._speech_in_progress,
             "speech_current_job_id": self._speech_current_job_id,
             "speech_queue_depth": self._speech_queue.qsize(),
+            "speech_queue_maxsize": self.speech_queue_maxsize,
             "speech_jobs_queued": self._speech_jobs_queued,
             "speech_jobs_completed": self._speech_jobs_completed,
             "speech_jobs_failed": self._speech_jobs_failed,
