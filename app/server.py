@@ -96,12 +96,11 @@ def speak_text(
     language: str = "en",
     ctx: Context = current_context,
 ) -> dict[str, object]:
-    """Queue one speech job for local playback on this machine.
+    """Queue one detached speech job for local playback on this machine.
 
-    One queue slot equals one full `speak_text` request, including its full chunk list.
-    If too many requests are already pending, the tool rejects the new job and the client
-    should try again later. The runtime performs one model batch call per queued request
-    and then streams the generated waveforms through one live audio output stream.
+    The MCP call returns after handing the request to a detached local playback process.
+    That helper process performs one model batch call for the full request and keeps
+    host playback alive even after the stdio MCP session exits.
     """
     return speak_text_tool(
         ctx,

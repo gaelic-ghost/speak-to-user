@@ -4,7 +4,7 @@
 
 It wraps [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), keeps model lifecycle management inside the server process, writes generated audio to disk only when explicitly requested, and can speak directly through the host machine without persisting playback output.
 
-The implementation is intentionally small: one runtime per server process, one bounded playback queue, one model batch call per queued `speak_text` request, and one live audio stream per playback job.
+The implementation is intentionally small: one runtime per server process for direct tools, one detached playback helper for `speak_text`, one model batch call per speech request, and one live audio stream per playback job.
 
 ## Why This Exists
 
@@ -51,8 +51,7 @@ On startup, the server:
 
 1. builds a `TTSRuntime` from environment configuration
 2. starts the idle-unload watchdog
-3. starts the playback worker
-4. begins background preload of the TTS model
+3. begins background preload of the TTS model
 
 Startup is intentionally non-blocking. If preload is still in progress, the server still comes up, and agents can inspect readiness through `tts_status`. The `ready` field flips to `true` only once the model is actually loaded and no runtime error is recorded.
 
@@ -74,8 +73,8 @@ Returns current runtime state, including:
 - key lifecycle timestamps
 - output directory
 - the last recorded error, if any
-- queued speech worker activity and queue depth
-- current playback job and playback chunk progress for the active speech job
+- detached speech submission state
+- the last recorded detached playback error, if any
 
 ### `load_model`
 
@@ -106,9 +105,7 @@ Synthesizes a single audio file and returns metadata including:
 
 Queues speech for local playback on the host machine without retaining an output file as part of the tool contract.
 
-Internally, `speak_text` chunks long text only to stay within model-friendly text sizes. Once queued, the runtime performs one `generate_voice_design(...)` batch call for the full request, receives one ordered waveform list back, buffers a small initial amount of generated audio, opens one live `sounddevice` output stream, and writes the waveforms to that stream in FIFO order. It does not run one model call per chunk, and it does not require FastMCP background-task support.
-
-One queue slot equals one `speak_text` request, carrying that request's full chunk list plus voice and language metadata. When the queue is full, the call fails so clients can retry later instead of allowing unbounded memory growth.
+Internally, `speak_text` chunks long text only to stay within model-friendly text sizes, writes one small job payload to disk, and spawns a detached local helper process. That helper performs one `generate_voice_design(...)` batch call for the full request, receives one ordered waveform list back, buffers a small initial amount of generated audio, opens one live `sounddevice` output stream, and writes the waveforms to that stream in FIFO order. The MCP call returns after handoff, so stdio-session teardown does not kill playback.
 
 ## Configuration
 
@@ -120,12 +117,11 @@ Environment variables:
   Default: `1200`
 - `SPEAK_TO_USER_OUTPUT_DIR`
   Default: `generated-audio`
+- `SPEAK_TO_USER_JOB_DIR`
+  Default: `/tmp/speak-to-user-jobs`
 - `SPEAK_TO_USER_DEVICE`
   Allowed values: `auto`, `mps`, `cpu`
   Default: `auto`
-- `SPEAK_TO_USER_SPEECH_QUEUE_MAXSIZE`
-  Default: `4`
-  Meaning: at most `4` pending `speak_text` jobs may wait in the in-process queue at once; this is a request count, not a chunk count or byte limit
 
 ## Output Behavior
 
@@ -134,9 +130,9 @@ Environment variables:
 - When no `filename_stem` is provided, files get a UTC timestamp-based name.
 - `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
 - `speak_text` keeps playback in memory and does not persist playback audio to disk.
-- `speak_text` returns after the speech job is queued; playback continues asynchronously on the host machine.
-- Playback uses one model batch call per queued request, then streams generated waveforms through one live audio output stream.
-- `speak_text` rejects new jobs once shutdown begins, and it rejects excess queued jobs once the configured queue limit is reached.
+- `speak_text` returns after a detached helper process has been launched; playback continues asynchronously on the host machine.
+- Playback uses one model batch call per speech request, then streams generated waveforms through one live audio output stream.
+- Detached playback keeps running even if the stdio MCP server process exits immediately after the tool result is returned.
 
 ## Language And Voice Inputs
 

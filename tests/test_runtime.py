@@ -236,22 +236,14 @@ def test_enqueue_speech_returns_queue_metadata(
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
+    launched: list[dict[str, object]] = []
+    monkeypatch.setattr("app.runtime._job_dir", lambda: tmp_path / "jobs")
 
-    class FakeThread:
-        ident = 999
+    class FakePopen:
+        def __init__(self, args: list[str], **kwargs: object) -> None:
+            launched.append({"args": args, "kwargs": kwargs})
 
-        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
-            self.target = target
-            self.name = name
-            self.daemon = daemon
-
-        def start(self) -> None:
-            return None
-
-        def join(self, timeout: float | None = None) -> None:
-            return None
-
-    monkeypatch.setattr("app.runtime.threading.Thread", FakeThread)
+    monkeypatch.setattr("app.runtime.subprocess.Popen", FakePopen)
 
     result = runtime.enqueue_speech(
         chunks=["Hello there", "General Kenobi"],
@@ -265,58 +257,15 @@ def test_enqueue_speech_returns_queue_metadata(
     assert result["chunked"] is True
     assert result["chunk_count"] == 2
     assert result["language"] == "English"
+    assert result["playback_mode"] == "detached-subprocess"
     assert result["speech_jobs_queued"] == 1
-    assert result["speech_queue_depth"] == 1
+    assert result["speech_queue_depth"] == 0
     assert result["speech_queue_maxsize"] == 4
-
-
-def test_enqueue_speech_rejects_when_queue_is_full(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = TTSRuntime(
-        model_id="Qwen/test-model",
-        idle_unload_seconds=10,
-        speech_queue_maxsize=1,
-        output_dir=tmp_path / "generated-audio",
-        device_preference="cpu",
-    )
-
-    class FakeThread:
-        ident = 999
-
-        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
-            self.target = target
-            self.name = name
-            self.daemon = daemon
-
-        def start(self) -> None:
-            return None
-
-        def is_alive(self) -> bool:
-            return True
-
-        def join(self, timeout: float | None = None) -> None:
-            return None
-
-    monkeypatch.setattr("app.runtime.threading.Thread", FakeThread)
-
-    runtime.enqueue_speech(
-        chunks=["Hello there"],
-        voice_description="Warm and calm",
-        language="en",
-    )
-
-    with pytest.raises(RuntimeError, match="pending speak_text job\\(s\\) are already waiting"):
-        runtime.enqueue_speech(
-            chunks=["General Kenobi"],
-            voice_description="Warm and calm",
-            language="en",
-        )
-
-    status = runtime.status()
-    assert status["speech_jobs_queued"] == 1
-    assert status["speech_queue_depth"] == 1
+    assert len(launched) == 1
+    launch_args = cast(list[str], launched[0]["args"])
+    assert launch_args[:3] == [sys.executable, "-m", "app.playback_job"]
+    job_files = list((tmp_path / "jobs").glob("*.json"))
+    assert len(job_files) == 1
 
 
 def test_enqueue_speech_rejects_after_shutdown_starts(tmp_path: Path) -> None:
@@ -329,63 +278,6 @@ def test_enqueue_speech_rejects_after_shutdown_starts(tmp_path: Path) -> None:
             voice_description="Warm and calm",
             language="en",
         )
-
-
-def test_speech_worker_processes_queued_job(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    played_chunks: list[list[str]] = []
-    observed_progress: list[tuple[int | None, int | None]] = []
-
-    def play_speech_chunks(**kwargs: object) -> dict[str, object]:
-        chunks = list(cast(list[str], kwargs["chunks"]))
-        played_chunks.append(chunks)
-        observed_progress.append(
-            (
-                cast(int | None, runtime.status()["speech_current_chunk_index"]),
-                cast(int | None, runtime.status()["speech_current_chunk_count"]),
-            )
-        )
-        return {
-            "result": "success",
-            "played": True,
-            "player": "sounddevice-stream",
-            "chunked": len(chunks) > 1,
-            "chunk_count": len(chunks),
-            "sample_rate": 24000,
-            "sample_count": 3,
-            "duration_seconds": 0.001,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
-            "language": kwargs["language"],
-        }
-
-    monkeypatch.setattr(runtime, "play_speech_chunks", play_speech_chunks)
-
-    runtime._speech_queue.put(
-        {
-            "job_id": 1,
-            "chunks": ["Hello there", "General Kenobi"],
-            "voice_description": "Warm and calm",
-            "language": "English",
-        },
-    )
-    runtime._speech_queue.put(None)
-
-    runtime._speech_worker_loop()
-
-    status = runtime.status()
-    assert played_chunks == [["Hello there", "General Kenobi"]]
-    assert status["speech_jobs_completed"] == 1
-    assert status["speech_jobs_failed"] == 0
-    assert status["speech_in_progress"] is False
-    assert status["speech_current_job_id"] is None
-    assert status["speech_current_chunk_index"] is None
-    assert status["speech_current_chunk_count"] is None
-    assert status["speech_last_error"] is None
-    assert observed_progress == [(0, 2)]
 
 
 def test_play_speech_chunks_does_not_wait_for_preload_while_holding_lock(

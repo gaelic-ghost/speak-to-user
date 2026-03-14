@@ -1,6 +1,6 @@
 # Tool Workflows
 
-`WORKFLOWS.md` documents the live MCP paths in this repo. It follows the real runtime flow in `app/server.py`, `app/tools.py`, `app/runtime.py`, and `app/text_chunking.py`.
+`WORKFLOWS.md` documents the live MCP paths in this repo. It follows the real runtime flow in `app/server.py`, `app/tools.py`, `app/runtime.py`, `app/playback_job.py`, and `app/text_chunking.py`.
 
 ## Shared Lifespan Flow
 
@@ -11,7 +11,6 @@ flowchart LR
     C --> D["TTSRuntime(...)"]
     D --> E["runtime.start_background_preload()"]
     E --> F["runtime.start_watchdog()"]
-    E --> G["runtime.start_speech_worker()"]
     E --> H["spawn preload thread"]
     H --> I["_background_preload_worker()"]
     I --> J["load_model()"]
@@ -68,27 +67,29 @@ flowchart LR
     A["MCP tool: server.speak_text(...)"] --> B["tools.speak_text(ctx, ...)"]
     B --> C["chunk_text_for_tts(text)"]
     B --> D["runtime.enqueue_speech(...)"]
-    D --> E["speech worker thread"]
-    E --> F["runtime.play_speech_chunks(...)"]
-    F --> G["_synthesize_audio_batch(texts=chunks, ...)"]
-    G --> H["_model.generate_voice_design(...)"]
-    H --> I["list[np.ndarray] waveforms"]
-    I --> J["small playback preroll buffer"]
-    J --> K["_open_output_stream(...)"]
-    K --> L["_write_output_stream_chunk(...) in FIFO order"]
+    D --> E["write detached job payload"]
+    E --> F["spawn python -m app.playback_job"]
+    F --> G["detached helper process"]
+    G --> H["runtime.play_speech_chunks(...)"]
+    H --> I["_synthesize_audio_batch(texts=chunks, ...)"]
+    I --> J["_model.generate_voice_design(...)"]
+    J --> K["list[np.ndarray] waveforms"]
+    K --> L["small playback preroll buffer"]
+    L --> M["_open_output_stream(...)"]
+    M --> N["_write_output_stream_chunk(...) in FIFO order"]
 ```
 
-`speak_text` is a plain MCP tool. It chunks text only to stay within model-friendly text sizes, then hands the full chunk list to the runtime queue.
+`speak_text` is a plain MCP tool. It chunks text only to stay within model-friendly text sizes, then hands the full chunk list to the runtime for detached handoff.
 
-The background worker performs one model batch call for the full queued request, buffers a small initial amount of generated audio, opens one live output stream, and writes the generated waveforms to the host audio device in order.
+The detached helper process performs one model batch call for the full request, buffers a small initial amount of generated audio, opens one live output stream, and writes the generated waveforms to the host audio device in order.
 
 Important behavior:
 
-- one queue slot equals one full `speak_text` request
-- one queued request results in one model batch call
-- playback uses one output stream per queued request
+- one `speak_text` call creates one detached playback job
+- one detached playback job results in one model batch call
+- playback uses one output stream per speech request
 - playback audio is not persisted to disk
-- queue-full failures are retryable client-side backpressure, not permanent input errors
+- detached playback survives stdio-session teardown after the MCP call returns
 
 ## Text Chunking
 

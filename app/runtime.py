@@ -4,13 +4,16 @@ import builtins
 import contextlib
 import datetime as dt
 import gc
+import json
 import os
 from pathlib import Path
 import queue
+import subprocess
 import sys
 import threading
 import time
 from typing import Any
+import uuid
 
 import numpy as np
 import sounddevice as sd  # type: ignore[import-untyped]
@@ -46,6 +49,10 @@ def _utc_now() -> dt.datetime:
 
 def _timestamp_value(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _job_dir() -> Path:
+    return (Path(os.getenv("SPEAK_TO_USER_JOB_DIR", "/tmp/speak-to-user-jobs"))).expanduser()
 
 
 def _normalize_device(raw: str | None) -> str:
@@ -375,23 +382,26 @@ class TTSRuntime:
                     "runtime is shutting down and is not accepting new speak_text jobs; "
                     "try again after the server is ready"
                 )
-            self.start_speech_worker()
-            if self._speech_queue.full():
-                raise RuntimeError(
-                    "speech queue is full: "
-                    f"{self.speech_queue_maxsize} pending speak_text job(s) are already waiting; "
-                    "try again later"
-                )
-
             job_id = self._speech_jobs_queued + 1
             enqueued_at = _utc_now()
-            self._speech_queue.put_nowait(
-                {
-                    "job_id": job_id,
-                    "chunks": normalized_chunks,
-                    "voice_description": normalized_description,
-                    "language": normalized_language,
-                }
+            job_dir = _job_dir()
+            job_dir.mkdir(parents=True, exist_ok=True)
+            job_path = job_dir / f"job-{job_id}-{uuid.uuid4().hex}.json"
+            job_payload = {
+                "job_id": job_id,
+                "chunks": normalized_chunks,
+                "voice_description": normalized_description,
+                "language": normalized_language,
+            }
+            job_path.write_text(json.dumps(job_payload), encoding="utf-8")
+
+            subprocess.Popen(
+                [sys.executable, "-m", "app.playback_job", str(job_path)],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
             )
             self._speech_jobs_queued = job_id
             self._speech_last_enqueued_at = enqueued_at
@@ -403,6 +413,7 @@ class TTSRuntime:
                 "chunk_count": len(normalized_chunks),
                 "language": normalized_language,
                 "enqueued_at": enqueued_at.isoformat(),
+                "playback_mode": "detached-subprocess",
                 **self._speech_status_payload_locked(),
             }
 

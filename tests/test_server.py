@@ -213,8 +213,8 @@ def test_speak_text_is_plain_tool() -> None:
         assert tool.task_config.mode == "forbidden"
         assert "output_format" not in tool.parameters
         assert "filename_stem" not in tool.parameters
-        assert "One queue slot equals one full `speak_text` request" in (tool.description or "")
-        assert "one model batch call per queued request" in (tool.description or "")
+        assert "Queue one detached speech job" in (tool.description or "")
+        assert "one model batch call for the full request" in (tool.description or "")
 
     asyncio.run(run())
 
