@@ -3,13 +3,13 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import datetime
+from pathlib import Path
 from typing import cast
 
 from fastmcp import Context
 from fastmcp.dependencies import Progress
 
 from app.runtime import TTSRuntime
-from app.text_chunking import chunk_filename_stem as chunk_filename_stem_for_tts
 from app.text_chunking import chunk_text_for_tts
 
 
@@ -27,6 +27,12 @@ def _runtime_from_context(ctx: Context) -> TTSRuntime:
     if runtime is None:
         raise RuntimeError("TTS runtime is unavailable in lifespan context")
     return cast(TTSRuntime, runtime)
+
+
+def _delete_generated_audio(path: str) -> None:
+    audio_path = Path(path)
+    if audio_path.exists():
+        audio_path.unlink()
 
 
 # MARK: Tool Adapters
@@ -90,8 +96,6 @@ async def speak_text(
     text: str,
     voice_description: str,
     language: str = "en",
-    output_format: str = "wav",
-    filename_stem: str | None = None,
 ) -> dict[str, object]:
     runtime = _runtime_from_context(ctx)
     chunks = chunk_text_for_tts(text)
@@ -111,11 +115,6 @@ async def speak_text(
     while chunk_queue:
         chunk_index += 1
         chunk_text = chunk_queue.popleft()
-        chunk_filename_stem = chunk_filename_stem_for_tts(
-            filename_stem,
-            chunk_index,
-            chunk_count,
-        )
 
         await progress.set_message(f"Generating chunk {chunk_index} of {chunk_count}")
         generation_result = await asyncio.to_thread(
@@ -123,13 +122,15 @@ async def speak_text(
             text=chunk_text,
             voice_description=voice_description,
             language=language,
-            output_format=output_format,
-            filename_stem=chunk_filename_stem,
+            output_format="wav",
         )
         await progress.increment()
 
-        await progress.set_message(f"Playing chunk {chunk_index} of {chunk_count}")
-        playback_result = await asyncio.to_thread(runtime.play_audio, generation_result["path"])
+        try:
+            await progress.set_message(f"Playing chunk {chunk_index} of {chunk_count}")
+            playback_result = await asyncio.to_thread(runtime.play_audio, generation_result["path"])
+        finally:
+            await asyncio.to_thread(_delete_generated_audio, generation_result["path"])
         await progress.increment()
 
         generated_chunks.append(
@@ -137,7 +138,6 @@ async def speak_text(
                 "index": chunk_index,
                 "text": chunk_text,
                 "text_length": len(chunk_text),
-                "path": generation_result["path"],
                 "format": generation_result["format"],
                 "sample_rate": generation_result["sample_rate"],
                 "sample_count": generation_result["sample_count"],
@@ -153,16 +153,19 @@ async def speak_text(
     await progress.set_message("Playback complete")
 
     last_chunk = generated_chunks[-1]
+    total_duration_seconds = round(
+        sum(cast(float, chunk["duration_seconds"]) for chunk in generated_chunks),
+        3,
+    )
     return {
         "result": "success",
         "chunked": chunk_count > 1,
         "chunk_count": chunk_count,
         "chunks": generated_chunks,
-        "path": last_chunk["path"],
         "format": last_chunk["format"],
         "sample_rate": last_chunk["sample_rate"],
         "sample_count": last_chunk["sample_count"],
-        "duration_seconds": last_chunk["duration_seconds"],
+        "duration_seconds": total_duration_seconds,
         "model_id": last_chunk["model_id"],
         "device": last_chunk["device"],
         "language": last_chunk["language"],

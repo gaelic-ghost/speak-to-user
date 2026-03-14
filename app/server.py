@@ -104,8 +104,6 @@ async def speak_text(
     text: str,
     voice_description: str,
     language: str = "en",
-    output_format: str = "wav",
-    filename_stem: str | None = None,
     ctx: Context = current_context,
     progress: Progress = task_progress,
 ) -> dict[str, object]:
@@ -116,8 +114,6 @@ async def speak_text(
         text=text,
         voice_description=voice_description,
         language=language,
-        output_format=output_format,
-        filename_stem=filename_stem,
     )
 
 

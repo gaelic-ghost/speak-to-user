@@ -33,6 +33,7 @@ class StubRuntime:
         }
         self.generated_texts: list[str] = []
         self.played_paths: list[str] = []
+        self.deleted_paths: list[str] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
@@ -177,6 +178,8 @@ def test_speak_text_requires_background_task_mode() -> None:
         assert tool is not None
         assert tool.task_config is not None
         assert tool.task_config.mode == "required"
+        assert "output_format" not in tool.parameters
+        assert "filename_stem" not in tool.parameters
 
     asyncio.run(run())
 
@@ -239,3 +242,28 @@ def test_speak_text_chunks_and_plays_in_fifo_order(monkeypatch) -> None:
     ]
     assert progress.total == 7
     assert progress.current == 7
+
+
+def test_speak_text_deletes_generated_audio_after_playback(monkeypatch) -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+    progress = StubProgress()
+    deleted_paths: list[str] = []
+
+    monkeypatch.setattr("app.tools.Path.exists", lambda self: True)
+    monkeypatch.setattr("app.tools.Path.unlink", lambda self: deleted_paths.append(str(self)))
+
+    async def run() -> dict[str, object]:
+        from app.tools import speak_text as speak_text_tool
+
+        return await speak_text_tool(
+            cast(Context, ctx),
+            cast(Progress, progress),
+            text="hello there",
+            voice_description="warm",
+        )
+
+    result = asyncio.run(run())
+
+    assert result["result"] == "success"
+    assert deleted_paths == ["/tmp/generated-audio/test-1.wav"]

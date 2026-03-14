@@ -12,16 +12,19 @@ _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+")
 # MARK: Chunking Helpers
 
 def _append_chunk(chunks: list[str], value: str) -> None:
+    # Step 1: normalize candidate chunk text and keep only non-empty values.
     normalized = value.strip()
     if normalized:
         chunks.append(normalized)
 
 
 def _split_long_word(word: str, max_chars: int) -> list[str]:
+    # Step 2: hard-split a single overlong word when no softer boundary exists.
     return [word[index : index + max_chars] for index in range(0, len(word), max_chars)]
 
 
 def _chunk_words(text: str, max_chars: int) -> list[str]:
+    # Step 3: pack words into bounded chunks when sentence boundaries are unavailable.
     words = text.split()
     if not words:
         return []
@@ -48,6 +51,7 @@ def _chunk_words(text: str, max_chars: int) -> list[str]:
 
 
 def _chunk_sentences(text: str, max_chars: int) -> list[str]:
+    # Step 4: prefer sentence-sized chunks, then fall back to word chunking for long sentences.
     sentences = [part.strip() for part in _SENTENCE_BREAK_RE.split(text.strip()) if part.strip()]
     if not sentences:
         return _chunk_words(text, max_chars)
@@ -74,6 +78,8 @@ def _chunk_sentences(text: str, max_chars: int) -> list[str]:
 
 
 def chunk_text_for_tts(text: str, max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS) -> list[str]:
+    # Step 5: drive the full chunking chain with paragraph-first splitting
+    # and lower-level fallbacks.
     normalized = text.strip()
     if not normalized:
         return []
@@ -105,13 +111,3 @@ def chunk_text_for_tts(text: str, max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS) 
 
     _append_chunk(chunks, current)
     return chunks
-
-
-def chunk_filename_stem(
-    filename_stem: str | None,
-    chunk_index: int,
-    chunk_count: int,
-) -> str | None:
-    if filename_stem is None or chunk_count <= 1:
-        return filename_stem
-    return f"{filename_stem}-{chunk_index:02d}"
