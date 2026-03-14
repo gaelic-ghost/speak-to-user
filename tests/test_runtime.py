@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import threading
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -177,7 +177,7 @@ def test_generate_speech_buffer_batches_chunks(
     assert result["result"] == "success"
     assert result["chunk_count"] == 2
     waveform = cast(runtime_module.np.ndarray, result["waveform"])
-    assert waveform.tolist() == [0.0, 0.1, 0.2, 0.0, 0.1, 0.2]
+    assert waveform.tolist() == pytest.approx([0.0, 0.1, 0.2, 0.0, 0.1, 0.2])
     assert fake_model.calls == [
         {
             "text": ["Hello there", "General Kenobi"],
@@ -185,6 +185,45 @@ def test_generate_speech_buffer_batches_chunks(
             "instruct": ["Warm and calm", "Warm and calm"],
         }
     ]
+
+
+def test_generate_speech_buffer_does_not_wait_for_preload_while_holding_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    fake_model = FakeModel()
+    lock_state: dict[str, bool] = {"held_during_wait": False}
+
+    class InspectPreloadEvent:
+        def wait(self, timeout: float | None = None) -> bool:
+            del timeout
+            acquired = runtime._lock.acquire(blocking=False)
+            if acquired:
+                runtime._lock.release()
+            lock_state["held_during_wait"] = not acquired
+            runtime._preload_in_progress = False
+            return True
+
+        def clear(self) -> None:
+            return None
+
+        def set(self) -> None:
+            return None
+
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
+    runtime._preload_in_progress = True
+    runtime._preload_thread = threading.Thread(target=lambda: None, name="preload-placeholder")
+    runtime._preload_complete = cast(Any, InspectPreloadEvent())
+
+    result = runtime.generate_speech_buffer(
+        chunks=["Hello there", "General Kenobi"],
+        voice_description="Warm and calm",
+        language="en",
+    )
+
+    assert result["result"] == "success"
+    assert lock_state["held_during_wait"] is False
 
 
 def test_play_audio_buffer_uses_sounddevice(

@@ -453,9 +453,12 @@ class TTSRuntime:
         language: str,
     ) -> dict[str, Any]:
         with self._lock:
-            if self._model is None:
-                self.load_model()
+            model_missing = self._model is None
 
+        if model_missing:
+            self.load_model()
+
+        with self._lock:
             assert self._model is not None
             try:
                 wavs, sample_rate = self._model.generate_voice_design(
