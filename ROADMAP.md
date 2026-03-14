@@ -4,7 +4,6 @@ This roadmap tracks likely next directions for `speak-to-user`. It is intentiona
 
 ## Near-Term Priorities
 
-- Add a speech-generation queue so concurrent `speak_text` and `generate_audio` requests can be handled more predictably.
 - Add persistent file storage for retained outputs and batch-generation workflows.
 - Expose agent-facing MCP Prompts and Resources with guidance for chunking, voice usage, and reliable server interaction.
 - Add voice description profile support so repeated usage patterns can be named and reused instead of rewritten each time.

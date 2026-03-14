@@ -2,20 +2,18 @@
 
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server for coding agents that need a dependable, host-local text-to-speech path for user-facing replies.
 
-It wraps [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), keeps model lifecycle management inside the server process, writes generated audio to disk when explicitly requested, and can play speech directly from memory on the host machine.
+It wraps [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), keeps model lifecycle management inside the server process, writes generated audio to disk only when explicitly requested, and can speak directly through the host machine without persisting playback output.
 
-The current focus is simple and practical: give an agent one reliable way to speak to a local user without introducing a large framework surface or a remote service dependency.
+The implementation is intentionally small: one runtime per server process, one bounded playback queue, one model batch call per queued `speak_text` request, and one live audio stream per playback job.
 
 ## Why This Exists
 
-Agent workflows often end with text output even when spoken output would be more natural, faster to consume, or more accessible. This server gives agents a small MCP tool surface for:
+Agent workflows often end with text output even when spoken output would be faster to consume, more natural, or more accessible. This server gives agents a compact MCP tool surface for:
 
 - checking runtime readiness
 - loading and unloading the TTS model
 - generating local audio files
 - speaking a response out loud on the host machine
-
-That makes it useful as a local building block for Codex-style workflows, agent tooling experiments, accessibility support, and hands-free feedback loops.
 
 ## Current Capabilities
 
@@ -23,7 +21,7 @@ That makes it useful as a local building block for Codex-style workflows, agent 
 - Background model preload on startup
 - Automatic idle unloading to reclaim memory after inactivity
 - Runtime status inspection, including preload timing and last-error visibility
-- Bounded speech queue with backpressure instead of unbounded in-memory growth
+- Bounded speech queue with request-level backpressure
 - Local file generation in `wav` and `flac`
 - Local playback on macOS through the host machine
 - Host-local configuration through environment variables
@@ -47,13 +45,16 @@ uv sync
 uv run python app/server.py
 ```
 
+The default FastMCP transport is stdio. The server starts on demand, creates one `TTSRuntime` for that process, and shuts the runtime down when the stdio session ends.
+
 On startup, the server:
 
 1. builds a `TTSRuntime` from environment configuration
 2. starts the idle-unload watchdog
-3. begins background preload of the TTS model
+3. starts the playback worker
+4. begins background preload of the TTS model
 
-Startup is intentionally non-blocking. If preload is still in progress, the server still comes up, and agents can inspect readiness through `tts_status`. The `ready` field only flips to `true` once the model is actually loaded and no runtime error is recorded.
+Startup is intentionally non-blocking. If preload is still in progress, the server still comes up, and agents can inspect readiness through `tts_status`. The `ready` field flips to `true` only once the model is actually loaded and no runtime error is recorded.
 
 ## MCP Tools
 
@@ -74,8 +75,7 @@ Returns current runtime state, including:
 - output directory
 - the last recorded error, if any
 - queued speech worker activity and queue depth
-- queued speech worker capacity
-- current playback chunk progress for the active speech job
+- current playback job and playback chunk progress for the active speech job
 
 ### `load_model`
 
@@ -104,11 +104,11 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Queues speech for local playback on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text and hands the chunk list to one in-process playback worker thread, which then synthesizes and plays one chunk at a time instead of concatenating the full reply into one giant in-memory waveform. This keeps `speak_text` compatible with simpler MCP tool runners that do not request FastMCP task execution and helps avoid foreground timeouts on longer replies. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. The queue is intentionally bounded; if too many speech jobs are already pending, the call fails instead of allowing unbounded memory growth. One queue slot equals one `speak_text` request, carrying that request's full chunk list plus voice/language metadata. When the queue is full, clients should treat that as a temporary backpressure signal and retry later. It reports progress for:
+Queues speech for local playback on the host machine without retaining an output file as part of the tool contract.
 
-- chunk preparation
-- queue handoff
-- queue confirmation
+Internally, `speak_text` chunks long text only to stay within model-friendly text sizes. Once queued, the runtime performs one `generate_voice_design(...)` batch call for the full request, receives one ordered waveform list back, buffers a small initial amount of generated audio, opens one live `sounddevice` output stream, and writes the waveforms to that stream in FIFO order. It does not run one model call per chunk, and it does not require FastMCP background-task support.
+
+One queue slot equals one `speak_text` request, carrying that request's full chunk list plus voice and language metadata. When the queue is full, the call fails so clients can retry later instead of allowing unbounded memory growth.
 
 ## Configuration
 
@@ -125,7 +125,7 @@ Environment variables:
   Default: `auto`
 - `SPEAK_TO_USER_SPEECH_QUEUE_MAXSIZE`
   Default: `4`
-  Meaning: at most `4` pending `speak_text` jobs may wait in the in-process queue at once; this is a job count, not a chunk count or byte limit
+  Meaning: at most `4` pending `speak_text` jobs may wait in the in-process queue at once; this is a request count, not a chunk count or byte limit
 
 ## Output Behavior
 
@@ -133,12 +133,10 @@ Environment variables:
 - Relative output directories are resolved from the current working directory at runtime.
 - When no `filename_stem` is provided, files get a UTC timestamp-based name.
 - `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
-- `speak_text` is the exception: it keeps playback in memory and does not persist chunk audio to disk.
-- `speak_text` now returns after the speech job is queued; playback continues asynchronously on the host machine.
-- playback is streamed chunk by chunk through the local audio output instead of concatenating the full reply into one large playback buffer first.
+- `speak_text` keeps playback in memory and does not persist playback audio to disk.
+- `speak_text` returns after the speech job is queued; playback continues asynchronously on the host machine.
+- Playback uses one model batch call per queued request, then streams generated waveforms through one live audio output stream.
 - `speak_text` rejects new jobs once shutdown begins, and it rejects excess queued jobs once the configured queue limit is reached.
-- The queue limit applies per queued request. A single queued request may still contain many text chunks, so the queue bound limits request count rather than total memory bytes.
-- Queue-full failures are intentionally retryable: clients should wait and try again later rather than treating them as permanent input errors.
 
 ## Language And Voice Inputs
 
@@ -157,9 +155,10 @@ Some language aliases are normalized internally:
 ## Design Notes
 
 - The server is intentionally local-first.
+- Stdout is kept clean so stdio MCP framing is not polluted by model-side prints.
 - Errors are captured in runtime state and surfaced via `tts_status` instead of crashing the process whenever possible.
 - The model can be unloaded after inactivity to reduce resource usage on a development machine.
-- The tool surface is deliberately small right now so agent integrations stay easy to reason about.
+- The tool surface is deliberately small so agent integrations stay easy to reason about.
 
 ## Development
 
@@ -167,11 +166,12 @@ Project layout:
 
 - `app/server.py`: FastMCP entrypoint and tool registration
 - `app/runtime.py`: runtime lifecycle, preload, idle unloading, generation, and playback
-- `app/tools.py`: tool adapters between FastMCP context and runtime operations
+- `app/tools.py`: tool adapters and text chunking handoff
+- `app/text_chunking.py`: paragraph-, sentence-, and word-level chunking helpers
 - `tests/test_runtime.py`: runtime tests
 - `tests/test_server.py`: server and tool behavior tests
 - `ROADMAP.md`: planned future work
-- `WORKFLOWS.md`: end-to-end tool and data-shape flow reference
+- `WORKFLOWS.md`: end-to-end tool and data-flow reference
 
 Validation commands:
 
@@ -180,23 +180,3 @@ uv run pytest
 uv run ruff check .
 uv run mypy .
 ```
-
-## Future Work
-
-Planned work currently includes:
-
-- queue-based speech generation
-- persistent file storage for batch generation
-- agent-facing guidance through MCP Prompts and Resources
-- guidance for chunking long replies
-- voice description profile support
-- voice profile selection through MCP user elicitation
-- automatic voice profile switching using FastMCP Context
-- FastMCP Apps and UI support
-- a related agent skill for consistent usage guidance
-- support for additional TTS runtimes
-- packaging and distribution on PyPI
-- composition with a FastAPI service
-- distribution as a macOS `MenuBarExtra` app
-
-Those plans are intentionally aspirational, not committed API guarantees. The current implementation is still centered on a compact, local MCP speech server.

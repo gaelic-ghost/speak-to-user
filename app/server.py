@@ -5,10 +5,8 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastmcp import Context, FastMCP
-from fastmcp.dependencies import CurrentContext, Progress
+from fastmcp.dependencies import CurrentContext
 from fastmcp.server.lifespan import lifespan
-from fastmcp.server.tasks import TaskConfig
-from key_value.aio.stores.memory import MemoryStore
 
 from app.runtime import TTSRuntime
 from app.tools import (
@@ -21,8 +19,6 @@ from app.tools import (
     unload_model as unload_model_tool,
 )
 
-
-
 @lifespan
 async def app_lifespan(_server: FastMCP):
     runtime = TTSRuntime.from_env()
@@ -33,13 +29,10 @@ async def app_lifespan(_server: FastMCP):
         runtime.shutdown()
 
 
-cache_store = MemoryStore()
 current_context = CurrentContext()
-task_progress = Progress()
 mcp = FastMCP(
     "speak-to-user",
     lifespan=app_lifespan,
-    session_state_store=cache_store,
 )
 
 
@@ -96,24 +89,22 @@ def generate_audio(
     )
 
 
-@mcp.tool(task=TaskConfig(mode="optional"))
-async def speak_text(
+@mcp.tool
+def speak_text(
     text: str,
     voice_description: str,
     language: str = "en",
     ctx: Context = current_context,
-    progress: Progress = task_progress,
 ) -> dict[str, object]:
     """Queue one speech job for local playback on this machine.
 
     One queue slot equals one full `speak_text` request, including its full chunk list.
     If too many requests are already pending, the tool rejects the new job and the client
-    should try again later. Playback then proceeds chunk by chunk on the background worker,
-    and clients can poll `tts_status` for active chunk progress.
+    should try again later. The runtime performs one model batch call per queued request
+    and then streams the generated waveforms through one live audio output stream.
     """
-    return await speak_text_tool(
+    return speak_text_tool(
         ctx,
-        progress,
         text=text,
         voice_description=voice_description,
         language=language,

@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 import datetime
 from typing import cast
 
 from fastmcp import Context
-from fastmcp.dependencies import Progress
 
 from app.runtime import TTSRuntime
 from app.text_chunking import chunk_text_for_tts
@@ -81,9 +79,8 @@ def generate_audio(
         return {"result": "error", "error": str(exc), **runtime.status()}
 
 
-async def speak_text(
+def speak_text(
     ctx: Context,
-    progress: Progress,
     *,
     text: str,
     voice_description: str,
@@ -94,22 +91,9 @@ async def speak_text(
     if not chunks:
         raise ValueError("text must not be empty")
 
-    chunk_count = len(chunks)
-    total_steps = 3
-
-    await progress.set_total(total_steps)
-    await progress.set_message(f"Prepared {chunk_count} chunk(s) for queued speech playback")
-    await progress.increment()
-
-    await progress.set_message("Handing speech job to the local playback queue")
-    queue_result = await asyncio.to_thread(
-        runtime.enqueue_speech,
+    queue_result = runtime.enqueue_speech(
         chunks=chunks,
         voice_description=voice_description,
         language=language,
     )
-    await progress.increment()
-
-    await progress.set_message("Speech job queued")
-    await progress.increment()
     return cast(dict[str, object], queue_result)

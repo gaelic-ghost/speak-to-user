@@ -160,12 +160,12 @@ def test_generate_audio_reloads_after_idle_unload(
     assert load_count["value"] == 2
 
 
-def test_play_speech_chunks_streams_one_chunk_at_a_time(
+def test_play_speech_chunks_uses_one_batch_model_call(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    synthesized_texts: list[str] = []
+    generated_batches: list[dict[str, object]] = []
     played: list[dict[str, object]] = []
 
     class FakeStream:
@@ -182,13 +182,20 @@ def test_play_speech_chunks_streams_one_chunk_at_a_time(
         def close(self) -> None:
             self.closed = True
 
-    def synthesize_audio(**kwargs: object) -> dict[str, object]:
-        synthesized_texts.append(cast(str, kwargs["text"]))
+    def synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
+        generated_batches.append(
+            {
+                "texts": list(cast(list[str], kwargs["texts"])),
+                "language": kwargs["language"],
+                "voice_description": kwargs["voice_description"],
+            }
+        )
         return {
-            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
+            "waveforms": [
+                runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
+                runtime_module.np.array([0.3, 0.4, 0.5], dtype=runtime_module.np.float32),
+            ],
             "sample_rate": 24000,
-            "sample_count": 3,
-            "duration_seconds": 0.001,
             "model_id": "Qwen/test-model",
             "device": "cpu",
             "language": kwargs["language"],
@@ -196,8 +203,8 @@ def test_play_speech_chunks_streams_one_chunk_at_a_time(
 
     monkeypatch.setattr(
         runtime,
-        "_synthesize_audio",
-        synthesize_audio,
+        "_synthesize_audio_batch",
+        synthesize_audio_batch,
     )
     monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
 
@@ -212,10 +219,16 @@ def test_play_speech_chunks_streams_one_chunk_at_a_time(
     assert result["chunk_count"] == 2
     assert result["sample_count"] == 6
     assert result["player"] == "sounddevice-stream"
-    assert synthesized_texts == ["Hello there", "General Kenobi"]
+    assert generated_batches == [
+        {
+            "texts": ["Hello there", "General Kenobi"],
+            "language": "English",
+            "voice_description": "Warm and calm",
+        }
+    ]
     assert len(played) == 2
     assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
-    assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
+    assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.3, 0.4, 0.5])
 
 
 def test_enqueue_speech_returns_queue_metadata(
@@ -403,15 +416,11 @@ def test_play_speech_chunks_does_not_wait_for_preload_while_holding_lock(
     runtime._preload_in_progress = True
     runtime._preload_thread = threading.Thread(target=lambda: None, name="preload-placeholder")
     runtime._preload_complete = cast(Any, InspectPreloadEvent())
-    monkeypatch.setattr(
-        runtime,
-        "_open_output_stream",
-        lambda **kwargs: SimpleNamespace(
-            start=lambda: None,
-            write=lambda waveform: False,
-            close=lambda: None,
-        ),
-    )
+    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: SimpleNamespace(
+        start=lambda: None,
+        write=lambda waveform: False,
+        close=lambda: None,
+    ))
 
     result = runtime.play_speech_chunks(
         chunks=["Hello there", "General Kenobi"],
@@ -443,12 +452,12 @@ def test_play_speech_chunks_uses_output_stream(
 
     monkeypatch.setattr(
         runtime,
-        "_synthesize_audio",
+        "_synthesize_audio_batch",
         lambda **kwargs: {
-            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
+            "waveforms": [
+                runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32)
+            ],
             "sample_rate": 24000,
-            "sample_count": 3,
-            "duration_seconds": 0.001,
             "model_id": "Qwen/test-model",
             "device": "cpu",
             "language": kwargs["language"],

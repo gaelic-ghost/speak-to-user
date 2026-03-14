@@ -21,6 +21,7 @@ import soundfile as sf  # type: ignore[import-untyped]
 DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 DEFAULT_IDLE_UNLOAD_SECONDS = 1200
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 4
+DEFAULT_PLAYBACK_PREROLL_SECONDS = 0.25
 ALLOWED_OUTPUT_FORMATS = {"wav", "flac"}
 LANGUAGE_ALIASES = {
     "auto": "Auto",
@@ -602,49 +603,49 @@ class TTSRuntime:
 
         normalized_language = _normalize_language(language)
         normalized_chunks = self._normalize_chunks(chunks)
+        batch_result = self._synthesize_audio_batch(
+            texts=normalized_chunks,
+            voice_description=normalized_description,
+            language=normalized_language,
+        )
+        waveforms = [
+            self._prepare_waveform_for_output_stream(waveform)
+            for waveform in batch_result["waveforms"]
+        ]
+        if not waveforms:
+            raise RuntimeError("no speech chunks were available for playback")
 
+        sample_rate = int(batch_result["sample_rate"])
+        channel_count = self._waveform_channel_count(waveforms[0])
         total_sample_count = 0
-        sample_rate: int | None = None
-        channel_count: int | None = None
-        stream: sd.OutputStream | None = None
+        buffered_sample_count = 0
+        preroll_sample_target = max(1, int(sample_rate * DEFAULT_PLAYBACK_PREROLL_SECONDS))
+        buffered_waveforms: list[np.ndarray] = []
+        remaining_waveforms: list[np.ndarray] = []
 
+        for waveform in waveforms:
+            current_channel_count = self._waveform_channel_count(waveform)
+            if current_channel_count != channel_count:
+                raise RuntimeError("streamed speech chunk channel count changed during playback")
+
+            if buffered_sample_count < preroll_sample_target:
+                buffered_waveforms.append(waveform)
+                buffered_sample_count += int(waveform.shape[0])
+            else:
+                remaining_waveforms.append(waveform)
+
+        stream: sd.OutputStream | None = None
         try:
-            for index, chunk in enumerate(normalized_chunks, start=1):
+            stream = self._open_output_stream(
+                sample_rate=sample_rate,
+                channel_count=channel_count,
+            )
+            for index, waveform in enumerate(buffered_waveforms + remaining_waveforms, start=1):
                 with self._lock:
                     self._speech_current_chunk_index = index
-                    self._speech_current_chunk_count = len(normalized_chunks)
-
-                synthesis_result = self._synthesize_audio(
-                    text=chunk,
-                    voice_description=normalized_description,
-                    language=normalized_language,
-                )
-                waveform = self._prepare_waveform_for_output_stream(synthesis_result["waveform"])
-                current_sample_rate = int(synthesis_result["sample_rate"])
-                current_channel_count = self._waveform_channel_count(waveform)
-
-                if stream is None:
-                    sample_rate = current_sample_rate
-                    channel_count = current_channel_count
-                    stream = self._open_output_stream(
-                        sample_rate=sample_rate,
-                        channel_count=channel_count,
-                    )
-                else:
-                    if sample_rate != current_sample_rate:
-                        raise RuntimeError(
-                            "streamed speech chunk sample rate changed during playback"
-                        )
-                    if channel_count != current_channel_count:
-                        raise RuntimeError(
-                            "streamed speech chunk channel count changed during playback"
-                        )
-
+                    self._speech_current_chunk_count = len(waveforms)
                 self._write_output_stream_chunk(stream, waveform)
                 total_sample_count += int(waveform.shape[0])
-
-            if stream is None or sample_rate is None:
-                raise RuntimeError("no speech chunks were available for playback")
 
             return {
                 "result": "success",
@@ -653,12 +654,10 @@ class TTSRuntime:
                 "chunk_count": len(normalized_chunks),
                 "sample_rate": sample_rate,
                 "sample_count": total_sample_count,
-                "duration_seconds": (
-                    round(total_sample_count / sample_rate, 3) if sample_rate else 0.0
-                ),
-                "model_id": self.model_id,
-                "device": self._resolved_device,
-                "language": normalized_language,
+                "duration_seconds": round(total_sample_count / sample_rate, 3),
+                "model_id": batch_result["model_id"],
+                "device": batch_result["device"],
+                "language": batch_result["language"],
                 "player": "sounddevice-stream",
             }
         finally:

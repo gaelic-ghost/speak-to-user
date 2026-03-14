@@ -9,7 +9,6 @@ from typing import cast
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastmcp import Context
-from fastmcp.dependencies import Progress
 
 from app import server
 
@@ -125,22 +124,6 @@ class StubRuntime:
         }
 
 
-class StubProgress:
-    def __init__(self) -> None:
-        self.total: int | None = None
-        self.current = 0
-        self.messages: list[str | None] = []
-
-    async def set_total(self, total: int) -> None:
-        self.total = total
-
-    async def increment(self, amount: int = 1) -> None:
-        self.current += amount
-
-    async def set_message(self, message: str | None) -> None:
-        self.messages.append(message)
-
-
 class StubContext:
     def __init__(self, runtime: object) -> None:
         self.lifespan_context = {"runtime": runtime}
@@ -222,34 +205,29 @@ def test_server_module_imports_when_loaded_from_file_path() -> None:
     assert module.mcp.name == "speak-to-user"
 
 
-def test_speak_text_requires_background_task_mode() -> None:
+def test_speak_text_is_plain_tool() -> None:
     async def run() -> None:
         tool = await server.mcp.get_tool("speak_text")
         assert tool is not None
         assert tool.task_config is not None
-        assert tool.task_config.mode == "optional"
+        assert tool.task_config.mode == "forbidden"
         assert "output_format" not in tool.parameters
         assert "filename_stem" not in tool.parameters
         assert "One queue slot equals one full `speak_text` request" in (tool.description or "")
-        assert "try again later" in (tool.description or "")
+        assert "one model batch call per queued request" in (tool.description or "")
 
     asyncio.run(run())
 
 
-def test_speak_text_reports_progress_and_queues_audio() -> None:
+def test_speak_text_queues_audio() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
-    progress = StubProgress()
 
-    async def run() -> dict[str, object]:
-        return await server.speak_text(
-            "hello",
-            "warm",
-            ctx=cast(Context, ctx),
-            progress=cast(Progress, progress),
-        )
-
-    result = asyncio.run(run())
+    result = server.speak_text(
+        "hello",
+        "warm",
+        ctx=cast(Context, ctx),
+    )
 
     assert result["result"] == "success"
     assert result["queued"] is True
@@ -261,34 +239,21 @@ def test_speak_text_reports_progress_and_queues_audio() -> None:
             "language": "en",
         }
     ]
-    assert progress.total == 3
-    assert progress.current == 3
-    assert progress.messages == [
-        "Prepared 1 chunk(s) for queued speech playback",
-        "Handing speech job to the local playback queue",
-        "Speech job queued",
-    ]
 
 
 def test_speak_text_chunks_and_queues_in_fifo_order(monkeypatch) -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
-    progress = StubProgress()
     chunked_text = ["First chunk.", "Second chunk.", "Third chunk."]
 
     monkeypatch.setattr("app.tools.chunk_text_for_tts", lambda text: list(chunked_text))
+    from app.tools import speak_text as speak_text_tool
 
-    async def run() -> dict[str, object]:
-        from app.tools import speak_text as speak_text_tool
-
-        return await speak_text_tool(
-            cast(Context, ctx),
-            cast(Progress, progress),
-            text="ignored",
-            voice_description="warm",
-        )
-
-    result = asyncio.run(run())
+    result = speak_text_tool(
+        cast(Context, ctx),
+        text="ignored",
+        voice_description="warm",
+    )
 
     assert result["result"] == "success"
     assert result["chunked"] is True
@@ -300,5 +265,3 @@ def test_speak_text_chunks_and_queues_in_fifo_order(monkeypatch) -> None:
             "language": "en",
         }
     ]
-    assert progress.total == 3
-    assert progress.current == 3
