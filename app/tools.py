@@ -3,19 +3,14 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import datetime
-import re
 from typing import cast
 
 from fastmcp import Context
 from fastmcp.dependencies import Progress
 
 from app.runtime import TTSRuntime
-
-# MARK: Constants
-
-DEFAULT_TTS_CHUNK_MAX_CHARS = 1200
-_PARAGRAPH_BREAK_RE = re.compile(r"\n\s*\n+")
-_SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+")
+from app.text_chunking import chunk_filename_stem as chunk_filename_stem_for_tts
+from app.text_chunking import chunk_text_for_tts
 
 
 # MARK: General Helpers
@@ -32,112 +27,6 @@ def _runtime_from_context(ctx: Context) -> TTSRuntime:
     if runtime is None:
         raise RuntimeError("TTS runtime is unavailable in lifespan context")
     return cast(TTSRuntime, runtime)
-
-
-def _append_chunk(chunks: list[str], value: str) -> None:
-    normalized = value.strip()
-    if normalized:
-        chunks.append(normalized)
-
-
-def _split_long_word(word: str, max_chars: int) -> list[str]:
-    return [word[index : index + max_chars] for index in range(0, len(word), max_chars)]
-
-
-def _chunk_words(text: str, max_chars: int) -> list[str]:
-    words = text.split()
-    if not words:
-        return []
-
-    chunks: list[str] = []
-    current = ""
-
-    for word in words:
-        candidate = word if not current else f"{current} {word}"
-        if len(candidate) <= max_chars:
-            current = candidate
-            continue
-
-        _append_chunk(chunks, current)
-
-        if len(word) > max_chars:
-            chunks.extend(_split_long_word(word, max_chars))
-            current = ""
-        else:
-            current = word
-
-    _append_chunk(chunks, current)
-    return chunks
-
-
-def _chunk_sentences(text: str, max_chars: int) -> list[str]:
-    sentences = [part.strip() for part in _SENTENCE_BREAK_RE.split(text.strip()) if part.strip()]
-    if not sentences:
-        return _chunk_words(text, max_chars)
-
-    chunks: list[str] = []
-    current = ""
-
-    for sentence in sentences:
-        candidate = sentence if not current else f"{current} {sentence}"
-        if len(candidate) <= max_chars:
-            current = candidate
-            continue
-
-        _append_chunk(chunks, current)
-
-        if len(sentence) > max_chars:
-            chunks.extend(_chunk_words(sentence, max_chars))
-            current = ""
-        else:
-            current = sentence
-
-    _append_chunk(chunks, current)
-    return chunks
-
-
-def chunk_text_for_tts(text: str, max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS) -> list[str]:
-    normalized = text.strip()
-    if not normalized:
-        return []
-    if max_chars <= 0:
-        raise ValueError("max_chars must be greater than zero")
-    if len(normalized) <= max_chars:
-        return [normalized]
-
-    paragraphs = [part.strip() for part in _PARAGRAPH_BREAK_RE.split(normalized) if part.strip()]
-    if not paragraphs:
-        return _chunk_sentences(normalized, max_chars)
-
-    chunks: list[str] = []
-    current = ""
-
-    for paragraph in paragraphs:
-        candidate = paragraph if not current else f"{current}\n\n{paragraph}"
-        if len(candidate) <= max_chars:
-            current = candidate
-            continue
-
-        _append_chunk(chunks, current)
-
-        if len(paragraph) > max_chars:
-            chunks.extend(_chunk_sentences(paragraph, max_chars))
-            current = ""
-        else:
-            current = paragraph
-
-    _append_chunk(chunks, current)
-    return chunks
-
-
-def _chunk_filename_stem(
-    filename_stem: str | None,
-    chunk_index: int,
-    chunk_count: int,
-) -> str | None:
-    if filename_stem is None or chunk_count <= 1:
-        return filename_stem
-    return f"{filename_stem}-{chunk_index:02d}"
 
 
 # MARK: Tool Adapters
@@ -222,7 +111,11 @@ async def speak_text(
     while chunk_queue:
         chunk_index += 1
         chunk_text = chunk_queue.popleft()
-        chunk_filename_stem = _chunk_filename_stem(filename_stem, chunk_index, chunk_count)
+        chunk_filename_stem = chunk_filename_stem_for_tts(
+            filename_stem,
+            chunk_index,
+            chunk_count,
+        )
 
         await progress.set_message(f"Generating chunk {chunk_index} of {chunk_count}")
         generation_result = await asyncio.to_thread(

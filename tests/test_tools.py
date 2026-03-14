@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.tools import chunk_text_for_tts
+from app.text_chunking import chunk_text_for_tts
 
 
 def test_chunk_text_for_tts_keeps_short_text_as_one_chunk() -> None:
