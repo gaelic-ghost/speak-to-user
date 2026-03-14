@@ -72,6 +72,7 @@ Returns current runtime state, including:
 - key lifecycle timestamps
 - output directory
 - the last recorded error, if any
+- queued speech worker activity and queue depth
 
 ### `load_model`
 
@@ -100,12 +101,11 @@ Synthesizes a single audio file and returns metadata including:
 
 ### `speak_text`
 
-Generates speech and plays it locally on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text, sends the full chunk list through one batched `generate_voice_design(...)` call, concatenates the returned waveform list into one in-memory audio buffer, and plays that single buffer directly instead of persisting temporary files. This tool supports FastMCP background task execution and can also be called synchronously by clients that do not send task metadata, which improves compatibility with simpler MCP tool runners. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
+Queues speech for local playback on the host machine without retaining an output file as part of the tool contract. Internally it chunks long text and hands the chunk list to one in-process playback worker thread, which then performs synthesis and playback outside the foreground tool call. This keeps `speak_text` compatible with simpler MCP tool runners that do not request FastMCP task execution and helps avoid foreground timeouts on longer replies. Long text is automatically chunked into paragraph-oriented units, with sentence and word fallback when a single paragraph is still too large. It reports progress for:
 
-- generation
-- buffer concatenation
-- buffer playback
-- completion
+- chunk preparation
+- queue handoff
+- queue confirmation
 
 ## Configuration
 
@@ -128,6 +128,7 @@ Environment variables:
 - When no `filename_stem` is provided, files get a UTC timestamp-based name.
 - `filename_stem` values are sanitized to keep paths predictable and filesystem-safe.
 - `speak_text` is the exception: it keeps playback in memory and does not persist chunk audio to disk.
+- `speak_text` now returns after the speech job is queued; playback continues asynchronously on the host machine.
 
 ## Language And Voice Inputs
 

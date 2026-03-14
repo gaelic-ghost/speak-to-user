@@ -34,6 +34,7 @@ class StubRuntime:
         self.generated_texts: list[str] = []
         self.generated_batches: list[list[str]] = []
         self.played_buffers: list[dict[str, object]] = []
+        self.enqueued_jobs: list[dict[str, object]] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
@@ -89,6 +90,34 @@ class StubRuntime:
             "result": "success",
             "played": True,
             "player": "sounddevice",
+        }
+
+    def enqueue_speech(self, **kwargs: object) -> dict[str, object]:
+        chunks = list(cast(list[str], kwargs.get("chunks", [])))
+        self.enqueued_jobs.append(
+            {
+                "chunks": chunks,
+                "voice_description": kwargs.get("voice_description", ""),
+                "language": kwargs.get("language", "en"),
+            }
+        )
+        return {
+            "result": "success",
+            "queued": True,
+            "job_id": len(self.enqueued_jobs),
+            "chunked": len(chunks) > 1,
+            "chunk_count": len(chunks),
+            "language": kwargs.get("language", "en"),
+            "enqueued_at": "2026-03-14T00:00:00+00:00",
+            "speech_in_progress": False,
+            "speech_current_job_id": None,
+            "speech_queue_depth": 1,
+            "speech_jobs_queued": len(self.enqueued_jobs),
+            "speech_jobs_completed": 0,
+            "speech_jobs_failed": 0,
+            "speech_last_enqueued_at": "2026-03-14T00:00:00+00:00",
+            "speech_last_completed_at": None,
+            "speech_last_error": None,
         }
 
 
@@ -201,7 +230,7 @@ def test_speak_text_requires_background_task_mode() -> None:
     asyncio.run(run())
 
 
-def test_speak_text_reports_progress_and_plays_audio() -> None:
+def test_speak_text_reports_progress_and_queues_audio() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
     progress = StubProgress()
@@ -217,20 +246,25 @@ def test_speak_text_reports_progress_and_plays_audio() -> None:
     result = asyncio.run(run())
 
     assert result["result"] == "success"
-    assert result["played"] is True
+    assert result["queued"] is True
     assert result["chunk_count"] == 1
-    assert progress.total == 4
-    assert progress.current == 4
+    assert runtime.enqueued_jobs == [
+        {
+            "chunks": ["hello"],
+            "voice_description": "warm",
+            "language": "en",
+        }
+    ]
+    assert progress.total == 3
+    assert progress.current == 3
     assert progress.messages == [
-        "Queued 1 chunk(s) for speech generation",
-        "Generating speech chunks",
-        "Concatenating audio buffer",
-        "Playing audio buffer",
-        "Playback complete",
+        "Prepared 1 chunk(s) for queued speech playback",
+        "Handing speech job to the local playback queue",
+        "Speech job queued",
     ]
 
 
-def test_speak_text_chunks_and_plays_in_fifo_order(monkeypatch) -> None:
+def test_speak_text_chunks_and_queues_in_fifo_order(monkeypatch) -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
     progress = StubProgress()
@@ -253,7 +287,12 @@ def test_speak_text_chunks_and_plays_in_fifo_order(monkeypatch) -> None:
     assert result["result"] == "success"
     assert result["chunked"] is True
     assert result["chunk_count"] == 3
-    assert runtime.generated_batches == [chunked_text]
-    assert runtime.played_buffers
-    assert progress.total == 4
-    assert progress.current == 4
+    assert runtime.enqueued_jobs == [
+        {
+            "chunks": chunked_text,
+            "voice_description": "warm",
+            "language": "en",
+        }
+    ]
+    assert progress.total == 3
+    assert progress.current == 3

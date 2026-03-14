@@ -42,6 +42,15 @@ def make_runtime(tmp_path: Path) -> TTSRuntime:
     )
 
 
+def _record_playback(
+    played: list[dict[str, object]],
+    waveform: list[float],
+    sample_rate: int,
+) -> dict[str, object]:
+    played.append({"waveform": waveform, "sample_rate": sample_rate})
+    return {"result": "success", "played": True, "player": "sounddevice"}
+
+
 # MARK: Module Helpers
 
 def test_stdout_suppression_uses_module_level_safe_print() -> None:
@@ -187,6 +196,97 @@ def test_generate_speech_buffer_batches_chunks(
     ]
 
 
+def test_enqueue_speech_returns_queue_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+
+    class FakeThread:
+        ident = 999
+
+        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
+            self.target = target
+            self.name = name
+            self.daemon = daemon
+
+        def start(self) -> None:
+            return None
+
+        def join(self, timeout: float | None = None) -> None:
+            return None
+
+    monkeypatch.setattr("app.runtime.threading.Thread", FakeThread)
+
+    result = runtime.enqueue_speech(
+        chunks=["Hello there", "General Kenobi"],
+        voice_description="Warm and calm",
+        language="en",
+    )
+
+    assert result["result"] == "success"
+    assert result["queued"] is True
+    assert result["job_id"] == 1
+    assert result["chunked"] is True
+    assert result["chunk_count"] == 2
+    assert result["language"] == "English"
+    assert result["speech_jobs_queued"] == 1
+    assert result["speech_queue_depth"] == 1
+
+
+def test_speech_worker_processes_queued_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    played: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        runtime,
+        "generate_speech_buffer",
+        lambda **kwargs: {
+            "result": "success",
+            "format": "wav",
+            "chunked": len(cast(list[str], kwargs["chunks"])) > 1,
+            "chunk_count": len(cast(list[str], kwargs["chunks"])),
+            "sample_rate": 24000,
+            "sample_count": 3,
+            "duration_seconds": 0.001,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": kwargs["language"],
+            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
+        },
+    )
+    monkeypatch.setattr(
+        runtime,
+        "play_audio_buffer",
+        lambda waveform, sample_rate: _record_playback(played, waveform.tolist(), sample_rate),
+    )
+
+    runtime._speech_queue.put(
+        {
+            "job_id": 1,
+            "chunks": ["Hello there"],
+            "voice_description": "Warm and calm",
+            "language": "English",
+        }
+    )
+    runtime._speech_queue.put(None)
+
+    runtime._speech_worker_loop()
+
+    status = runtime.status()
+    assert len(played) == 1
+    assert played[0]["sample_rate"] == 24000
+    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
+    assert status["speech_jobs_completed"] == 1
+    assert status["speech_jobs_failed"] == 0
+    assert status["speech_in_progress"] is False
+    assert status["speech_current_job_id"] is None
+    assert status["speech_last_error"] is None
+
+
 def test_generate_speech_buffer_does_not_wait_for_preload_while_holding_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -296,7 +396,7 @@ def test_start_background_preload_is_idempotent(
 
     assert runtime.start_background_preload() is True
     assert runtime.start_background_preload() is False
-    assert thread_starts["value"] == 2
+    assert thread_starts["value"] == 3
     assert runtime.status()["preload_in_progress"] is True
 
 

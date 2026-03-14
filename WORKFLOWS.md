@@ -255,50 +255,45 @@ flowchart LR
     D --> E["_chunk_sentences(...) / _chunk_words(...) / _split_long_word(...)"]
     D --> F["list[str] chunks"]
     F --> G["async Progress setup"]
-    G --> H["asyncio.to_thread(runtime.generate_speech_buffer, chunks, ...)"]
-    H --> I["runtime.generate_speech_buffer(...)"]
+    G --> H["asyncio.to_thread(runtime.enqueue_speech, chunks, ...)"]
+    H --> I["runtime.enqueue_speech(...)"]
     I --> J["normalize chunks/voice_description/language"]
-    J --> K["_synthesize_audio_batch(...)"]
-    K --> L["list[np.ndarray] waveforms + sample_rate"]
-    L --> M["_concatenate_waveforms(...)"]
-    M --> N["single np.ndarray audio buffer"]
-    N --> O["asyncio.to_thread(runtime.play_audio_buffer, waveform, sample_rate)"]
-    O --> P["sd.play(waveform, sample_rate)"]
-    P --> Q["sd.wait()"]
-    Q --> R["aggregate final success payload"]
+    J --> K["queue job for speech worker thread"]
+    K --> L["return queue metadata payload"]
+    K --> M["speech worker: generate_speech_buffer(...)"]
+    M --> N["speech worker: play_audio_buffer(...)"]
 ```
 
 ### Flow
 
-`speak_text` is the most layered path in the repo and the only tool registered as a required FastMCP background task.
+`speak_text` is the most layered path in the repo and is registered as an optional FastMCP background task.
 
 The adapter layer:
 
 1. resolves the runtime from context
 2. chunks the input text
 3. initializes FastMCP task progress
-4. sends the full chunk list to `runtime.generate_speech_buffer()` through `asyncio.to_thread(...)`
-5. sends the concatenated waveform buffer to `runtime.play_audio_buffer()` through `asyncio.to_thread(...)`
-6. assembles one aggregate result payload
+4. sends the full chunk list to `runtime.enqueue_speech()` through `asyncio.to_thread(...)`
+5. returns queue metadata immediately to the caller
+6. lets the runtime speech worker synthesize and play audio after the tool call returns
 
-Unlike older disk-backed playback designs, this path does not persist temporary audio files.
+Unlike older disk-backed playback designs, this path does not persist temporary audio files, and unlike the earlier fully blocking in-memory path, it does not wait for playback to finish before returning.
 
 ### Data Shape Transitions
 
 - input `text: str` -> `list[str]` chunk list
 - async task state -> progress side effects through `Progress.set_total()`, `set_message()`, and `increment()`
 - `list[str]` -> worker-thread runtime call through `asyncio.to_thread(...)`
-- normalized chunk inputs -> batched model inputs `text: list[str]`, `language: list[str]`, `instruct: list[str]`
-- model output `(wavs, sample_rate)` -> `list[np.ndarray[np.float32]]` + `int`
-- `list[np.ndarray]` -> single concatenated `np.ndarray[np.float32]`
-- concatenated waveform buffer + sample rate -> host playback side effect through `sd.play()` / `sd.wait()`
-- runtime buffer result `dict[str, object]` + playback result `dict[str, object]` -> final aggregate success payload `dict[str, object]`
+- normalized chunk inputs -> queued runtime job payload `dict[str, object]`
+- queued runtime job payload -> immediate queue metadata result `dict[str, object]`
+- queued runtime job payload -> speech worker synthesis and host playback side effects after the tool result has already been returned
 
 ### Errors
 
 - adapter behavior: blank input after chunking raises `ValueError("text must not be empty")`
-- unlike the synchronous adapter tools, `tools.speak_text()` does not wrap exceptions into `{"result": "error"}` payloads
-- runtime validation and synthesis/playback failures therefore bubble out of the task
+- unlike the synchronous adapter tools, `tools.speak_text()` does not wrap chunk-validation failures into `{"result": "error"}` payloads
+- runtime validation failures while enqueueing still bubble out of the tool
+- synthesis and playback failures after queueing are recorded in runtime status instead of being returned directly to the original caller
 
 ## Chunking Helper Flow
 

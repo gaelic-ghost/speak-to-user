@@ -95,35 +95,21 @@ async def speak_text(
         raise ValueError("text must not be empty")
 
     chunk_count = len(chunks)
-    total_steps = 4
+    total_steps = 3
 
     await progress.set_total(total_steps)
-    await progress.set_message(f"Queued {chunk_count} chunk(s) for speech generation")
+    await progress.set_message(f"Prepared {chunk_count} chunk(s) for queued speech playback")
     await progress.increment()
 
-    await progress.set_message("Generating speech chunks")
-    await progress.increment()
-
-    await progress.set_message("Concatenating audio buffer")
-    buffer_result = await asyncio.to_thread(
-        runtime.generate_speech_buffer,
+    await progress.set_message("Handing speech job to the local playback queue")
+    queue_result = await asyncio.to_thread(
+        runtime.enqueue_speech,
         chunks=chunks,
         voice_description=voice_description,
         language=language,
     )
     await progress.increment()
 
-    await progress.set_message("Playing audio buffer")
-    playback_result = await asyncio.to_thread(
-        runtime.play_audio_buffer,
-        buffer_result["waveform"],
-        cast(int, buffer_result["sample_rate"]),
-    )
+    await progress.set_message("Speech job queued")
     await progress.increment()
-
-    await progress.set_message("Playback complete")
-    return {
-        "result": "success",
-        **{key: value for key, value in buffer_result.items() if key != "waveform"},
-        **playback_result,
-    }
+    return cast(dict[str, object], queue_result)

@@ -29,6 +29,8 @@ uv run ruff check .
 uv run mypy .
 ```
 
+- Never run tests in parallel in this repository when they may load the TTS model or other large runtime state into memory. Gale's machine has 24GB of RAM, and overlapping model loads can exhaust memory and destabilize the system.
+
 ## FastMCP Guidance
 
 - Use the `fastmcp_docs` MCP server for up-to-date FastMCP behavior and APIs.

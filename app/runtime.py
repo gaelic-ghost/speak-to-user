@@ -6,6 +6,7 @@ import datetime as dt
 import gc
 import os
 from pathlib import Path
+import queue
 import sys
 import threading
 import time
@@ -133,6 +134,17 @@ class TTSRuntime:
         self._preload_complete = threading.Event()
         self._preload_thread: threading.Thread | None = None
         self._preload_in_progress = False
+        self._speech_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._speech_worker_started = False
+        self._speech_worker_thread: threading.Thread | None = None
+        self._speech_in_progress = False
+        self._speech_current_job_id: int | None = None
+        self._speech_jobs_queued = 0
+        self._speech_jobs_completed = 0
+        self._speech_jobs_failed = 0
+        self._speech_last_enqueued_at: dt.datetime | None = None
+        self._speech_last_completed_at: dt.datetime | None = None
+        self._speech_last_error: str | None = None
 
         self._model: Any | None = None
         self._resolved_device: str | None = None
@@ -175,11 +187,24 @@ class TTSRuntime:
             self._watchdog_started = True
             self._watchdog_thread.start()
 
+    def start_speech_worker(self) -> None:
+        with self._lock:
+            if self._speech_worker_started:
+                return
+            self._speech_worker_thread = threading.Thread(
+                target=self._speech_worker_loop,
+                name="speak-to-user-speech-worker",
+                daemon=True,
+            )
+            self._speech_worker_started = True
+            self._speech_worker_thread.start()
+
     def preload(self) -> None:
         self.start_background_preload()
 
     def start_background_preload(self) -> bool:
         self.start_watchdog()
+        self.start_speech_worker()
         with self._lock:
             if self._shutdown_requested.is_set():
                 return False
@@ -201,6 +226,8 @@ class TTSRuntime:
     def shutdown(self) -> None:
         self._shutdown_requested.set()
         self._watchdog_stop.set()
+        if self._speech_worker_started:
+            self._speech_queue.put(None)
         preload_thread = self._preload_thread
         if preload_thread is not None:
             preload_thread.join(timeout=1)
@@ -210,6 +237,9 @@ class TTSRuntime:
         thread = self._watchdog_thread
         if thread is not None:
             thread.join(timeout=1)
+        speech_thread = self._speech_worker_thread
+        if speech_thread is not None:
+            speech_thread.join(timeout=1)
 
     def status(self) -> dict[str, Any]:
         with self._lock:
@@ -293,6 +323,48 @@ class TTSRuntime:
         with self._lock:
             self.idle_unload_seconds = seconds
             return self._status_payload_locked()
+
+    def enqueue_speech(
+        self,
+        *,
+        chunks: list[str],
+        voice_description: str,
+        language: str = "en",
+    ) -> dict[str, Any]:
+        normalized_chunks = self._normalize_chunks(chunks)
+        normalized_description = voice_description.strip()
+        if not normalized_description:
+            raise ValueError("voice_description must not be empty")
+        normalized_language = _normalize_language(language)
+
+        self.start_speech_worker()
+
+        with self._lock:
+            self._speech_jobs_queued += 1
+            job_id = self._speech_jobs_queued
+            enqueued_at = _utc_now()
+            self._speech_last_enqueued_at = enqueued_at
+
+        self._speech_queue.put(
+            {
+                "job_id": job_id,
+                "chunks": normalized_chunks,
+                "voice_description": normalized_description,
+                "language": normalized_language,
+            }
+        )
+
+        with self._lock:
+            return {
+                "result": "success",
+                "queued": True,
+                "job_id": job_id,
+                "chunked": len(normalized_chunks) > 1,
+                "chunk_count": len(normalized_chunks),
+                "language": normalized_language,
+                "enqueued_at": enqueued_at.isoformat(),
+                **self._speech_status_payload_locked(),
+            }
 
     def generate_audio(
         self,
@@ -425,7 +497,62 @@ class TTSRuntime:
             "preload_completed_at": _timestamp_value(self._preload_completed_at),
             "output_dir": str(self.output_dir),
             "last_error": self._last_error,
+            **self._speech_status_payload_locked(),
         }
+
+    def _speech_status_payload_locked(self) -> dict[str, Any]:
+        return {
+            "speech_in_progress": self._speech_in_progress,
+            "speech_current_job_id": self._speech_current_job_id,
+            "speech_queue_depth": self._speech_queue.qsize(),
+            "speech_jobs_queued": self._speech_jobs_queued,
+            "speech_jobs_completed": self._speech_jobs_completed,
+            "speech_jobs_failed": self._speech_jobs_failed,
+            "speech_last_enqueued_at": _timestamp_value(self._speech_last_enqueued_at),
+            "speech_last_completed_at": _timestamp_value(self._speech_last_completed_at),
+            "speech_last_error": self._speech_last_error,
+        }
+
+    def _speech_worker_loop(self) -> None:
+        while True:
+            job = self._speech_queue.get()
+            if job is None:
+                return
+
+            job_id = int(job["job_id"])
+            chunks = list(job["chunks"])
+            voice_description = str(job["voice_description"])
+            language = str(job["language"])
+
+            with self._lock:
+                self._speech_in_progress = True
+                self._speech_current_job_id = job_id
+                self._speech_last_error = None
+
+            try:
+                buffer_result = self.generate_speech_buffer(
+                    chunks=chunks,
+                    voice_description=voice_description,
+                    language=language,
+                )
+                self.play_audio_buffer(
+                    buffer_result["waveform"],
+                    buffer_result["sample_rate"],
+                )
+            except Exception as exc:
+                with self._lock:
+                    self._speech_jobs_failed += 1
+                    self._speech_last_error = str(exc)
+                    self._last_error = str(exc)
+            else:
+                with self._lock:
+                    self._speech_jobs_completed += 1
+                    self._speech_last_completed_at = _utc_now()
+                    self._speech_last_error = None
+            finally:
+                with self._lock:
+                    self._speech_in_progress = False
+                    self._speech_current_job_id = None
 
     def _touch_locked(self, value: dt.datetime | None = None) -> None:
         self._last_used_at = value or _utc_now()
