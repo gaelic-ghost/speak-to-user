@@ -30,6 +30,8 @@ class StubRuntime:
             "preload_completed_at": None,
             "output_dir": "/tmp/generated-audio",
             "last_error": None,
+            "speech_current_chunk_index": None,
+            "speech_current_chunk_count": None,
             "speech_queue_maxsize": 4,
         }
         self.generated_texts: list[str] = []

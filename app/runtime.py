@@ -147,6 +147,8 @@ class TTSRuntime:
         self._speech_worker_thread: threading.Thread | None = None
         self._speech_in_progress = False
         self._speech_current_job_id: int | None = None
+        self._speech_current_chunk_index: int | None = None
+        self._speech_current_chunk_count: int | None = None
         self._speech_jobs_queued = 0
         self._speech_jobs_completed = 0
         self._speech_jobs_failed = 0
@@ -447,56 +449,6 @@ class TTSRuntime:
             "language": synthesis_result["language"],
         }
 
-    def generate_speech_buffer(
-        self,
-        *,
-        chunks: list[str],
-        voice_description: str,
-        language: str = "en",
-    ) -> dict[str, Any]:
-        if not chunks:
-            raise ValueError("chunks must not be empty")
-
-        normalized_description = voice_description.strip()
-        if not normalized_description:
-            raise ValueError("voice_description must not be empty")
-
-        normalized_language = _normalize_language(language)
-        normalized_chunks = self._normalize_chunks(chunks)
-        batch_result = self._synthesize_audio_batch(
-            texts=normalized_chunks,
-            voice_description=normalized_description,
-            language=normalized_language,
-        )
-        waveform = self._concatenate_waveforms(batch_result["waveforms"])
-
-        return {
-            "result": "success",
-            "format": "wav",
-            "chunked": len(normalized_chunks) > 1,
-            "chunk_count": len(normalized_chunks),
-            "sample_rate": batch_result["sample_rate"],
-            "sample_count": len(waveform),
-            "duration_seconds": round(len(waveform) / batch_result["sample_rate"], 3),
-            "model_id": batch_result["model_id"],
-            "device": batch_result["device"],
-            "language": batch_result["language"],
-            "waveform": waveform,
-        }
-
-    def play_audio_buffer(
-        self,
-        waveform: np.ndarray,
-        sample_rate: int,
-    ) -> dict[str, Any]:
-        sd.play(waveform, sample_rate)
-        sd.wait()
-        return {
-            "result": "success",
-            "played": True,
-            "player": "sounddevice",
-        }
-
     def _watchdog_loop(self) -> None:
         while not self._watchdog_stop.wait(timeout=5):
             with self._lock:
@@ -541,6 +493,8 @@ class TTSRuntime:
         return {
             "speech_in_progress": self._speech_in_progress,
             "speech_current_job_id": self._speech_current_job_id,
+            "speech_current_chunk_index": self._speech_current_chunk_index,
+            "speech_current_chunk_count": self._speech_current_chunk_count,
             "speech_queue_depth": self._speech_queue.qsize(),
             "speech_queue_maxsize": self.speech_queue_maxsize,
             "speech_jobs_queued": self._speech_jobs_queued,
@@ -565,17 +519,15 @@ class TTSRuntime:
             with self._lock:
                 self._speech_in_progress = True
                 self._speech_current_job_id = job_id
+                self._speech_current_chunk_index = 0
+                self._speech_current_chunk_count = len(chunks)
                 self._speech_last_error = None
 
             try:
-                buffer_result = self.generate_speech_buffer(
+                self.play_speech_chunks(
                     chunks=chunks,
                     voice_description=voice_description,
                     language=language,
-                )
-                self.play_audio_buffer(
-                    buffer_result["waveform"],
-                    buffer_result["sample_rate"],
                 )
             except Exception as exc:
                 with self._lock:
@@ -587,10 +539,13 @@ class TTSRuntime:
                     self._speech_jobs_completed += 1
                     self._speech_last_completed_at = _utc_now()
                     self._speech_last_error = None
+                    self._touch_locked()
             finally:
                 with self._lock:
                     self._speech_in_progress = False
                     self._speech_current_job_id = None
+                    self._speech_current_chunk_index = None
+                    self._speech_current_chunk_count = None
 
     def _touch_locked(self, value: dt.datetime | None = None) -> None:
         self._last_used_at = value or _utc_now()
@@ -631,6 +586,85 @@ class TTSRuntime:
             "language": batch_result["language"],
         }
 
+    def play_speech_chunks(
+        self,
+        *,
+        chunks: list[str],
+        voice_description: str,
+        language: str = "en",
+    ) -> dict[str, Any]:
+        if not chunks:
+            raise ValueError("chunks must not be empty")
+
+        normalized_description = voice_description.strip()
+        if not normalized_description:
+            raise ValueError("voice_description must not be empty")
+
+        normalized_language = _normalize_language(language)
+        normalized_chunks = self._normalize_chunks(chunks)
+
+        total_sample_count = 0
+        sample_rate: int | None = None
+        channel_count: int | None = None
+        stream: sd.OutputStream | None = None
+
+        try:
+            for index, chunk in enumerate(normalized_chunks, start=1):
+                with self._lock:
+                    self._speech_current_chunk_index = index
+                    self._speech_current_chunk_count = len(normalized_chunks)
+
+                synthesis_result = self._synthesize_audio(
+                    text=chunk,
+                    voice_description=normalized_description,
+                    language=normalized_language,
+                )
+                waveform = self._prepare_waveform_for_output_stream(synthesis_result["waveform"])
+                current_sample_rate = int(synthesis_result["sample_rate"])
+                current_channel_count = self._waveform_channel_count(waveform)
+
+                if stream is None:
+                    sample_rate = current_sample_rate
+                    channel_count = current_channel_count
+                    stream = self._open_output_stream(
+                        sample_rate=sample_rate,
+                        channel_count=channel_count,
+                    )
+                else:
+                    if sample_rate != current_sample_rate:
+                        raise RuntimeError(
+                            "streamed speech chunk sample rate changed during playback"
+                        )
+                    if channel_count != current_channel_count:
+                        raise RuntimeError(
+                            "streamed speech chunk channel count changed during playback"
+                        )
+
+                self._write_output_stream_chunk(stream, waveform)
+                total_sample_count += int(waveform.shape[0])
+
+            if stream is None or sample_rate is None:
+                raise RuntimeError("no speech chunks were available for playback")
+
+            return {
+                "result": "success",
+                "played": True,
+                "chunked": len(normalized_chunks) > 1,
+                "chunk_count": len(normalized_chunks),
+                "sample_rate": sample_rate,
+                "sample_count": total_sample_count,
+                "duration_seconds": (
+                    round(total_sample_count / sample_rate, 3) if sample_rate else 0.0
+                ),
+                "model_id": self.model_id,
+                "device": self._resolved_device,
+                "language": normalized_language,
+                "player": "sounddevice-stream",
+            }
+        finally:
+            if stream is not None:
+                stream.close()
+
     def _synthesize_audio_batch(
         self,
         *,
@@ -668,11 +702,6 @@ class TTSRuntime:
                 "device": self._resolved_device,
                 "language": language,
             }
-
-    def _concatenate_waveforms(self, waveforms: list[Any]) -> np.ndarray:
-        if not waveforms:
-            raise ValueError("waveforms must not be empty")
-        return np.concatenate([np.asarray(waveform, dtype=np.float32) for waveform in waveforms])
 
     def _load_model_impl(self) -> Any:
         with _suppress_default_stdout_prints_for_current_thread():
@@ -734,3 +763,43 @@ class TTSRuntime:
         if waveform_array.ndim > 1:
             waveform_array = np.squeeze(waveform_array)
         return waveform_array
+
+    def _prepare_waveform_for_output_stream(self, waveform: Any) -> np.ndarray:
+        waveform_array = np.asarray(waveform, dtype=np.float32)
+        if waveform_array.ndim == 0:
+            raise ValueError("waveform must contain at least one frame")
+        if waveform_array.ndim == 1:
+            return np.ascontiguousarray(waveform_array)
+        if waveform_array.ndim == 2:
+            return np.ascontiguousarray(waveform_array)
+        raise ValueError("waveform must be mono or multi-channel frame data")
+
+    def _waveform_channel_count(self, waveform: np.ndarray) -> int:
+        if waveform.ndim == 1:
+            return 1
+        if waveform.ndim == 2:
+            return int(waveform.shape[1])
+        raise ValueError("waveform must be mono or multi-channel frame data")
+
+    def _open_output_stream(
+        self,
+        *,
+        sample_rate: int,
+        channel_count: int,
+    ) -> sd.OutputStream:
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=channel_count,
+            dtype="float32",
+        )
+        stream.start()
+        return stream
+
+    def _write_output_stream_chunk(
+        self,
+        stream: sd.OutputStream,
+        waveform: np.ndarray,
+    ) -> None:
+        underflowed = stream.write(waveform)
+        if underflowed:
+            raise RuntimeError("audio output underflowed during streamed playback")

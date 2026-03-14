@@ -43,15 +43,6 @@ def make_runtime(tmp_path: Path) -> TTSRuntime:
     )
 
 
-def _record_playback(
-    played: list[dict[str, object]],
-    waveform: list[float],
-    sample_rate: int,
-) -> dict[str, object]:
-    played.append({"waveform": waveform, "sample_rate": sample_rate})
-    return {"result": "success", "played": True, "player": "sounddevice"}
-
-
 # MARK: Module Helpers
 
 def test_stdout_suppression_uses_module_level_safe_print() -> None:
@@ -169,32 +160,62 @@ def test_generate_audio_reloads_after_idle_unload(
     assert load_count["value"] == 2
 
 
-def test_generate_speech_buffer_batches_chunks(
+def test_play_speech_chunks_streams_one_chunk_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    fake_model = FakeModel()
+    synthesized_texts: list[str] = []
+    played: list[dict[str, object]] = []
 
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
+    class FakeStream:
+        def __init__(self) -> None:
+            self.closed = False
 
-    result = runtime.generate_speech_buffer(
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: runtime_module.np.ndarray) -> bool:
+            played.append({"waveform": waveform.tolist()})
+            return False
+
+        def close(self) -> None:
+            self.closed = True
+
+    def synthesize_audio(**kwargs: object) -> dict[str, object]:
+        synthesized_texts.append(cast(str, kwargs["text"]))
+        return {
+            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
+            "sample_rate": 24000,
+            "sample_count": 3,
+            "duration_seconds": 0.001,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": kwargs["language"],
+        }
+
+    monkeypatch.setattr(
+        runtime,
+        "_synthesize_audio",
+        synthesize_audio,
+    )
+    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
+
+    result = runtime.play_speech_chunks(
         chunks=["Hello there", "General Kenobi"],
         voice_description="Warm and calm",
         language="en",
     )
 
     assert result["result"] == "success"
+    assert result["played"] is True
     assert result["chunk_count"] == 2
-    waveform = cast(runtime_module.np.ndarray, result["waveform"])
-    assert waveform.tolist() == pytest.approx([0.0, 0.1, 0.2, 0.0, 0.1, 0.2])
-    assert fake_model.calls == [
-        {
-            "text": ["Hello there", "General Kenobi"],
-            "language": ["English", "English"],
-            "instruct": ["Warm and calm", "Warm and calm"],
-        }
-    ]
+    assert result["sample_count"] == 6
+    assert result["player"] == "sounddevice-stream"
+    assert synthesized_texts == ["Hello there", "General Kenobi"]
+    assert len(played) == 2
+    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
+    assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
 
 
 def test_enqueue_speech_returns_queue_metadata(
@@ -302,55 +323,59 @@ def test_speech_worker_processes_queued_job(
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    played: list[dict[str, object]] = []
+    played_chunks: list[list[str]] = []
+    observed_progress: list[tuple[int | None, int | None]] = []
 
-    monkeypatch.setattr(
-        runtime,
-        "generate_speech_buffer",
-        lambda **kwargs: {
+    def play_speech_chunks(**kwargs: object) -> dict[str, object]:
+        chunks = list(cast(list[str], kwargs["chunks"]))
+        played_chunks.append(chunks)
+        observed_progress.append(
+            (
+                cast(int | None, runtime.status()["speech_current_chunk_index"]),
+                cast(int | None, runtime.status()["speech_current_chunk_count"]),
+            )
+        )
+        return {
             "result": "success",
-            "format": "wav",
-            "chunked": len(cast(list[str], kwargs["chunks"])) > 1,
-            "chunk_count": len(cast(list[str], kwargs["chunks"])),
+            "played": True,
+            "player": "sounddevice-stream",
+            "chunked": len(chunks) > 1,
+            "chunk_count": len(chunks),
             "sample_rate": 24000,
             "sample_count": 3,
             "duration_seconds": 0.001,
             "model_id": "Qwen/test-model",
             "device": "cpu",
             "language": kwargs["language"],
-            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
-        },
-    )
-    monkeypatch.setattr(
-        runtime,
-        "play_audio_buffer",
-        lambda waveform, sample_rate: _record_playback(played, waveform.tolist(), sample_rate),
-    )
+        }
+
+    monkeypatch.setattr(runtime, "play_speech_chunks", play_speech_chunks)
 
     runtime._speech_queue.put(
         {
             "job_id": 1,
-            "chunks": ["Hello there"],
+            "chunks": ["Hello there", "General Kenobi"],
             "voice_description": "Warm and calm",
             "language": "English",
-        }
+        },
     )
     runtime._speech_queue.put(None)
 
     runtime._speech_worker_loop()
 
     status = runtime.status()
-    assert len(played) == 1
-    assert played[0]["sample_rate"] == 24000
-    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
+    assert played_chunks == [["Hello there", "General Kenobi"]]
     assert status["speech_jobs_completed"] == 1
     assert status["speech_jobs_failed"] == 0
     assert status["speech_in_progress"] is False
     assert status["speech_current_job_id"] is None
+    assert status["speech_current_chunk_index"] is None
+    assert status["speech_current_chunk_count"] is None
     assert status["speech_last_error"] is None
+    assert observed_progress == [(0, 2)]
 
 
-def test_generate_speech_buffer_does_not_wait_for_preload_while_holding_lock(
+def test_play_speech_chunks_does_not_wait_for_preload_while_holding_lock(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -378,8 +403,17 @@ def test_generate_speech_buffer_does_not_wait_for_preload_while_holding_lock(
     runtime._preload_in_progress = True
     runtime._preload_thread = threading.Thread(target=lambda: None, name="preload-placeholder")
     runtime._preload_complete = cast(Any, InspectPreloadEvent())
+    monkeypatch.setattr(
+        runtime,
+        "_open_output_stream",
+        lambda **kwargs: SimpleNamespace(
+            start=lambda: None,
+            write=lambda waveform: False,
+            close=lambda: None,
+        ),
+    )
 
-    result = runtime.generate_speech_buffer(
+    result = runtime.play_speech_chunks(
         chunks=["Hello there", "General Kenobi"],
         voice_description="Warm and calm",
         language="en",
@@ -389,28 +423,49 @@ def test_generate_speech_buffer_does_not_wait_for_preload_while_holding_lock(
     assert lock_state["held_during_wait"] is False
 
 
-def test_play_audio_buffer_uses_sounddevice(
+def test_play_speech_chunks_uses_output_stream(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
     played: list[dict[str, object]] = []
-    waited = {"called": False}
+
+    class FakeStream:
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: runtime_module.np.ndarray) -> bool:
+            played.append({"waveform": waveform.tolist()})
+            return False
+
+        def close(self) -> None:
+            return None
 
     monkeypatch.setattr(
-        "app.runtime.sd.play",
-        lambda waveform, sample_rate: played.append(
-            {"waveform": list(waveform), "sample_rate": sample_rate}
-        ),
+        runtime,
+        "_synthesize_audio",
+        lambda **kwargs: {
+            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
+            "sample_rate": 24000,
+            "sample_count": 3,
+            "duration_seconds": 0.001,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": kwargs["language"],
+        },
     )
-    monkeypatch.setattr("app.runtime.sd.wait", lambda: waited.__setitem__("called", True))
+    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
 
-    waveform = runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32)
-    result = runtime.play_audio_buffer(waveform, 24000)
+    result = runtime.play_speech_chunks(
+        chunks=["Hello there"],
+        voice_description="Warm and calm",
+        language="en",
+    )
 
-    assert result == {"result": "success", "played": True, "player": "sounddevice"}
-    assert played == [{"waveform": [0.0, 0.1, 0.2], "sample_rate": 24000}]
-    assert waited["called"] is True
+    assert result["result"] == "success"
+    assert result["played"] is True
+    assert len(played) == 1
+    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
 
 
 def test_watchdog_unloads_after_idle_threshold(
