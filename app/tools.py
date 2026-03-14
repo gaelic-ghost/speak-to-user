@@ -6,7 +6,6 @@ from typing import cast
 from fastmcp import Context
 
 from app.runtime import TTSRuntime
-from app.text_chunking import chunk_text_for_tts
 
 
 # MARK: General Helpers
@@ -32,53 +31,6 @@ def tts_status(ctx: Context) -> dict[str, object]:
     return runtime.status()
 
 
-def load_model(ctx: Context) -> dict[str, object]:
-    runtime = _runtime_from_context(ctx)
-    try:
-        return runtime.load_model()
-    except Exception as exc:
-        return {"result": "error", "loaded": False, "error": str(exc), **runtime.status()}
-
-
-def unload_model(ctx: Context) -> dict[str, object]:
-    runtime = _runtime_from_context(ctx)
-    try:
-        return runtime.unload_model()
-    except Exception as exc:
-        return {"result": "error", "loaded": True, "error": str(exc), **runtime.status()}
-
-
-def set_idle_unload_timeout(ctx: Context, seconds: int) -> dict[str, object]:
-    runtime = _runtime_from_context(ctx)
-    try:
-        status = runtime.set_idle_unload_timeout(seconds)
-    except Exception as exc:
-        return {"result": "error", "error": str(exc), **runtime.status()}
-    return {"result": "success", "info": "idle unload timeout updated", **status}
-
-
-def generate_audio(
-    ctx: Context,
-    *,
-    text: str,
-    voice_description: str,
-    language: str = "en",
-    output_format: str = "wav",
-    filename_stem: str | None = None,
-) -> dict[str, object]:
-    runtime = _runtime_from_context(ctx)
-    try:
-        return runtime.generate_audio(
-            text=text,
-            voice_description=voice_description,
-            language=language,
-            output_format=output_format,
-            filename_stem=filename_stem,
-        )
-    except Exception as exc:
-        return {"result": "error", "error": str(exc), **runtime.status()}
-
-
 def speak_text(
     ctx: Context,
     *,
@@ -87,13 +39,12 @@ def speak_text(
     language: str = "en",
 ) -> dict[str, object]:
     runtime = _runtime_from_context(ctx)
-    chunks = chunk_text_for_tts(text)
-    if not chunks:
+    normalized_text = text.strip()
+    if not normalized_text:
         raise ValueError("text must not be empty")
 
-    queue_result = runtime.enqueue_speech(
-        chunks=chunks,
+    return runtime.speak_text(
+        chunks=[normalized_text],
         voice_description=voice_description,
         language=language,
     )
-    return cast(dict[str, object], queue_result)

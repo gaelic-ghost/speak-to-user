@@ -8,7 +8,6 @@ dependencies = [
     "fastmcp>=3.1.0",
     "qwen-tts",
     "sounddevice>=0.5.5",
-    "soundfile>=0.13.1",
     "transformers==4.57.3",
 ]
 
@@ -37,5 +36,5 @@ check_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["qwen_tts", "sounddevice", "soundfile"]
+module = ["qwen_tts", "sounddevice"]
 ignore_missing_imports = true

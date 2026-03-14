@@ -4,8 +4,7 @@ import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
 import sys
-import threading
-from typing import Any, cast
+from typing import cast
 
 import pytest
 
@@ -34,11 +33,9 @@ class FakeModel:
 
 
 def make_runtime(tmp_path: Path) -> TTSRuntime:
+    del tmp_path
     return TTSRuntime(
         model_id="Qwen/test-model",
-        idle_unload_seconds=10,
-        speech_queue_maxsize=4,
-        output_dir=tmp_path / "generated-audio",
         device_preference="cpu",
     )
 
@@ -81,84 +78,131 @@ def test_load_model_failure_records_error(monkeypatch: pytest.MonkeyPatch, tmp_p
         runtime.load_model()
 
     assert runtime.status()["last_error"] == "load failed"
-    assert runtime.status()["preload_in_progress"] is False
 
 
-def test_unload_model_clears_loaded_state(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_preload_starts_worker_and_loads_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    calls = {"worker": 0, "load": 0}
+
+    def fake_start_speech_worker() -> bool:
+        calls["worker"] = 1
+        return True
+
+    def fake_load_model() -> dict[str, object]:
+        calls["load"] = 1
+        return {"result": "success", "loaded": True}
+
+    monkeypatch.setattr(runtime, "start_speech_worker", fake_start_speech_worker)
+    monkeypatch.setattr(runtime, "load_model", fake_load_model)
+
+    result = runtime.preload()
+
+    assert result == {"result": "success", "loaded": True}
+    assert calls == {"worker": 1, "load": 1}
+
+
+def test_shutdown_releases_loaded_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
     monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
-    runtime.load_model()
-
-    result = runtime.unload_model()
-
-    assert result["result"] == "success"
-    assert result["loaded"] is False
-    assert runtime.status()["model_loaded"] is False
-
-
-def test_set_idle_timeout_rejects_non_positive(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-
-    with pytest.raises(ValueError, match="greater than zero"):
-        runtime.set_idle_unload_timeout(0)
-
-
-# MARK: Audio Generation
-
-def test_generate_audio_writes_file_and_returns_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    fake_model = FakeModel()
-    writes: list[dict[str, object]] = []
-
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
+    released: list[tuple[object | None, str | None]] = []
     monkeypatch.setattr(
-        "app.runtime.sf.write",
-        lambda path, waveform, sample_rate: writes.append(
-            {"path": Path(path), "waveform": list(waveform), "sample_rate": sample_rate}
-        ),
+        runtime,
+        "_release_model_resources",
+        lambda model, *, resolved_device: released.append((model, resolved_device)),
     )
 
-    result = runtime.generate_audio(
-        text="Hello there",
+    runtime.load_model()
+    runtime.shutdown()
+
+    assert runtime.status()["model_loaded"] is False
+    assert len(released) == 1
+
+
+# MARK: Queue
+
+def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    worker_starts = {"value": 0}
+
+    def fake_start_speech_worker() -> bool:
+        worker_starts["value"] += 1
+        return True
+
+    monkeypatch.setattr(runtime, "start_speech_worker", fake_start_speech_worker)
+
+    result = runtime.speak_text(
+        chunks=["Hello there"],
         voice_description="Warm and calm",
         language="en",
-        output_format="wav",
-        filename_stem="greeting",
     )
 
     assert result["result"] == "success"
-    assert result["path"].endswith("greeting.wav")
-    assert result["sample_rate"] == 24000
-    assert result["sample_count"] == 3
-    assert cast(Path, writes[0]["path"]).name == "greeting.wav"
-    assert fake_model.calls[0]["language"] == ["English"]
+    assert result["queued"] is True
+    assert result["chunk_count"] == 1
+    assert result["speech_jobs_queued"] == 1
+    assert result["speech_queue_depth"] == 1
+    assert worker_starts["value"] == 1
 
 
-def test_generate_audio_reloads_after_idle_unload(
+def test_speech_worker_plays_queued_jobs_in_fifo_order(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    models = [FakeModel(), FakeModel()]
-    load_count = {"value": 0}
+    played_jobs: list[dict[str, object]] = []
 
-    def load_impl() -> FakeModel:
-        model = models[load_count["value"]]
-        load_count["value"] += 1
-        return model
+    def fake_play_speech_chunks(**kwargs: object) -> dict[str, object]:
+        played_jobs.append(dict(kwargs))
+        return {
+            "played": True,
+            "sample_rate": 24000,
+            "sample_count": 3,
+            "duration_seconds": 0.0,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": kwargs["language"],
+            "player": "sounddevice-stream",
+        }
 
-    monkeypatch.setattr(runtime, "_load_model_impl", load_impl)
-    monkeypatch.setattr("app.runtime.sf.write", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runtime, "play_speech_chunks", fake_play_speech_chunks)
 
-    runtime.generate_audio(text="First", voice_description="Plain")
-    runtime.unload_model(reason="idle timeout exceeded")
-    runtime.generate_audio(text="Second", voice_description="Plain")
+    runtime.speak_text(chunks=["first"], voice_description="warm", language="en")
+    runtime.speak_text(chunks=["second"], voice_description="warm", language="en")
+    runtime._speech_queue.put_nowait(None)
+    runtime._speech_worker_loop()
 
-    assert load_count["value"] == 2
+    assert played_jobs == [
+        {"chunks": ["first"], "voice_description": "warm", "language": "English"},
+        {"chunks": ["second"], "voice_description": "warm", "language": "English"},
+    ]
+    status = runtime.status()
+    assert status["speech_jobs_completed"] == 2
+    assert status["speech_queue_depth"] == 0
 
+
+def test_speech_worker_records_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    def boom(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        raise RuntimeError("playback failed")
+
+    monkeypatch.setattr(runtime, "play_speech_chunks", boom)
+
+    runtime.speak_text(chunks=["Hello there"], voice_description="warm", language="en")
+    runtime._speech_queue.put_nowait(None)
+    runtime._speech_worker_loop()
+
+    status = runtime.status()
+    assert status["speech_jobs_failed"] == 1
+    assert status["speech_last_error"] == "playback failed"
+    assert status["last_error"] == "playback failed"
+
+
+# MARK: Playback
 
 def test_play_speech_chunks_uses_one_batch_model_call(
     monkeypatch: pytest.MonkeyPatch,
@@ -201,11 +245,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
             "language": kwargs["language"],
         }
 
-    monkeypatch.setattr(
-        runtime,
-        "_synthesize_audio_batch",
-        synthesize_audio_batch,
-    )
+    monkeypatch.setattr(runtime, "_synthesize_audio_batch", synthesize_audio_batch)
     monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
 
     result = runtime.play_speech_chunks(
@@ -214,9 +254,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
         language="en",
     )
 
-    assert result["result"] == "success"
     assert result["played"] is True
-    assert result["chunk_count"] == 2
     assert result["sample_count"] == 6
     assert result["player"] == "sounddevice-stream"
     assert generated_batches == [
@@ -231,256 +269,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
     assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.3, 0.4, 0.5])
 
 
-def test_enqueue_speech_returns_queue_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    launched: list[dict[str, object]] = []
-    monkeypatch.setattr("app.runtime._job_dir", lambda: tmp_path / "jobs")
-
-    class FakePopen:
-        def __init__(self, args: list[str], **kwargs: object) -> None:
-            launched.append({"args": args, "kwargs": kwargs})
-
-    monkeypatch.setattr("app.runtime.subprocess.Popen", FakePopen)
-
-    result = runtime.enqueue_speech(
-        chunks=["Hello there", "General Kenobi"],
-        voice_description="Warm and calm",
-        language="en",
-    )
-
-    assert result["result"] == "success"
-    assert result["queued"] is True
-    assert result["job_id"] == 1
-    assert result["chunked"] is True
-    assert result["chunk_count"] == 2
-    assert result["language"] == "English"
-    assert result["playback_mode"] == "detached-subprocess"
-    assert result["speech_jobs_queued"] == 1
-    assert result["speech_queue_depth"] == 0
-    assert result["speech_queue_maxsize"] == 4
-    assert len(launched) == 1
-    launch_args = cast(list[str], launched[0]["args"])
-    assert launch_args[:3] == [sys.executable, "-m", "app.playback_job"]
-    job_files = list((tmp_path / "jobs").glob("*.json"))
-    assert len(job_files) == 1
-
-
-def test_enqueue_speech_rejects_after_shutdown_starts(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-    runtime._shutdown_requested.set()
-
-    with pytest.raises(RuntimeError, match="not accepting new speak_text jobs"):
-        runtime.enqueue_speech(
-            chunks=["Hello there"],
-            voice_description="Warm and calm",
-            language="en",
-        )
-
-
-def test_play_speech_chunks_does_not_wait_for_preload_while_holding_lock(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    fake_model = FakeModel()
-    lock_state: dict[str, bool] = {"held_during_wait": False}
-
-    class InspectPreloadEvent:
-        def wait(self, timeout: float | None = None) -> bool:
-            del timeout
-            acquired = runtime._lock.acquire(blocking=False)
-            if acquired:
-                runtime._lock.release()
-            lock_state["held_during_wait"] = not acquired
-            runtime._preload_in_progress = False
-            return True
-
-        def clear(self) -> None:
-            return None
-
-        def set(self) -> None:
-            return None
-
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
-    runtime._preload_in_progress = True
-    runtime._preload_thread = threading.Thread(target=lambda: None, name="preload-placeholder")
-    runtime._preload_complete = cast(Any, InspectPreloadEvent())
-    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: SimpleNamespace(
-        start=lambda: None,
-        write=lambda waveform: False,
-        close=lambda: None,
-    ))
-
-    result = runtime.play_speech_chunks(
-        chunks=["Hello there", "General Kenobi"],
-        voice_description="Warm and calm",
-        language="en",
-    )
-
-    assert result["result"] == "success"
-    assert lock_state["held_during_wait"] is False
-
-
-def test_play_speech_chunks_uses_output_stream(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    played: list[dict[str, object]] = []
-
-    class FakeStream:
-        def start(self) -> None:
-            return None
-
-        def write(self, waveform: runtime_module.np.ndarray) -> bool:
-            played.append({"waveform": waveform.tolist()})
-            return False
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(
-        runtime,
-        "_synthesize_audio_batch",
-        lambda **kwargs: {
-            "waveforms": [
-                runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32)
-            ],
-            "sample_rate": 24000,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
-            "language": kwargs["language"],
-        },
-    )
-    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
-
-    result = runtime.play_speech_chunks(
-        chunks=["Hello there"],
-        voice_description="Warm and calm",
-        language="en",
-    )
-
-    assert result["result"] == "success"
-    assert result["played"] is True
-    assert len(played) == 1
-    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
-
-
-def test_watchdog_unloads_after_idle_threshold(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
-    runtime.load_model()
-    runtime._last_used_monotonic = time_marker = 100.0
-
-    monotonic_values = iter([time_marker + 11.0])
-    monkeypatch.setattr("app.runtime.time.monotonic", lambda: next(monotonic_values))
-    wait_values = iter([False, True])
-    monkeypatch.setattr(runtime._watchdog_stop, "wait", lambda timeout: next(wait_values))
-
-    runtime._watchdog_loop()
-
-    assert runtime.status()["model_loaded"] is False
-
-
-# MARK: Background Preload
-
-def test_start_background_preload_is_idempotent(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    thread_starts = {"value": 0}
-
-    class FakeThread:
-        ident = 999
-
-        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
-            self.target = target
-            self.name = name
-            self.daemon = daemon
-
-        def start(self) -> None:
-            thread_starts["value"] += 1
-
-        def join(self, timeout: float | None = None) -> None:
-            return None
-
-    monkeypatch.setattr("app.runtime.threading.Thread", FakeThread)
-
-    assert runtime.start_background_preload() is True
-    assert runtime.start_background_preload() is False
-    assert thread_starts["value"] == 3
-    assert runtime.status()["preload_in_progress"] is True
-
-
-def test_background_preload_worker_updates_status(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    fake_now = iter(
-        [
-            dt.datetime(2026, 3, 14, 17, 0, tzinfo=dt.UTC),
-            dt.datetime(2026, 3, 14, 17, 0, 5, tzinfo=dt.UTC),
-            dt.datetime(2026, 3, 14, 17, 0, 10, tzinfo=dt.UTC),
-        ]
-    )
-
-    monkeypatch.setattr("app.runtime._utc_now", lambda: next(fake_now))
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
-
-    class FakeThread:
-        ident = 999
-
-        def __init__(self, *, target: object, name: str, daemon: bool) -> None:
-            self.target = target
-            self.name = name
-            self.daemon = daemon
-
-        def start(self) -> None:
-            return None
-
-        def join(self, timeout: float | None = None) -> None:
-            return None
-
-    monkeypatch.setattr("app.runtime.threading.Thread", FakeThread)
-
-    runtime.start_background_preload()
-    runtime._preload_thread = threading.current_thread()
-    runtime._background_preload_worker()
-
-    status = runtime.status()
-    assert status["model_loaded"] is True
-    assert status["preload_in_progress"] is False
-    assert status["preload_started_at"] == "2026-03-14T17:00:00+00:00"
-    assert status["preload_completed_at"] == "2026-03-14T17:00:10+00:00"
-
-
-def test_background_preload_worker_records_error_without_raising(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-
-    def boom() -> FakeModel:
-        raise RuntimeError("preload failed")
-
-    monkeypatch.setattr(runtime, "_load_model_impl", boom)
-
-    runtime._preload_in_progress = True
-    runtime._background_preload_worker()
-
-    status = runtime.status()
-    assert status["model_loaded"] is False
-    assert status["preload_in_progress"] is False
-    assert status["last_error"] == "preload failed"
-
+# MARK: Status
 
 def test_status_ready_requires_loaded_model(
     monkeypatch: pytest.MonkeyPatch,
@@ -490,16 +279,12 @@ def test_status_ready_requires_loaded_model(
 
     assert runtime.status()["ready"] is False
 
-    runtime._preload_in_progress = True
-    assert runtime.status()["ready"] is False
-
     monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
-    runtime._preload_in_progress = False
     runtime.load_model()
 
     assert runtime.status()["ready"] is True
 
-    runtime.unload_model()
+    runtime.shutdown()
     assert runtime.status()["ready"] is False
 
 

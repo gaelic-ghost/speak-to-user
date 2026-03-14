@@ -17,86 +17,33 @@ class StubRuntime:
     def __init__(self) -> None:
         self.status_payload = {
             "ready": True,
-            "model_loaded": False,
-            "preload_in_progress": False,
+            "model_loaded": True,
             "device": "cpu",
             "model_id": "Qwen/test-model",
-            "idle_unload_seconds": 1200,
             "last_used_at": None,
             "last_loaded_at": None,
-            "last_unloaded_at": None,
-            "preload_started_at": None,
-            "preload_completed_at": None,
-            "output_dir": "/tmp/generated-audio",
             "last_error": None,
+            "speech_in_progress": False,
+            "speech_current_job_id": None,
             "speech_current_chunk_index": None,
             "speech_current_chunk_count": None,
-            "speech_queue_maxsize": 4,
+            "speech_queue_depth": 0,
+            "speech_queue_maxsize": 32,
+            "speech_jobs_queued": 0,
+            "speech_jobs_completed": 0,
+            "speech_jobs_failed": 0,
+            "speech_last_enqueued_at": None,
+            "speech_last_completed_at": None,
+            "speech_last_error": None,
         }
-        self.generated_texts: list[str] = []
-        self.generated_batches: list[list[str]] = []
-        self.played_buffers: list[dict[str, object]] = []
-        self.enqueued_jobs: list[dict[str, object]] = []
+        self.queued_jobs: list[dict[str, object]] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
 
-    def load_model(self) -> dict[str, object]:
-        return {"result": "success", "loaded": True, **self.status_payload}
-
-    def unload_model(self) -> dict[str, object]:
-        return {"result": "success", "loaded": False, **self.status_payload}
-
-    def set_idle_unload_timeout(self, seconds: int) -> dict[str, object]:
-        payload = dict(self.status_payload)
-        payload["idle_unload_seconds"] = seconds
-        return payload
-
-    def generate_audio(self, **kwargs: object) -> dict[str, object]:
-        text = str(kwargs.get("text", ""))
-        chunk_number = len(self.generated_texts) + 1
-        self.generated_texts.append(text)
-        return {
-            "result": "success",
-            "path": f"/tmp/generated-audio/test-{chunk_number}.wav",
-            "format": "wav",
-            "sample_rate": 24000,
-            "sample_count": len(text),
-            "duration_seconds": 0.001,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
-            "language": kwargs.get("language", "en"),
-            **kwargs,
-        }
-
-    def generate_speech_buffer(self, **kwargs: object) -> dict[str, object]:
+    def speak_text(self, **kwargs: object) -> dict[str, object]:
         chunks = list(cast(list[str], kwargs.get("chunks", [])))
-        self.generated_batches.append(chunks)
-        return {
-            "result": "success",
-            "format": "wav",
-            "sample_rate": 24000,
-            "chunked": len(chunks) > 1,
-            "chunk_count": len(chunks),
-            "sample_count": sum(len(chunk) for chunk in chunks),
-            "duration_seconds": 0.003,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
-            "language": kwargs.get("language", "en"),
-            "waveform": [0.1] * max(sum(len(chunk) for chunk in chunks), 1),
-        }
-
-    def play_audio_buffer(self, waveform: object, sample_rate: int) -> dict[str, object]:
-        self.played_buffers.append({"waveform": waveform, "sample_rate": sample_rate})
-        return {
-            "result": "success",
-            "played": True,
-            "player": "sounddevice",
-        }
-
-    def enqueue_speech(self, **kwargs: object) -> dict[str, object]:
-        chunks = list(cast(list[str], kwargs.get("chunks", [])))
-        self.enqueued_jobs.append(
+        self.queued_jobs.append(
             {
                 "chunks": chunks,
                 "voice_description": kwargs.get("voice_description", ""),
@@ -106,16 +53,19 @@ class StubRuntime:
         return {
             "result": "success",
             "queued": True,
-            "job_id": len(self.enqueued_jobs),
+            "job_id": len(self.queued_jobs),
             "chunked": len(chunks) > 1,
             "chunk_count": len(chunks),
             "language": kwargs.get("language", "en"),
             "enqueued_at": "2026-03-14T00:00:00+00:00",
+            "playback_mode": "in-process-queue",
             "speech_in_progress": False,
             "speech_current_job_id": None,
-            "speech_queue_depth": 1,
-            "speech_queue_maxsize": 4,
-            "speech_jobs_queued": len(self.enqueued_jobs),
+            "speech_current_chunk_index": None,
+            "speech_current_chunk_count": None,
+            "speech_queue_depth": len(self.queued_jobs),
+            "speech_queue_maxsize": 32,
+            "speech_jobs_queued": len(self.queued_jobs),
             "speech_jobs_completed": 0,
             "speech_jobs_failed": 0,
             "speech_last_enqueued_at": "2026-03-14T00:00:00+00:00",
@@ -129,36 +79,6 @@ class StubContext:
         self.lifespan_context = {"runtime": runtime}
 
 
-def test_set_idle_unload_timeout_returns_error_payload() -> None:
-    runtime = StubRuntime()
-    ctx = StubContext(runtime)
-
-    def boom(seconds: int) -> dict[str, object]:
-        raise ValueError("bad timeout")
-
-    runtime.set_idle_unload_timeout = boom  # type: ignore[method-assign]
-
-    result = server.set_idle_unload_timeout(0, cast(Context, ctx))
-
-    assert result["result"] == "error"
-    assert result["error"] == "bad timeout"
-
-
-def test_generate_audio_returns_runtime_error_payload() -> None:
-    runtime = StubRuntime()
-    ctx = StubContext(runtime)
-
-    def boom(**kwargs: object) -> dict[str, object]:
-        raise RuntimeError("generation failed")
-
-    runtime.generate_audio = boom  # type: ignore[method-assign]
-
-    result = server.generate_audio("hello", "warm", ctx=cast(Context, ctx))
-
-    assert result["result"] == "error"
-    assert result["error"] == "generation failed"
-
-
 def test_tts_status_uses_lifespan_runtime() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
@@ -169,13 +89,13 @@ def test_tts_status_uses_lifespan_runtime() -> None:
     assert result["device"] == "cpu"
 
 
-def test_app_lifespan_starts_background_preload_and_shuts_down(monkeypatch) -> None:
+def test_app_lifespan_preloads_and_shuts_down(monkeypatch) -> None:
     events: list[str] = []
 
     class FakeRuntime:
-        def start_background_preload(self) -> bool:
-            events.append("background-preload")
-            return True
+        def preload(self) -> dict[str, object]:
+            events.append("preload")
+            return {"result": "success", "loaded": True}
 
         def shutdown(self) -> None:
             events.append("shutdown")
@@ -189,7 +109,7 @@ def test_app_lifespan_starts_background_preload_and_shuts_down(monkeypatch) -> N
 
     asyncio.run(run_lifespan())
 
-    assert events == ["background-preload", "yielded", "shutdown"]
+    assert events == ["preload", "yielded", "shutdown"]
 
 
 def test_server_module_imports_when_loaded_from_file_path() -> None:
@@ -205,17 +125,6 @@ def test_server_module_imports_when_loaded_from_file_path() -> None:
     assert module.mcp.name == "speak-to-user"
 
 
-def test_speak_text_process_resource_is_registered() -> None:
-    async def run() -> None:
-        resource = await server.mcp.get_resource("info://speak-text-process")
-        assert resource is not None
-        assert resource.mime_type == "text/markdown"
-        assert resource.name == "speak_text process"
-        assert "detached local playback path" in (resource.description or "")
-
-    asyncio.run(run())
-
-
 def test_speak_text_is_plain_tool() -> None:
     async def run() -> None:
         tool = await server.mcp.get_tool("speak_text")
@@ -224,8 +133,7 @@ def test_speak_text_is_plain_tool() -> None:
         assert tool.task_config.mode == "forbidden"
         assert "output_format" not in tool.parameters
         assert "filename_stem" not in tool.parameters
-        assert "Queue one detached speech job" in (tool.description or "")
-        assert "one model batch call for the full request" in (tool.description or "")
+        assert "Queue one full text job for local audio playback" in (tool.description or "")
 
     asyncio.run(run())
 
@@ -243,7 +151,7 @@ def test_speak_text_queues_audio() -> None:
     assert result["result"] == "success"
     assert result["queued"] is True
     assert result["chunk_count"] == 1
-    assert runtime.enqueued_jobs == [
+    assert runtime.queued_jobs == [
         {
             "chunks": ["hello"],
             "voice_description": "warm",
@@ -252,26 +160,23 @@ def test_speak_text_queues_audio() -> None:
     ]
 
 
-def test_speak_text_chunks_and_queues_in_fifo_order(monkeypatch) -> None:
+def test_speak_text_passes_full_text_as_one_request() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
-    chunked_text = ["First chunk.", "Second chunk.", "Third chunk."]
-
-    monkeypatch.setattr("app.tools.chunk_text_for_tts", lambda text: list(chunked_text))
     from app.tools import speak_text as speak_text_tool
 
     result = speak_text_tool(
         cast(Context, ctx),
-        text="ignored",
+        text="First chunk. Second chunk. Third chunk.",
         voice_description="warm",
     )
 
     assert result["result"] == "success"
-    assert result["chunked"] is True
-    assert result["chunk_count"] == 3
-    assert runtime.enqueued_jobs == [
+    assert result["chunked"] is False
+    assert result["chunk_count"] == 1
+    assert runtime.queued_jobs == [
         {
-            "chunks": chunked_text,
+            "chunks": ["First chunk. Second chunk. Third chunk."],
             "voice_description": "warm",
             "language": "en",
         }
