@@ -162,6 +162,9 @@ def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert result["speech_jobs_queued"] == 1
     assert result["speech_queue_depth"] == 1
     assert worker_starts["value"] == 1
+    assert result["speech_last_event"] == "speech_job_queued"
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert recent_events[-1]["event"] == "speech_job_queued"
 
 
 def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(
@@ -269,6 +272,8 @@ def test_speech_worker_records_failure(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert status["speech_phase"] == "idle"
     assert status["speech_last_error"] == "playback failed"
     assert status["last_error"] == "playback failed"
+    recent_events = cast(list[dict[str, object]], status["recent_events"])
+    assert recent_events[-2]["event"] == "speech_job_failed"
 
 
 def test_speech_worker_reports_synthesizing_phase_before_playback(
@@ -518,6 +523,82 @@ def test_status_ready_requires_loaded_model(
     runtime.load_model()
 
     assert runtime.status()["ready"] is True
+
+
+def test_emit_runtime_event_records_recent_event_and_prints_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    printed: list[str] = []
+
+    monkeypatch.setattr(
+        runtime_module,
+        "_ORIGINAL_PRINT",
+        lambda message, **kwargs: printed.append(str(message)),
+    )
+
+    runtime._emit_runtime_event("custom_event", level="info", job_id=7)
+
+    status = runtime.status()
+    assert status["speech_last_event"] == "custom_event"
+    assert status["speech_last_event_at"] is not None
+    recent_events = cast(list[dict[str, object]], status["recent_events"])
+    assert recent_events[-1]["event"] == "custom_event"
+    assert recent_events[-1]["job_id"] == 7
+    assert '"event": "custom_event"' in printed[-1]
+
+
+def test_recent_event_buffer_is_bounded(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    for index in range(runtime_module.DEFAULT_RECENT_EVENT_LIMIT + 5):
+        runtime._emit_runtime_event("bounded_event", level="info", event_index=index)
+
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert len(recent_events) == runtime_module.DEFAULT_RECENT_EVENT_LIMIT
+    assert recent_events[0]["event_index"] == 5
+    assert recent_events[-1]["event_index"] == runtime_module.DEFAULT_RECENT_EVENT_LIMIT + 4
+
+
+def test_speech_worker_emits_lifecycle_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
+    events: list[str] = []
+    real_emit_runtime_event = runtime._emit_runtime_event
+
+    def capture_event(event: str, *, level: str, **details: object) -> None:
+        events.append(event)
+        real_emit_runtime_event(event, level=level, **details)
+
+    monkeypatch.setattr(runtime, "_emit_runtime_event", capture_event)
+
+    def fake_play_speech_chunks(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "played": True,
+            "sample_rate": 24000,
+            "sample_count": 3,
+            "duration_seconds": 0.0,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": "English",
+            "player": "sounddevice-stream",
+        }
+
+    monkeypatch.setattr(runtime, "play_speech_chunks", fake_play_speech_chunks)
+
+    runtime.speak_text(chunks=["first"], voice_description="warm", language="en")
+    runtime._speech_queue.put_nowait(None)
+    runtime._speech_worker_loop()
+
+    assert "speech_job_queued" in events
+    assert "speech_job_started" in events
+    assert "speech_job_completed" in events
+    assert "speech_worker_stopped" in events
 
     runtime.shutdown()
     assert runtime.status()["ready"] is False

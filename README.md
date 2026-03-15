@@ -68,6 +68,9 @@ SPEAK_TO_USER_PORT=8766 uv run python app/server.py
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY`
   Allowed values: `low`, `high`, or a positive number
   Default: `high`
+- `SPEAK_TO_USER_LOG_LEVEL`
+  Allowed values: `minimal`, `info`, `debug`
+  Default: `info`
 
 Runtime language inputs accept either full language names understood by the model, short codes like `en`, or common locale variants like `en-US` and `pt_BR`.
 
@@ -79,6 +82,9 @@ They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/
 
 - Stable service: `http://127.0.0.1:8765/mcp`
 - Dev service: `http://127.0.0.1:8766/mcp`
+
+Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
+At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, completion, and failure. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
 Install or refresh the LaunchAgents:
 
