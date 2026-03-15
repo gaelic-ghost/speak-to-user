@@ -8,18 +8,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.text_chunking import chunk_text_for_tts
 
 
-def test_chunk_text_for_tts_always_chunks_by_sentence_even_when_short() -> None:
+def test_chunk_text_for_tts_keeps_short_text_together_when_it_fits() -> None:
     text = "A short paragraph. A second sentence."
 
     result = chunk_text_for_tts(text, max_chars=200)
 
-    assert result == ["A short paragraph.", "A second sentence."]
+    assert result == [text]
 
 
-def test_chunk_text_for_tts_keeps_one_sentence_per_chunk() -> None:
+def test_chunk_text_for_tts_packs_words_without_waiting_for_sentence_boundaries() -> None:
     text = "First sentence. Second sentence. Third sentence."
 
-    result = chunk_text_for_tts(text, max_chars=36)
+    result = chunk_text_for_tts(text, max_chars=18)
 
     assert result == [
         "First sentence.",
@@ -28,7 +28,7 @@ def test_chunk_text_for_tts_keeps_one_sentence_per_chunk() -> None:
     ]
 
 
-def test_chunk_text_for_tts_splits_only_overlong_sentences_by_words() -> None:
+def test_chunk_text_for_tts_splits_overlong_text_by_words() -> None:
     text = (
         "This is the first sentence. "
         "This second sentence is longer than the limit. "
@@ -39,9 +39,9 @@ def test_chunk_text_for_tts_splits_only_overlong_sentences_by_words() -> None:
 
     assert result == [
         "This is the first",
-        "sentence.",
-        "This second sentence",
-        "is longer than the",
+        "sentence. This",
+        "second sentence is",
+        "longer than the",
         "limit.",
         "Supercalifragilistic",
         "expialidocious",
