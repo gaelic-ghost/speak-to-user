@@ -211,7 +211,6 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
 ) -> None:
     runtime = make_runtime(tmp_path)
     phases: list[str] = []
-    played: list[dict[str, object]] = []
 
     def fake_synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
         del kwargs
@@ -226,23 +225,26 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
             "language": "English",
         }
 
-    def fake_play_waveform_blocking(**kwargs: object) -> None:
-        waveform = cast(runtime_module.np.ndarray, kwargs["waveform"])
-        assert kwargs["sample_rate"] == 24000
-        assert kwargs["channel_count"] == 1
-        played.append({"waveform": waveform.tolist()})
-        phases.append(cast(str, runtime.status()["speech_phase"]))
-        return None
+    class FakeStream:
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: runtime_module.np.ndarray) -> bool:
+            del waveform
+            phases.append(cast(str, runtime.status()["speech_phase"]))
+            return False
+
+        def close(self) -> None:
+            return None
 
     monkeypatch.setattr(runtime, "_synthesize_audio_batch", fake_synthesize_audio_batch)
-    monkeypatch.setattr(runtime, "_play_waveform_blocking", fake_play_waveform_blocking)
+    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
 
     runtime.speak_text(chunks=["Hello there"], voice_description="warm", language="en")
     runtime._speech_queue.put_nowait(None)
     runtime._speech_worker_loop()
 
     assert phases == ["synthesizing", "playing"]
-    assert played == [{"waveform": pytest.approx([0.0, 0.1, 0.2])}]
 
 
 # MARK: Playback
@@ -255,16 +257,19 @@ def test_play_speech_chunks_uses_one_batch_model_call(
     generated_batches: list[dict[str, object]] = []
     played: list[dict[str, object]] = []
 
-    def fake_play_waveform_blocking(**kwargs: object) -> None:
-        waveform = cast(runtime_module.np.ndarray, kwargs["waveform"])
-        played.append(
-            {
-                "waveform": waveform.tolist(),
-                "sample_rate": kwargs["sample_rate"],
-                "channel_count": kwargs["channel_count"],
-            }
-        )
-        return None
+    class FakeStream:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: runtime_module.np.ndarray) -> bool:
+            played.append({"waveform": waveform.tolist()})
+            return False
+
+        def close(self) -> None:
+            self.closed = True
 
     def synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
         generated_batches.append(
@@ -286,7 +291,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
         }
 
     monkeypatch.setattr(runtime, "_synthesize_audio_batch", synthesize_audio_batch)
-    monkeypatch.setattr(runtime, "_play_waveform_blocking", fake_play_waveform_blocking)
+    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
 
     result = runtime.play_speech_chunks(
         chunks=["Hello there", "General Kenobi"],
@@ -296,7 +301,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
 
     assert result["played"] is True
     assert result["sample_count"] == 6
-    assert result["player"] == "sounddevice-play"
+    assert result["player"] == "sounddevice-stream"
     assert runtime.status()["speech_phase"] == "playing"
     assert generated_batches == [
         {
@@ -305,51 +310,9 @@ def test_play_speech_chunks_uses_one_batch_model_call(
             "voice_description": "Warm and calm",
         }
     ]
-    assert played == [
-        {
-            "waveform": pytest.approx([0.0, 0.1, 0.2, 0.3, 0.4, 0.5]),
-            "sample_rate": 24000,
-            "channel_count": 1,
-        }
-    ]
-
-
-def test_combine_waveforms_for_playback_concatenates_channels(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-
-    result = runtime._combine_waveforms_for_playback(
-        waveforms=[
-            runtime_module.np.array([[0.0, 0.1], [0.2, 0.3]], dtype=runtime_module.np.float32),
-            runtime_module.np.array([[0.4, 0.5]], dtype=runtime_module.np.float32),
-        ],
-        channel_count=2,
-    )
-
-    assert runtime_module.np.allclose(
-        result,
-        runtime_module.np.array(
-            [[0.0, 0.1], [0.2, 0.3], [0.4, 0.5]],
-            dtype=runtime_module.np.float32,
-        ),
-    )
-
-
-def test_play_waveform_blocking_requires_matching_shape(tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-
-    with pytest.raises(ValueError, match="mono playback requires"):
-        runtime._play_waveform_blocking(
-            waveform=runtime_module.np.array([[0.0], [0.1]], dtype=runtime_module.np.float32),
-            sample_rate=24000,
-            channel_count=1,
-        )
-
-    with pytest.raises(ValueError, match="multi-channel playback requires"):
-        runtime._play_waveform_blocking(
-            waveform=runtime_module.np.array([0.0, 0.1], dtype=runtime_module.np.float32),
-            sample_rate=24000,
-            channel_count=2,
-        )
+    assert len(played) == 2
+    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
+    assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.3, 0.4, 0.5])
 
 
 # MARK: Status
