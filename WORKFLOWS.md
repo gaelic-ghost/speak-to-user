@@ -82,10 +82,13 @@ Important behavior:
 
 ```mermaid
 flowchart LR
-    A["chunk_text_for_tts(text, max_chars)"] --> B["_chunk_words(...)"]
-    B --> C{"word fits?"}
-    C -->|yes| D["append word-packed chunk"]
-    C -->|no| E["_split_long_word(...)"]
+    A["chunk_text_for_tts(text, max_chars)"] --> B["split by sentence"]
+    B --> C{"sentence fits?"}
+    C -->|yes| D["append one sentence chunk"]
+    C -->|no| E["_chunk_words(...)"]
+    E --> F{"word fits?"}
+    F -->|yes| G["append word-packed chunk"]
+    F -->|no| H["_split_long_word(...)"]
 ```
 
-Chunking is always word-level. Each request is packed into bounded word chunks immediately, and only individual overlong words are hard-split. It is used for every `speak_text` request before buffered rolling synthesis and playback.
+Chunking is always sentence-first. Each sentence becomes its own chunk whenever possible, and only individual overlong sentences fall back to word splitting. It is used for every `speak_text` request before buffered rolling synthesis and playback.

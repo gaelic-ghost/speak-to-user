@@ -31,7 +31,7 @@ uv sync
 uv run python app/server.py
 ```
 
-Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Every request is chunked at the word level inside that job, the worker synthesizes ahead into a bounded waveform queue, opens playback after preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
+Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Every request is chunked sentence-by-sentence inside that job, the worker synthesizes ahead into a bounded waveform queue, opens playback only after a larger preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
 
 ## Configuration
 
