@@ -49,42 +49,64 @@ def _chunk_words(text: str, max_chars: int) -> list[str]:
     return chunks
 
 
-def _chunk_sentences(text: str, max_chars: int) -> list[str]:
-    # Step 4: pack adjacent sentences together up to the chunk limit, then fall back to word
-    # chunking only for individual overlong sentences.
-    sentences = [part.strip() for part in _SENTENCE_BREAK_RE.split(text.strip()) if part.strip()]
-    if not sentences:
-        return _chunk_words(text, max_chars)
+def _find_sentence_break_before_limit(text: str, max_chars: int) -> tuple[int, int] | None:
+    # Step 4: prefer the nearest sentence boundary at or before the character limit.
+    window = text[: max_chars + 1]
+    matches = list(_SENTENCE_BREAK_RE.finditer(window))
+    if not matches:
+        return None
+
+    match = matches[-1]
+    return (match.start(), match.end())
+
+
+def _find_word_break_before_limit(text: str, max_chars: int) -> int | None:
+    # Step 5: if no sentence boundary fits, fall back to the last whitespace before the limit.
+    window = text[: max_chars + 1]
+    for index in range(len(window) - 1, -1, -1):
+        if window[index].isspace():
+            return index
+    return None
+
+
+def _chunk_text_by_preferred_boundaries(text: str, max_chars: int) -> list[str]:
+    # Step 6: fill chunks toward the character limit and break on the best available boundary.
+    remaining = text.strip()
+    if not remaining:
+        return []
 
     chunks: list[str] = []
-    current = ""
 
-    for sentence in sentences:
-        if len(sentence) > max_chars:
-            _append_chunk(chunks, current)
-            current = ""
-            chunks.extend(_chunk_words(sentence, max_chars))
+    while remaining:
+        if len(remaining) <= max_chars:
+            _append_chunk(chunks, remaining)
+            break
+
+        sentence_break = _find_sentence_break_before_limit(remaining, max_chars)
+        if sentence_break is not None:
+            chunk_end, next_start = sentence_break
+            _append_chunk(chunks, remaining[:chunk_end])
+            remaining = remaining[next_start:].lstrip()
             continue
 
-        candidate = sentence if not current else f"{current} {sentence}"
-        if len(candidate) <= max_chars:
-            current = candidate
+        word_break = _find_word_break_before_limit(remaining, max_chars)
+        if word_break is not None:
+            _append_chunk(chunks, remaining[:word_break])
+            remaining = remaining[word_break + 1 :].lstrip()
             continue
 
-        _append_chunk(chunks, current)
-        current = sentence
+        _append_chunk(chunks, remaining[:max_chars])
+        remaining = remaining[max_chars:].lstrip()
 
-    _append_chunk(chunks, current)
     return chunks
 
 
 def chunk_text_for_tts(text: str, max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS) -> list[str]:
-    # Step 5: always split through the sentence-first chain so every request is chunked,
-    # while still packing adjacent sentences together when possible and allowing overlong
-    # single sentences to fall back to word chunking.
+    # Step 7: chunk near the character limit and prefer sentence boundaries before falling
+    # back to word boundaries or hard splits.
     normalized = text.strip()
     if not normalized:
         return []
     if max_chars <= 0:
         raise ValueError("max_chars must be greater than zero")
-    return _chunk_sentences(normalized, max_chars)
+    return _chunk_text_by_preferred_boundaries(normalized, max_chars)

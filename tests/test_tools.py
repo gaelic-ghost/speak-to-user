@@ -27,6 +27,17 @@ def test_chunk_text_for_tts_packs_adjacent_sentences_up_to_the_limit() -> None:
     ]
 
 
+def test_chunk_text_for_tts_prefers_nearest_sentence_end_before_limit() -> None:
+    text = "One. Two. Three. Four."
+
+    result = chunk_text_for_tts(text, max_chars=12)
+
+    assert result == [
+        "One. Two.",
+        "Three. Four.",
+    ]
+
+
 def test_chunk_text_for_tts_splits_only_overlong_sentences_by_words() -> None:
     text = (
         "This is the first sentence. "
