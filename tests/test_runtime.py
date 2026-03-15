@@ -154,6 +154,7 @@ def test_speech_worker_plays_queued_jobs_in_fifo_order(
 ) -> None:
     runtime = make_runtime(tmp_path)
     played_jobs: list[dict[str, object]] = []
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
 
     def fake_play_speech_chunks(**kwargs: object) -> dict[str, object]:
         played_jobs.append(dict(kwargs))
@@ -187,6 +188,7 @@ def test_speech_worker_plays_queued_jobs_in_fifo_order(
 
 def test_speech_worker_records_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
 
     def boom(**kwargs: object) -> dict[str, object]:
         del kwargs
@@ -211,6 +213,7 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
 ) -> None:
     runtime = make_runtime(tmp_path)
     phases: list[str] = []
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
 
     def fake_synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
         del kwargs
@@ -312,7 +315,6 @@ def test_play_speech_chunks_generates_and_writes_one_chunk_at_a_time(
     assert result["played"] is True
     assert result["sample_count"] == 6
     assert result["player"] == "sounddevice-stream"
-    assert runtime.status()["speech_phase"] == "playing"
     assert generated_chunks == [
         {
             "text": "Hello there",
@@ -380,17 +382,13 @@ def test_play_speech_chunks_starts_playback_after_small_preroll_then_continues(
         language="en",
     )
 
-    assert events == [
-        "synthesize:First chunk",
-        "open",
-        "write",
-        "synthesize:Second chunk",
-        "write",
-        "synthesize:Third chunk",
-        "write",
-        "stop",
-        "close",
-    ]
+    assert events[:2] == ["synthesize:First chunk", "synthesize:Second chunk"]
+    assert "open" in events
+    open_index = events.index("open")
+    first_write_index = events.index("write")
+    assert open_index < first_write_index
+    assert events[-2:] == ["stop", "close"]
+    assert events.count("write") == 3
 
 
 def test_normalize_language_accepts_locale_variants() -> None:

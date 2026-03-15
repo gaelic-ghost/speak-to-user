@@ -7,7 +7,7 @@ import os
 import queue
 import sys
 import threading
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import sounddevice as sd  # type: ignore[import-untyped]
@@ -15,7 +15,9 @@ import sounddevice as sd  # type: ignore[import-untyped]
 # MARK: Constants
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-DEFAULT_PLAYBACK_PREROLL_SECONDS = 0.25
+DEFAULT_PLAYBACK_PREROLL_SECONDS = 0.75
+DEFAULT_PLAYBACK_PREROLL_CHUNKS = 2
+DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 8
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
 LANGUAGE_ALIASES = {
@@ -328,37 +330,81 @@ class TTSRuntime:
         normalized_chunks = self._normalize_chunks(chunks)
         total_sample_count = 0
         buffered_sample_count = 0
-        preroll_sample_target: int | None = None
         buffered_waveforms: list[np.ndarray] = []
+        buffered_chunk_count = 0
         sample_rate: int | None = None
         channel_count: int | None = None
         model_id: str | None = None
         device: str | None = None
+        preroll_sample_target: int | None = None
+        producer_error: list[BaseException] = []
+        synthesis_done = threading.Event()
+        waveform_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(
+            maxsize=DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE
+        )
+        queue_sentinel = object()
 
         stream: sd.OutputStream | None = None
+
+        def synthesize_into_queue() -> None:
+            try:
+                for text_chunk in normalized_chunks:
+                    chunk_result = self._synthesize_audio_chunk(
+                        text=text_chunk,
+                        voice_description=normalized_description,
+                        language=normalized_language,
+                    )
+                    waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
+                    waveform_queue.put(
+                        {
+                            "waveform": waveform,
+                            "sample_rate": int(chunk_result["sample_rate"]),
+                            "model_id": str(chunk_result["model_id"]),
+                            "device": str(chunk_result["device"]),
+                            "language": str(chunk_result["language"]),
+                        }
+                    )
+            except BaseException as exc:
+                producer_error.append(exc)
+            finally:
+                synthesis_done.set()
+                waveform_queue.put(queue_sentinel)
+
+        producer_thread = threading.Thread(
+            target=synthesize_into_queue,
+            name="speak-to-user-waveform-producer",
+            daemon=True,
+        )
+        producer_thread.start()
+
         try:
-            for index, text_chunk in enumerate(normalized_chunks, start=1):
+            next_chunk_index = 1
+            while True:
                 with self._lock:
                     self._speech_phase = "synthesizing"
 
-                chunk_result = self._synthesize_audio_chunk(
-                    text=text_chunk,
-                    voice_description=normalized_description,
-                    language=normalized_language,
-                )
-                waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
+                queue_item = waveform_queue.get()
+                if queue_item is queue_sentinel:
+                    break
+
+                chunk_result = cast(dict[str, Any], queue_item)
+                waveform = chunk_result["waveform"]
+
+                current_sample_rate = int(chunk_result["sample_rate"])
+                current_model_id = str(chunk_result["model_id"])
+                current_device = str(chunk_result["device"])
+                current_language = str(chunk_result["language"])
 
                 if sample_rate is None:
-                    sample_rate = int(chunk_result["sample_rate"])
+                    sample_rate = current_sample_rate
                     channel_count = self._waveform_channel_count(waveform)
                     preroll_sample_target = max(
                         1,
                         int(sample_rate * DEFAULT_PLAYBACK_PREROLL_SECONDS),
                     )
-                    model_id = str(chunk_result["model_id"])
-                    device = str(chunk_result["device"])
+                    model_id = current_model_id
+                    device = current_device
                 else:
-                    current_sample_rate = int(chunk_result["sample_rate"])
                     if current_sample_rate != sample_rate:
                         raise RuntimeError(
                             "streamed speech chunk sample rate changed during playback"
@@ -368,17 +414,34 @@ class TTSRuntime:
                         raise RuntimeError(
                             "streamed speech chunk channel count changed during playback"
                         )
+                    if model_id != current_model_id:
+                        raise RuntimeError("streamed speech chunk model id changed during playback")
+                    if device != current_device:
+                        raise RuntimeError("streamed speech chunk device changed during playback")
+                    if current_language != normalized_language:
+                        raise RuntimeError(
+                            "streamed speech chunk language changed during playback"
+                        )
 
                 if stream is None:
                     buffered_waveforms.append(waveform)
                     buffered_sample_count += int(waveform.shape[0])
+                    buffered_chunk_count += 1
                     assert sample_rate is not None
                     assert channel_count is not None
                     assert preroll_sample_target is not None
 
+                    have_enough_preroll_audio = buffered_sample_count >= preroll_sample_target
+                    have_enough_preroll_chunks = (
+                        buffered_chunk_count >= min(
+                            DEFAULT_PLAYBACK_PREROLL_CHUNKS,
+                            len(normalized_chunks),
+                        )
+                    )
                     if (
-                        buffered_sample_count < preroll_sample_target
-                        and index < len(normalized_chunks)
+                        not synthesis_done.is_set()
+                        and not have_enough_preroll_audio
+                        and not have_enough_preroll_chunks
                     ):
                         continue
 
@@ -389,26 +452,28 @@ class TTSRuntime:
                         channel_count=channel_count,
                     )
 
-                    for buffered_index, buffered_waveform in enumerate(
-                        buffered_waveforms,
-                        start=index - len(buffered_waveforms) + 1,
-                    ):
+                    for buffered_waveform in buffered_waveforms:
                         with self._lock:
                             self._speech_phase = "playing"
-                            self._speech_current_chunk_index = buffered_index
+                            self._speech_current_chunk_index = next_chunk_index
                             self._speech_current_chunk_count = len(normalized_chunks)
                         self._write_output_stream_chunk(stream, buffered_waveform)
                         total_sample_count += int(buffered_waveform.shape[0])
+                        next_chunk_index += 1
                     buffered_waveforms.clear()
                     continue
 
                 assert stream is not None
                 with self._lock:
                     self._speech_phase = "playing"
-                    self._speech_current_chunk_index = index
+                    self._speech_current_chunk_index = next_chunk_index
                     self._speech_current_chunk_count = len(normalized_chunks)
                 self._write_output_stream_chunk(stream, waveform)
                 total_sample_count += int(waveform.shape[0])
+                next_chunk_index += 1
+
+            if producer_error:
+                raise RuntimeError(str(producer_error[0])) from producer_error[0]
 
             if stream is None:
                 raise RuntimeError("no speech chunks were available for playback")
@@ -427,6 +492,7 @@ class TTSRuntime:
                 "player": "sounddevice-stream",
             }
         finally:
+            producer_thread.join(timeout=1)
             if stream is not None:
                 stream.stop()
                 stream.close()
