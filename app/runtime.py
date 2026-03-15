@@ -17,6 +17,7 @@ import sounddevice as sd  # type: ignore[import-untyped]
 DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
 DEFAULT_PLAYBACK_PREROLL_SECONDS = 0.25
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
+DEFAULT_SPEECH_PHASE = "idle"
 LANGUAGE_ALIASES = {
     "auto": "Auto",
     "en": "English",
@@ -124,6 +125,7 @@ class TTSRuntime:
         self._last_loaded_at: dt.datetime | None = None
 
         self._speech_in_progress = False
+        self._speech_phase = DEFAULT_SPEECH_PHASE
         self._speech_current_job_id: int | None = None
         self._speech_current_chunk_index: int | None = None
         self._speech_current_chunk_count: int | None = None
@@ -294,6 +296,9 @@ class TTSRuntime:
 
         normalized_language = _normalize_language(language)
         normalized_chunks = self._normalize_chunks(chunks)
+        with self._lock:
+            self._speech_phase = "synthesizing"
+
         batch_result = self._synthesize_audio_batch(
             texts=normalized_chunks,
             voice_description=normalized_description,
@@ -327,12 +332,15 @@ class TTSRuntime:
 
         stream: sd.OutputStream | None = None
         try:
+            with self._lock:
+                self._speech_phase = "opening_output"
             stream = self._open_output_stream(
                 sample_rate=sample_rate,
                 channel_count=channel_count,
             )
             for index, waveform in enumerate(buffered_waveforms + remaining_waveforms, start=1):
                 with self._lock:
+                    self._speech_phase = "playing"
                     self._speech_current_chunk_index = index
                     self._speech_current_chunk_count = len(waveforms)
                 self._write_output_stream_chunk(stream, waveform)
@@ -366,6 +374,7 @@ class TTSRuntime:
 
             with self._lock:
                 self._speech_in_progress = True
+                self._speech_phase = "synthesizing"
                 self._speech_current_job_id = job_id
                 self._speech_current_chunk_index = 0
                 self._speech_current_chunk_count = len(chunks)
@@ -392,6 +401,7 @@ class TTSRuntime:
             finally:
                 with self._lock:
                     self._speech_in_progress = False
+                    self._speech_phase = DEFAULT_SPEECH_PHASE
                     self._speech_current_job_id = None
                     self._speech_current_chunk_index = None
                     self._speech_current_chunk_count = None
@@ -412,6 +422,7 @@ class TTSRuntime:
     def _speech_status_payload_locked(self) -> dict[str, Any]:
         return {
             "speech_in_progress": self._speech_in_progress,
+            "speech_phase": self._speech_phase,
             "speech_current_job_id": self._speech_current_job_id,
             "speech_current_chunk_index": self._speech_current_chunk_index,
             "speech_current_chunk_count": self._speech_current_chunk_count,

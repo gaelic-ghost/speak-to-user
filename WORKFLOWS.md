@@ -1,6 +1,6 @@
 # Tool Workflows
 
-`WORKFLOWS.md` documents the live MCP paths in this repo. It follows the real runtime flow in `app/server.py`, `app/tools.py`, `app/runtime.py`, `app/playback_job.py`, and `app/text_chunking.py`.
+`WORKFLOWS.md` documents the live MCP paths in this repo. It follows the current implementation in `app/server.py`, `app/tools.py`, `app/runtime.py`, and `app/text_chunking.py`.
 
 ## Shared Lifespan Flow
 
@@ -9,17 +9,15 @@ flowchart LR
     A["FastMCP startup"] --> B["app_lifespan()"]
     B --> C["TTSRuntime.from_env()"]
     C --> D["TTSRuntime(...)"]
-    D --> E["runtime.start_background_preload()"]
-    E --> F["runtime.start_watchdog()"]
-    E --> H["spawn preload thread"]
-    H --> I["_background_preload_worker()"]
-    I --> J["load_model()"]
-    B --> K["yield {'runtime': runtime} into lifespan_context"]
-    K --> L["tool calls resolve ctx.lifespan_context['runtime']"]
-    B --> M["runtime.shutdown()"]
+    D --> E["runtime.preload()"]
+    E --> F["runtime.start_speech_worker()"]
+    E --> G["runtime.load_model()"]
+    B --> H["yield {'runtime': runtime} into lifespan_context"]
+    H --> I["tool calls resolve ctx.lifespan_context['runtime']"]
+    B --> J["runtime.shutdown()"]
 ```
 
-The server creates one `TTSRuntime` per FastMCP process during lifespan setup. The runtime is shared by every tool call in that process and shut down when the server exits.
+The server creates one `TTSRuntime` per FastMCP process during lifespan setup. Preload starts the in-process speech worker and blocks until the model is resident. The runtime is then shared by every tool call in that process and shut down when the server exits.
 
 ## `health`
 
@@ -43,53 +41,41 @@ flowchart LR
 
 `tts_status` resolves the shared runtime from lifespan context and returns one lock-protected status snapshot.
 
-## `generate_audio`
+Important status behavior:
 
-```mermaid
-flowchart LR
-    A["MCP tool: server.generate_audio(...)"] --> B["tools.generate_audio(ctx, ...)"]
-    B --> C["runtime.generate_audio(...)"]
-    C --> D["normalize text/voice/language/format"]
-    D --> E["_build_output_path(...)"]
-    D --> F["_synthesize_audio(...)"]
-    F --> G["_synthesize_audio_batch(texts=[text], ...)"]
-    G --> H["_model.generate_voice_design(...)"]
-    H --> I["_coerce_waveform(...)"]
-    I --> J["sf.write(...)"]
-```
-
-`generate_audio` is the file-producing path. It normalizes inputs, synthesizes one waveform in memory, writes it to disk, and returns metadata about the generated file.
+- `speech_phase` is `idle` when no job is active.
+- `speech_phase` is `synthesizing` while the model is generating audio for the active request.
+- `speech_phase` is `opening_output` while the output stream is being opened.
+- `speech_phase` is `playing` while waveform chunks are being written to the audio device.
 
 ## `speak_text`
 
 ```mermaid
 flowchart LR
     A["MCP tool: server.speak_text(...)"] --> B["tools.speak_text(ctx, ...)"]
-    B --> C["chunk_text_for_tts(text)"]
-    B --> D["runtime.enqueue_speech(...)"]
-    D --> E["write detached job payload"]
-    E --> F["spawn python -m app.playback_job"]
-    F --> G["detached helper process"]
-    G --> H["runtime.play_speech_chunks(...)"]
+    B --> C["tools._runtime_from_context(ctx)"]
+    C --> D["runtime.speak_text(...)"]
+    D --> E["normalize text, voice, language"]
+    E --> F["enqueue one job into in-process FIFO queue"]
+    F --> G["speech worker reads job"]
+    G --> H["play_speech_chunks(...)"]
     H --> I["_synthesize_audio_batch(texts=chunks, ...)"]
     I --> J["_model.generate_voice_design(...)"]
-    J --> K["list[np.ndarray] waveforms"]
-    K --> L["small playback preroll buffer"]
+    J --> K["prepare waveform arrays"]
+    K --> L["small preroll buffer"]
     L --> M["_open_output_stream(...)"]
     M --> N["_write_output_stream_chunk(...) in FIFO order"]
 ```
 
-`speak_text` is a plain MCP tool. It chunks text only to stay within model-friendly text sizes, then hands the full chunk list to the runtime for detached handoff.
-
-The detached helper process performs one model batch call for the full request, buffers a small initial amount of generated audio, opens one live output stream, and writes the generated waveforms to the host audio device in order.
+`speak_text` is a plain MCP tool. It enqueues one full text request exactly as sent by the caller. Playback then happens on the already-running in-process worker.
 
 Important behavior:
 
-- one `speak_text` call creates one detached playback job
-- one detached playback job results in one model batch call
+- one `speak_text` call creates one queued playback job
+- one playback job results in one model batch call
 - playback uses one output stream per speech request
 - playback audio is not persisted to disk
-- detached playback survives stdio-session teardown after the MCP call returns
+- `speech_phase` exposes whether the job is still synthesizing or has reached playback
 
 ## Text Chunking
 
@@ -109,4 +95,4 @@ flowchart LR
     K -->|no| M["_split_long_word(...)"]
 ```
 
-Chunking is paragraph-first, with sentence and word fallback only when needed. It is used by `speak_text` to prepare the input list for one batch synthesis request.
+Chunking is paragraph-first, with sentence and word fallback only when needed. It is used when longer text needs to be split into model-friendly chunks before one batched synthesis request.

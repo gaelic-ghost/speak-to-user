@@ -142,6 +142,7 @@ def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert result["result"] == "success"
     assert result["queued"] is True
     assert result["chunk_count"] == 1
+    assert result["speech_phase"] == "idle"
     assert result["speech_jobs_queued"] == 1
     assert result["speech_queue_depth"] == 1
     assert worker_starts["value"] == 1
@@ -180,6 +181,7 @@ def test_speech_worker_plays_queued_jobs_in_fifo_order(
     ]
     status = runtime.status()
     assert status["speech_jobs_completed"] == 2
+    assert status["speech_phase"] == "idle"
     assert status["speech_queue_depth"] == 0
 
 
@@ -198,8 +200,51 @@ def test_speech_worker_records_failure(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     status = runtime.status()
     assert status["speech_jobs_failed"] == 1
+    assert status["speech_phase"] == "idle"
     assert status["speech_last_error"] == "playback failed"
     assert status["last_error"] == "playback failed"
+
+
+def test_speech_worker_reports_synthesizing_phase_before_playback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    phases: list[str] = []
+
+    def fake_synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        phases.append(cast(str, runtime.status()["speech_phase"]))
+        return {
+            "waveforms": [
+                runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32)
+            ],
+            "sample_rate": 24000,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": "English",
+        }
+
+    class FakeStream:
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: runtime_module.np.ndarray) -> bool:
+            del waveform
+            phases.append(cast(str, runtime.status()["speech_phase"]))
+            return False
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(runtime, "_synthesize_audio_batch", fake_synthesize_audio_batch)
+    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
+
+    runtime.speak_text(chunks=["Hello there"], voice_description="warm", language="en")
+    runtime._speech_queue.put_nowait(None)
+    runtime._speech_worker_loop()
+
+    assert phases == ["synthesizing", "playing"]
 
 
 # MARK: Playback
@@ -257,6 +302,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
     assert result["played"] is True
     assert result["sample_count"] == 6
     assert result["player"] == "sounddevice-stream"
+    assert runtime.status()["speech_phase"] == "playing"
     assert generated_batches == [
         {
             "texts": ["Hello there", "General Kenobi"],
