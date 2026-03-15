@@ -4,6 +4,7 @@ import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
 import sys
+import threading
 from typing import cast
 
 import pytest
@@ -146,6 +147,54 @@ def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert result["speech_jobs_queued"] == 1
     assert result["speech_queue_depth"] == 1
     assert worker_starts["value"] == 1
+
+
+def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
+
+    real_put_nowait = runtime._speech_queue.put_nowait
+    first_put_started = threading.Event()
+    allow_first_put_to_finish = threading.Event()
+
+    def controlled_put_nowait(job: dict[str, object] | None) -> None:
+        if (
+            job is not None
+            and cast(int, job["job_id"]) == 1
+            and not first_put_started.is_set()
+        ):
+            first_put_started.set()
+            allow_first_put_to_finish.wait(timeout=1)
+        real_put_nowait(job)
+
+    monkeypatch.setattr(runtime._speech_queue, "put_nowait", controlled_put_nowait)
+
+    results: list[dict[str, object]] = [{}, {}]
+
+    def enqueue(index: int) -> None:
+        results[index] = runtime.speak_text(
+            chunks=[f"chunk {index}"],
+            voice_description="Warm and calm",
+            language="en",
+        )
+
+    first_thread = threading.Thread(target=enqueue, args=(0,))
+    second_thread = threading.Thread(target=enqueue, args=(1,))
+
+    first_thread.start()
+    first_put_started.wait(timeout=1)
+    second_thread.start()
+    allow_first_put_to_finish.set()
+    first_thread.join(timeout=1)
+    second_thread.join(timeout=1)
+
+    assert [cast(int, result["job_id"]) for result in results] == [1, 2]
+    assert runtime.status()["speech_jobs_queued"] == 2
+    queued_jobs = [runtime._speech_queue.get_nowait(), runtime._speech_queue.get_nowait()]
+    assert [cast(dict[str, object], job)["job_id"] for job in queued_jobs] == [1, 2]
 
 
 def test_speech_worker_plays_queued_jobs_in_fifo_order(

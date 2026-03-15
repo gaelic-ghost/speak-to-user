@@ -274,9 +274,12 @@ class TTSRuntime:
             raise ValueError("voice_description must not be empty")
         normalized_language = _normalize_language(language)
 
+        self.start_speech_worker()
+
         with self._lock:
             if self._shutdown_requested.is_set():
                 raise RuntimeError("runtime is shutting down and cannot accept speech jobs")
+
             job_id = self._speech_jobs_queued + 1
             job = {
                 "job_id": job_id,
@@ -285,17 +288,13 @@ class TTSRuntime:
                 "language": normalized_language,
             }
 
-        self.start_speech_worker()
-
-        try:
-            self._speech_queue.put_nowait(job)
-        except queue.Full as exc:
-            with self._lock:
+            try:
+                self._speech_queue.put_nowait(job)
+            except queue.Full as exc:
                 self._speech_last_error = "speech queue is full"
                 self._last_error = self._speech_last_error
-            raise RuntimeError("speech queue is full") from exc
+                raise RuntimeError("speech queue is full") from exc
 
-        with self._lock:
             enqueued_at = _utc_now()
             self._speech_jobs_queued = job_id
             self._speech_last_enqueued_at = enqueued_at

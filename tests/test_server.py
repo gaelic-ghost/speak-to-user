@@ -6,6 +6,8 @@ from pathlib import Path
 import sys
 from typing import cast
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fastmcp import Context
@@ -125,6 +127,66 @@ def test_server_module_imports_when_loaded_from_file_path() -> None:
     spec.loader.exec_module(module)
 
     assert module.mcp.name == "speak-to-user"
+
+
+def test_server_config_from_env_uses_http_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SPEAK_TO_USER_HOST", raising=False)
+    monkeypatch.delenv("SPEAK_TO_USER_PORT", raising=False)
+    monkeypatch.delenv("SPEAK_TO_USER_MCP_PATH", raising=False)
+
+    config = server.server_config_from_env()
+
+    assert config == server.ServerConfig(
+        host="127.0.0.1",
+        port=8765,
+        path="/mcp",
+    )
+
+
+def test_server_config_from_env_normalizes_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEAK_TO_USER_HOST", "127.0.0.1")
+    monkeypatch.setenv("SPEAK_TO_USER_PORT", "8766")
+    monkeypatch.setenv("SPEAK_TO_USER_MCP_PATH", "custom-mcp")
+
+    config = server.server_config_from_env()
+
+    assert config == server.ServerConfig(
+        host="127.0.0.1",
+        port=8766,
+        path="/custom-mcp",
+    )
+
+
+def test_server_config_from_env_rejects_invalid_port(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEAK_TO_USER_PORT", "not-a-port")
+
+    with pytest.raises(ValueError, match="SPEAK_TO_USER_PORT must be an integer"):
+        server.server_config_from_env()
+
+
+def test_main_runs_http_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    def fake_run(**kwargs: object) -> None:
+        calls.append(dict(kwargs))
+
+    monkeypatch.setattr(
+        server,
+        "server_config_from_env",
+        lambda: server.ServerConfig(host="127.0.0.1", port=8766, path="/mcp"),
+    )
+    monkeypatch.setattr(server.mcp, "run", fake_run)
+
+    server.main()
+
+    assert calls == [
+        {
+            "transport": "http",
+            "host": "127.0.0.1",
+            "port": 8766,
+            "path": "/mcp",
+        }
+    ]
 
 
 def test_speak_text_is_plain_tool() -> None:

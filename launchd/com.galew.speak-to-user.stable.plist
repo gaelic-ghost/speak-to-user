@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.galew.speak-to-user.stable</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/uv</string>
+        <string>run</string>
+        <string>python</string>
+        <string>app/server.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/galew/Workspace/speak-to-gale</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SPEAK_TO_USER_HOST</key>
+        <string>127.0.0.1</string>
+        <key>SPEAK_TO_USER_PORT</key>
+        <string>8765</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/Users/galew/Library/Logs/speak-to-user.stable.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/galew/Library/Logs/speak-to-user.stable.stderr.log</string>
+</dict>
+</plist>

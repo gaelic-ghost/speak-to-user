@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+import os
 from pathlib import Path
 import sys
 
@@ -10,6 +12,62 @@ from fastmcp.server.lifespan import lifespan
 
 from app.runtime import TTSRuntime
 from app.tools import health_payload, speak_text as speak_text_tool, tts_status as tts_status_tool
+
+
+# MARK: Server Configuration
+
+DEFAULT_HTTP_HOST = "127.0.0.1"
+DEFAULT_HTTP_PORT = 8765
+DEFAULT_HTTP_PATH = "/mcp"
+
+
+@dataclass(frozen=True, slots=True)
+class ServerConfig:
+    host: str
+    port: int
+    path: str
+
+
+def _normalize_http_host(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("SPEAK_TO_USER_HOST must not be empty")
+    return normalized
+
+
+def _normalize_http_port(value: str | None) -> int:
+    if value is None:
+        return DEFAULT_HTTP_PORT
+
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("SPEAK_TO_USER_PORT must not be empty")
+
+    try:
+        port = int(normalized)
+    except ValueError as exc:
+        raise ValueError("SPEAK_TO_USER_PORT must be an integer") from exc
+
+    if not 1 <= port <= 65535:
+        raise ValueError("SPEAK_TO_USER_PORT must be between 1 and 65535")
+    return port
+
+
+def _normalize_http_path(value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError("SPEAK_TO_USER_MCP_PATH must not be empty")
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    return normalized
+
+
+def server_config_from_env() -> ServerConfig:
+    return ServerConfig(
+        host=_normalize_http_host(os.getenv("SPEAK_TO_USER_HOST", DEFAULT_HTTP_HOST)),
+        port=_normalize_http_port(os.getenv("SPEAK_TO_USER_PORT")),
+        path=_normalize_http_path(os.getenv("SPEAK_TO_USER_MCP_PATH", DEFAULT_HTTP_PATH)),
+    )
 
 
 @lifespan
@@ -57,5 +115,15 @@ def speak_text(
     )
 
 
+def main() -> None:
+    config = server_config_from_env()
+    mcp.run(
+        transport="http",
+        host=config.host,
+        port=config.port,
+        path=config.path,
+    )
+
+
 if __name__ == "__main__":
-    mcp.run()
+    main()
