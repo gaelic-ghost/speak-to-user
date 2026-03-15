@@ -60,12 +60,12 @@ flowchart LR
     F --> G["enqueue one job into in-process FIFO queue"]
     G --> H["speech worker reads job"]
     H --> I["play_speech_chunks(...)"]
-    I --> J["_synthesize_audio_batch(texts=chunks, ...)"]
+    I --> J["_synthesize_audio_chunk(text=chunk_1, ...)"]
     J --> K["_model.generate_voice_design(...)"]
-    K --> L["prepare waveform arrays"]
-    L --> M["small preroll buffer"]
-    M --> N["_open_output_stream(...)"]
-    N --> O["_write_output_stream_chunk(...) in FIFO order"]
+    K --> L["small preroll buffer"]
+    L --> M["_open_output_stream(...)"]
+    M --> N["_write_output_stream_chunk(chunk_1)"]
+    N --> O["_synthesize_audio_chunk(text=chunk_2, ...) then write chunk_2, repeat"]
 ```
 
 `speak_text` is a plain MCP tool. It enqueues one full text job for the caller's request, chunking longer text first so playback stays model-friendly. Playback then happens on the already-running in-process worker.
@@ -73,7 +73,7 @@ flowchart LR
 Important behavior:
 
 - one `speak_text` call creates one queued playback job
-- one playback job results in one model batch call
+- one playback job keeps one output stream open while chunks are synthesized and written in order
 - playback uses one output stream per speech request
 - playback audio is not persisted to disk
 - `speech_phase` exposes whether the job is still synthesizing or has reached playback
@@ -91,4 +91,4 @@ flowchart LR
     F -->|no| H["_split_long_word(...)"]
 ```
 
-Chunking is always sentence-first. Each sentence becomes its own chunk whenever possible, and only individual overlong sentences fall back to word splitting. It is used for every `speak_text` request before one batched synthesis request.
+Chunking is always sentence-first. Each sentence becomes its own chunk whenever possible, and only individual overlong sentences fall back to word splitting. It is used for every `speak_text` request before rolling chunk synthesis and playback.

@@ -31,7 +31,7 @@ uv sync
 uv run python app/server.py
 ```
 
-Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Every request is chunked sentence-by-sentence inside that job before one batched synthesis request, and the server's playback worker speaks jobs in order while the Codex MCP session stays alive. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
+Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Every request is chunked sentence-by-sentence inside that job, the worker synthesizes chunk 1, opens playback after a tiny preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
 
 ## Configuration
 

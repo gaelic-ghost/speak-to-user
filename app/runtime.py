@@ -326,64 +326,104 @@ class TTSRuntime:
 
         normalized_language = _normalize_language(language)
         normalized_chunks = self._normalize_chunks(chunks)
-        with self._lock:
-            self._speech_phase = "synthesizing"
-
-        batch_result = self._synthesize_audio_batch(
-            texts=normalized_chunks,
-            voice_description=normalized_description,
-            language=normalized_language,
-        )
-        waveforms = [
-            self._prepare_waveform_for_output_stream(waveform)
-            for waveform in batch_result["waveforms"]
-        ]
-        if not waveforms:
-            raise RuntimeError("no speech chunks were available for playback")
-
-        sample_rate = int(batch_result["sample_rate"])
-        channel_count = self._waveform_channel_count(waveforms[0])
         total_sample_count = 0
         buffered_sample_count = 0
-        preroll_sample_target = max(1, int(sample_rate * DEFAULT_PLAYBACK_PREROLL_SECONDS))
+        preroll_sample_target: int | None = None
         buffered_waveforms: list[np.ndarray] = []
-        remaining_waveforms: list[np.ndarray] = []
-
-        for waveform in waveforms:
-            current_channel_count = self._waveform_channel_count(waveform)
-            if current_channel_count != channel_count:
-                raise RuntimeError("streamed speech chunk channel count changed during playback")
-
-            if buffered_sample_count < preroll_sample_target:
-                buffered_waveforms.append(waveform)
-                buffered_sample_count += int(waveform.shape[0])
-            else:
-                remaining_waveforms.append(waveform)
+        sample_rate: int | None = None
+        channel_count: int | None = None
+        model_id: str | None = None
+        device: str | None = None
 
         stream: sd.OutputStream | None = None
         try:
-            with self._lock:
-                self._speech_phase = "opening_output"
-            stream = self._open_output_stream(
-                sample_rate=sample_rate,
-                channel_count=channel_count,
-            )
-            for index, waveform in enumerate(buffered_waveforms + remaining_waveforms, start=1):
+            for index, text_chunk in enumerate(normalized_chunks, start=1):
+                with self._lock:
+                    self._speech_phase = "synthesizing"
+
+                chunk_result = self._synthesize_audio_chunk(
+                    text=text_chunk,
+                    voice_description=normalized_description,
+                    language=normalized_language,
+                )
+                waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
+
+                if sample_rate is None:
+                    sample_rate = int(chunk_result["sample_rate"])
+                    channel_count = self._waveform_channel_count(waveform)
+                    preroll_sample_target = max(
+                        1,
+                        int(sample_rate * DEFAULT_PLAYBACK_PREROLL_SECONDS),
+                    )
+                    model_id = str(chunk_result["model_id"])
+                    device = str(chunk_result["device"])
+                else:
+                    current_sample_rate = int(chunk_result["sample_rate"])
+                    if current_sample_rate != sample_rate:
+                        raise RuntimeError(
+                            "streamed speech chunk sample rate changed during playback"
+                        )
+                    current_channel_count = self._waveform_channel_count(waveform)
+                    if channel_count is None or current_channel_count != channel_count:
+                        raise RuntimeError(
+                            "streamed speech chunk channel count changed during playback"
+                        )
+
+                if stream is None:
+                    buffered_waveforms.append(waveform)
+                    buffered_sample_count += int(waveform.shape[0])
+                    assert sample_rate is not None
+                    assert channel_count is not None
+                    assert preroll_sample_target is not None
+
+                    if (
+                        buffered_sample_count < preroll_sample_target
+                        and index < len(normalized_chunks)
+                    ):
+                        continue
+
+                    with self._lock:
+                        self._speech_phase = "opening_output"
+                    stream = self._open_output_stream(
+                        sample_rate=sample_rate,
+                        channel_count=channel_count,
+                    )
+
+                    for buffered_index, buffered_waveform in enumerate(
+                        buffered_waveforms,
+                        start=index - len(buffered_waveforms) + 1,
+                    ):
+                        with self._lock:
+                            self._speech_phase = "playing"
+                            self._speech_current_chunk_index = buffered_index
+                            self._speech_current_chunk_count = len(normalized_chunks)
+                        self._write_output_stream_chunk(stream, buffered_waveform)
+                        total_sample_count += int(buffered_waveform.shape[0])
+                    buffered_waveforms.clear()
+                    continue
+
+                assert stream is not None
                 with self._lock:
                     self._speech_phase = "playing"
                     self._speech_current_chunk_index = index
-                    self._speech_current_chunk_count = len(waveforms)
+                    self._speech_current_chunk_count = len(normalized_chunks)
                 self._write_output_stream_chunk(stream, waveform)
                 total_sample_count += int(waveform.shape[0])
 
+            if stream is None:
+                raise RuntimeError("no speech chunks were available for playback")
+
+            assert sample_rate is not None
+            assert model_id is not None
+            assert device is not None
             return {
                 "played": True,
                 "sample_rate": sample_rate,
                 "sample_count": total_sample_count,
                 "duration_seconds": round(total_sample_count / sample_rate, 3),
-                "model_id": batch_result["model_id"],
-                "device": batch_result["device"],
-                "language": batch_result["language"],
+                "model_id": model_id,
+                "device": device,
+                "language": normalized_language,
                 "player": "sounddevice-stream",
             }
         finally:
@@ -476,10 +516,10 @@ class TTSRuntime:
             raise ValueError("chunks must not be empty")
         return normalized_chunks
 
-    def _synthesize_audio_batch(
+    def _synthesize_audio_chunk(
         self,
         *,
-        texts: list[str],
+        text: str,
         voice_description: str,
         language: str,
     ) -> dict[str, Any]:
@@ -493,21 +533,23 @@ class TTSRuntime:
             assert self._model is not None
             try:
                 wavs, sample_rate = self._model.generate_voice_design(
-                    text=texts,
-                    language=[language] * len(texts),
-                    instruct=[voice_description] * len(texts),
+                    text=[text],
+                    language=[language],
+                    instruct=[voice_description],
                 )
             except Exception as exc:
                 self._last_error = str(exc)
                 raise
 
             waveforms = [self._coerce_waveform(waveform) for waveform in wavs]
+            if not waveforms:
+                raise RuntimeError("model returned no waveform for synthesized chunk")
             now = _utc_now()
             self._last_error = None
             self._touch_locked(now)
 
             return {
-                "waveforms": waveforms,
+                "waveform": waveforms[0],
                 "sample_rate": sample_rate,
                 "model_id": self.model_id,
                 "device": self._resolved_device,

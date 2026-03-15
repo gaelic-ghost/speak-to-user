@@ -212,13 +212,11 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
     runtime = make_runtime(tmp_path)
     phases: list[str] = []
 
-    def fake_synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
+    def fake_synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
         del kwargs
         phases.append(cast(str, runtime.status()["speech_phase"]))
         return {
-            "waveforms": [
-                runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32)
-            ],
+            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
             "sample_rate": 24000,
             "model_id": "Qwen/test-model",
             "device": "cpu",
@@ -234,10 +232,13 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
             phases.append(cast(str, runtime.status()["speech_phase"]))
             return False
 
+        def stop(self) -> None:
+            return None
+
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(runtime, "_synthesize_audio_batch", fake_synthesize_audio_batch)
+    monkeypatch.setattr(runtime, "_synthesize_audio_chunk", fake_synthesize_audio_chunk)
     monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
 
     runtime.speak_text(chunks=["Hello there"], voice_description="warm", language="en")
@@ -249,12 +250,12 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
 
 # MARK: Playback
 
-def test_play_speech_chunks_uses_one_batch_model_call(
+def test_play_speech_chunks_generates_and_writes_one_chunk_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    generated_batches: list[dict[str, object]] = []
+    generated_chunks: list[dict[str, object]] = []
     played: list[dict[str, object]] = []
     opened_streams: list[FakeStream] = []
 
@@ -282,26 +283,24 @@ def test_play_speech_chunks_uses_one_batch_model_call(
         opened_streams.append(stream)
         return stream
 
-    def synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
-        generated_batches.append(
+    def synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
+        generated_chunks.append(
             {
-                "texts": list(cast(list[str], kwargs["texts"])),
+                "text": cast(str, kwargs["text"]),
                 "language": kwargs["language"],
                 "voice_description": kwargs["voice_description"],
             }
         )
+        waveform = [0.0, 0.1, 0.2] if kwargs["text"] == "Hello there" else [0.3, 0.4, 0.5]
         return {
-            "waveforms": [
-                runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
-                runtime_module.np.array([0.3, 0.4, 0.5], dtype=runtime_module.np.float32),
-            ],
+            "waveform": runtime_module.np.array(waveform, dtype=runtime_module.np.float32),
             "sample_rate": 24000,
             "model_id": "Qwen/test-model",
             "device": "cpu",
             "language": kwargs["language"],
         }
 
-    monkeypatch.setattr(runtime, "_synthesize_audio_batch", synthesize_audio_batch)
+    monkeypatch.setattr(runtime, "_synthesize_audio_chunk", synthesize_audio_chunk)
     monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
 
     result = runtime.play_speech_chunks(
@@ -314,9 +313,14 @@ def test_play_speech_chunks_uses_one_batch_model_call(
     assert result["sample_count"] == 6
     assert result["player"] == "sounddevice-stream"
     assert runtime.status()["speech_phase"] == "playing"
-    assert generated_batches == [
+    assert generated_chunks == [
         {
-            "texts": ["Hello there", "General Kenobi"],
+            "text": "Hello there",
+            "language": "English",
+            "voice_description": "Warm and calm",
+        },
+        {
+            "text": "General Kenobi",
             "language": "English",
             "voice_description": "Warm and calm",
         }
@@ -327,6 +331,66 @@ def test_play_speech_chunks_uses_one_batch_model_call(
     assert len(played) == 2
     assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
     assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.3, 0.4, 0.5])
+
+
+def test_play_speech_chunks_starts_playback_after_small_preroll_then_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    events: list[str] = []
+
+    class FakeStream:
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: runtime_module.np.ndarray) -> bool:
+            del waveform
+            events.append("write")
+            return False
+
+        def stop(self) -> None:
+            events.append("stop")
+
+        def close(self) -> None:
+            events.append("close")
+
+    def synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
+        events.append(f"synthesize:{cast(str, kwargs['text'])}")
+        waveform = runtime_module.np.zeros(6000, dtype=runtime_module.np.float32)
+        return {
+            "waveform": waveform,
+            "sample_rate": 24000,
+            "model_id": "Qwen/test-model",
+            "device": "cpu",
+            "language": kwargs["language"],
+        }
+
+    def open_output_stream(**kwargs: object) -> FakeStream:
+        del kwargs
+        events.append("open")
+        return FakeStream()
+
+    monkeypatch.setattr(runtime, "_synthesize_audio_chunk", synthesize_audio_chunk)
+    monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
+
+    runtime.play_speech_chunks(
+        chunks=["First chunk", "Second chunk", "Third chunk"],
+        voice_description="Warm and calm",
+        language="en",
+    )
+
+    assert events == [
+        "synthesize:First chunk",
+        "open",
+        "write",
+        "synthesize:Second chunk",
+        "write",
+        "synthesize:Third chunk",
+        "write",
+        "stop",
+        "close",
+    ]
 
 
 def test_normalize_language_accepts_locale_variants() -> None:
