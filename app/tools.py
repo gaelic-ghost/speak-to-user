@@ -6,6 +6,7 @@ from typing import cast
 from fastmcp import Context
 
 from app.runtime import TTSRuntime
+from app.text_chunking import chunk_text_for_tts
 
 
 # MARK: General Helpers
@@ -44,7 +45,7 @@ def speak_text(
         raise ValueError("text must not be empty")
 
     return runtime.speak_text(
-        chunks=[normalized_text],
+        chunks=chunk_text_for_tts(normalized_text),
         voice_description=voice_description,
         language=language,
     )

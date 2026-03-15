@@ -54,20 +54,21 @@ Important status behavior:
 flowchart LR
     A["MCP tool: server.speak_text(...)"] --> B["tools.speak_text(ctx, ...)"]
     B --> C["tools._runtime_from_context(ctx)"]
-    C --> D["runtime.speak_text(...)"]
-    D --> E["normalize text, voice, language"]
-    E --> F["enqueue one job into in-process FIFO queue"]
-    F --> G["speech worker reads job"]
-    G --> H["play_speech_chunks(...)"]
-    H --> I["_synthesize_audio_batch(texts=chunks, ...)"]
-    I --> J["_model.generate_voice_design(...)"]
-    J --> K["prepare waveform arrays"]
-    K --> L["small preroll buffer"]
-    L --> M["_open_output_stream(...)"]
-    M --> N["_write_output_stream_chunk(...) in FIFO order"]
+    C --> D["chunk_text_for_tts(text)"]
+    D --> E["runtime.speak_text(...)"]
+    E --> F["normalize voice, language, chunks"]
+    F --> G["enqueue one job into in-process FIFO queue"]
+    G --> H["speech worker reads job"]
+    H --> I["play_speech_chunks(...)"]
+    I --> J["_synthesize_audio_batch(texts=chunks, ...)"]
+    J --> K["_model.generate_voice_design(...)"]
+    K --> L["prepare waveform arrays"]
+    L --> M["small preroll buffer"]
+    M --> N["_open_output_stream(...)"]
+    N --> O["_write_output_stream_chunk(...) in FIFO order"]
 ```
 
-`speak_text` is a plain MCP tool. It enqueues one full text request exactly as sent by the caller. Playback then happens on the already-running in-process worker.
+`speak_text` is a plain MCP tool. It enqueues one full text job for the caller's request, chunking longer text first so playback stays model-friendly. Playback then happens on the already-running in-process worker.
 
 Important behavior:
 

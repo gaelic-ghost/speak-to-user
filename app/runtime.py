@@ -22,6 +22,22 @@ LANGUAGE_ALIASES = {
     "auto": "Auto",
     "en": "English",
     "english": "English",
+    "fr": "French",
+    "french": "French",
+    "de": "German",
+    "german": "German",
+    "it": "Italian",
+    "italian": "Italian",
+    "ja": "Japanese",
+    "japanese": "Japanese",
+    "ko": "Korean",
+    "korean": "Korean",
+    "pt": "Portuguese",
+    "portuguese": "Portuguese",
+    "ru": "Russian",
+    "russian": "Russian",
+    "es": "Spanish",
+    "spanish": "Spanish",
     "zh": "Chinese",
     "chinese": "Chinese",
 }
@@ -54,7 +70,21 @@ def _normalize_language(value: str) -> str:
     normalized = value.strip()
     if not normalized:
         raise ValueError("language must not be empty")
-    return LANGUAGE_ALIASES.get(normalized.lower(), normalized)
+
+    lowered = normalized.lower()
+    alias = LANGUAGE_ALIASES.get(lowered)
+    if alias is not None:
+        return alias
+
+    # Accept common locale variants like en-US and pt_BR by folding to the base language.
+    for separator in ("-", "_"):
+        if separator in lowered:
+            base_language = lowered.split(separator, 1)[0]
+            alias = LANGUAGE_ALIASES.get(base_language)
+            if alias is not None:
+                return alias
+
+    return normalized
 
 
 def safe_print(*args: Any, **kwargs: Any) -> None:
@@ -358,6 +388,7 @@ class TTSRuntime:
             }
         finally:
             if stream is not None:
+                stream.stop()
                 stream.close()
 
     def _speech_worker_loop(self) -> None:

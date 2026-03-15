@@ -183,3 +183,23 @@ def test_speak_text_passes_full_text_as_one_request() -> None:
             "language": "en",
         }
     ]
+
+
+def test_speak_text_chunks_long_text_before_queueing() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+    from app.tools import speak_text as speak_text_tool
+
+    long_text = ("Sentence one. " * 120).strip()
+
+    result = speak_text_tool(
+        cast(Context, ctx),
+        text=long_text,
+        voice_description="warm",
+    )
+
+    assert result["result"] == "success"
+    assert result["chunked"] is True
+    assert cast(int, result["chunk_count"]) > 1
+    assert len(runtime.queued_jobs) == 1
+    assert len(cast(list[str], runtime.queued_jobs[0]["chunks"])) > 1

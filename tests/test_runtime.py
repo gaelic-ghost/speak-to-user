@@ -256,10 +256,12 @@ def test_play_speech_chunks_uses_one_batch_model_call(
     runtime = make_runtime(tmp_path)
     generated_batches: list[dict[str, object]] = []
     played: list[dict[str, object]] = []
+    opened_streams: list[FakeStream] = []
 
     class FakeStream:
         def __init__(self) -> None:
             self.closed = False
+            self.stopped = False
 
         def start(self) -> None:
             return None
@@ -268,8 +270,17 @@ def test_play_speech_chunks_uses_one_batch_model_call(
             played.append({"waveform": waveform.tolist()})
             return False
 
+        def stop(self) -> None:
+            self.stopped = True
+
         def close(self) -> None:
             self.closed = True
+
+    def open_output_stream(**kwargs: object) -> FakeStream:
+        del kwargs
+        stream = FakeStream()
+        opened_streams.append(stream)
+        return stream
 
     def synthesize_audio_batch(**kwargs: object) -> dict[str, object]:
         generated_batches.append(
@@ -291,7 +302,7 @@ def test_play_speech_chunks_uses_one_batch_model_call(
         }
 
     monkeypatch.setattr(runtime, "_synthesize_audio_batch", synthesize_audio_batch)
-    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
+    monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
 
     result = runtime.play_speech_chunks(
         chunks=["Hello there", "General Kenobi"],
@@ -310,9 +321,17 @@ def test_play_speech_chunks_uses_one_batch_model_call(
             "voice_description": "Warm and calm",
         }
     ]
+    assert len(opened_streams) == 1
+    assert opened_streams[0].stopped is True
+    assert opened_streams[0].closed is True
     assert len(played) == 2
     assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
     assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.3, 0.4, 0.5])
+
+
+def test_normalize_language_accepts_locale_variants() -> None:
+    assert runtime_module._normalize_language("en-US") == "English"
+    assert runtime_module._normalize_language("pt_BR") == "Portuguese"
 
 
 # MARK: Status
