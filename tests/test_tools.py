@@ -8,22 +8,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.text_chunking import chunk_text_for_tts
 
 
-def test_chunk_text_for_tts_always_chunks_by_sentence_even_when_short() -> None:
+def test_chunk_text_for_tts_keeps_short_paragraphs_in_one_chunk_when_they_fit() -> None:
     text = "A short paragraph. A second sentence."
 
     result = chunk_text_for_tts(text, max_chars=200)
 
-    assert result == ["A short paragraph.", "A second sentence."]
+    assert result == ["A short paragraph. A second sentence."]
 
 
-def test_chunk_text_for_tts_keeps_one_sentence_per_chunk() -> None:
+def test_chunk_text_for_tts_packs_adjacent_sentences_up_to_the_limit() -> None:
     text = "First sentence. Second sentence. Third sentence."
 
     result = chunk_text_for_tts(text, max_chars=36)
 
     assert result == [
-        "First sentence.",
-        "Second sentence.",
+        "First sentence. Second sentence.",
         "Third sentence.",
     ]
 

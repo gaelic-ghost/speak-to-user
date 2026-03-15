@@ -50,25 +50,38 @@ def _chunk_words(text: str, max_chars: int) -> list[str]:
 
 
 def _chunk_sentences(text: str, max_chars: int) -> list[str]:
-    # Step 4: emit one sentence per chunk whenever possible, then fall back to word chunking
-    # only for individual overlong sentences.
+    # Step 4: pack adjacent sentences together up to the chunk limit, then fall back to word
+    # chunking only for individual overlong sentences.
     sentences = [part.strip() for part in _SENTENCE_BREAK_RE.split(text.strip()) if part.strip()]
     if not sentences:
         return _chunk_words(text, max_chars)
 
     chunks: list[str] = []
+    current = ""
 
     for sentence in sentences:
         if len(sentence) > max_chars:
+            _append_chunk(chunks, current)
+            current = ""
             chunks.extend(_chunk_words(sentence, max_chars))
-        else:
-            _append_chunk(chunks, sentence)
+            continue
+
+        candidate = sentence if not current else f"{current} {sentence}"
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+
+        _append_chunk(chunks, current)
+        current = sentence
+
+    _append_chunk(chunks, current)
     return chunks
 
 
 def chunk_text_for_tts(text: str, max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS) -> list[str]:
     # Step 5: always split through the sentence-first chain so every request is chunked,
-    # while still allowing overlong single sentences to fall back to word chunking.
+    # while still packing adjacent sentences together when possible and allowing overlong
+    # single sentences to fall back to word chunking.
     normalized = text.strip()
     if not normalized:
         return []
