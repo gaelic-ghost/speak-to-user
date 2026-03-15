@@ -8,7 +8,7 @@ It uses [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwe
 
 - `health`: simple smoke-test response.
 - `tts_status`: reports whether the resident model is ready and shows queue status plus the current speech phase (`idle`, `synthesizing`, `opening_output`, or `playing`).
-- `speak_text`: enqueues one full text job and internally chunks longer text into model-friendly playback segments.
+- `speak_text`: enqueues one full text job and always chunks text sentence-by-sentence before playback, with word fallback only for overlong single sentences.
 
 There is no manual load tool, no unload tool, no idle auto-unload, no detached helper process, and no file-generation path.
 
@@ -31,7 +31,7 @@ uv sync
 uv run python app/server.py
 ```
 
-Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Longer text is chunked inside that job before one batched synthesis request, and the server's playback worker speaks jobs in order while the Codex MCP session stays alive. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
+Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Every request is chunked sentence-by-sentence inside that job before one batched synthesis request, and the server's playback worker speaks jobs in order while the Codex MCP session stays alive. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
 
 ## Configuration
 

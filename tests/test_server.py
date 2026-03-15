@@ -162,7 +162,7 @@ def test_speak_text_queues_audio() -> None:
     ]
 
 
-def test_speak_text_passes_full_text_as_one_request() -> None:
+def test_speak_text_chunks_multi_sentence_text_before_queueing() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
     from app.tools import speak_text as speak_text_tool
@@ -174,11 +174,11 @@ def test_speak_text_passes_full_text_as_one_request() -> None:
     )
 
     assert result["result"] == "success"
-    assert result["chunked"] is False
-    assert result["chunk_count"] == 1
+    assert result["chunked"] is True
+    assert result["chunk_count"] == 3
     assert runtime.queued_jobs == [
         {
-            "chunks": ["First chunk. Second chunk. Third chunk."],
+            "chunks": ["First chunk.", "Second chunk.", "Third chunk."],
             "voice_description": "warm",
             "language": "en",
         }

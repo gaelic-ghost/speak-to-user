@@ -82,18 +82,13 @@ Important behavior:
 
 ```mermaid
 flowchart LR
-    A["chunk_text_for_tts(text, max_chars)"] --> B{"text fits?"}
-    B -->|yes| C["return [text]"]
-    B -->|no| D["split by paragraph"]
-    D --> E{"paragraph fits?"}
-    E -->|yes| F["append paragraph"]
-    E -->|no| G["_chunk_sentences(...)"]
-    G --> H{"sentence fits?"}
-    H -->|yes| I["append sentence"]
-    H -->|no| J["_chunk_words(...)"]
-    J --> K{"word fits?"}
-    K -->|yes| L["append word-packed chunk"]
-    K -->|no| M["_split_long_word(...)"]
+    A["chunk_text_for_tts(text, max_chars)"] --> B["split by sentence"]
+    B --> C{"sentence fits?"}
+    C -->|yes| D["append one sentence chunk"]
+    C -->|no| E["_chunk_words(...)"]
+    E --> F{"word fits?"}
+    F -->|yes| G["append word-packed chunk"]
+    F -->|no| H["_split_long_word(...)"]
 ```
 
-Chunking is paragraph-first, with sentence and word fallback only when needed. It is used when longer text needs to be split into model-friendly chunks before one batched synthesis request.
+Chunking is always sentence-first. Each sentence becomes its own chunk whenever possible, and only individual overlong sentences fall back to word splitting. It is used for every `speak_text` request before one batched synthesis request.
