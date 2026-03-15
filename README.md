@@ -50,18 +50,32 @@ SPEAK_TO_USER_PORT=8766 uv run python app/server.py
 - `SPEAK_TO_USER_DEVICE`
   Allowed values: `auto`, `mps`, `cpu`
   Default: `auto`
+- `SPEAK_TO_USER_TORCH_DTYPE`
+  Optional values: `float16`, `bfloat16`, `float32`
+  Default: unset
 - `SPEAK_TO_USER_HOST`
   Default: `127.0.0.1`
 - `SPEAK_TO_USER_PORT`
   Default: `8765`
 - `SPEAK_TO_USER_MCP_PATH`
   Default: `/mcp`
+- `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS`
+  Default: `3.0`
+- `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS`
+  Default: `2`
+- `SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE`
+  Default: `16`
+- `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY`
+  Allowed values: `low`, `high`, or a positive number
+  Default: `high`
 
 Runtime language inputs accept either full language names understood by the model, short codes like `en`, or common locale variants like `en-US` and `pt_BR`.
 
 ## LaunchAgents
 
 This repo includes LaunchAgent plists in [launchd/com.galew.speak-to-user.stable.plist](/Users/galew/Workspace/speak-to-user/launchd/com.galew.speak-to-user.stable.plist) and [launchd/com.galew.speak-to-user.dev.plist](/Users/galew/Workspace/speak-to-user/launchd/com.galew.speak-to-user.dev.plist).
+
+They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/run_service.sh), which sets a Homebrew-friendly `PATH` so tools like `sox` resolve correctly under `launchd`.
 
 - Stable service: `http://127.0.0.1:8765/mcp`
 - Dev service: `http://127.0.0.1:8766/mcp`

@@ -3,8 +3,11 @@ from __future__ import annotations
 import builtins
 import contextlib
 import datetime as dt
+import gc
+import importlib.util
 import os
 import queue
+import shutil
 import sys
 import threading
 from typing import Any, cast
@@ -15,9 +18,10 @@ import sounddevice as sd  # type: ignore[import-untyped]
 # MARK: Constants
 
 DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-DEFAULT_PLAYBACK_PREROLL_SECONDS = 20.0
-DEFAULT_PLAYBACK_PREROLL_CHUNKS = 16
-DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 8
+DEFAULT_PLAYBACK_PREROLL_SECONDS = 3.0
+DEFAULT_PLAYBACK_PREROLL_CHUNKS = 2
+DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 16
+DEFAULT_OUTPUT_STREAM_LATENCY = "high"
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
 LANGUAGE_ALIASES = {
@@ -68,6 +72,70 @@ def _normalize_device(raw: str | None) -> str:
     return value
 
 
+def _normalize_torch_dtype(raw: str | None) -> str | None:
+    value = (raw or "").strip().lower()
+    if not value:
+        return None
+    if value not in {"float16", "bfloat16", "float32"}:
+        raise ValueError(
+            "SPEAK_TO_USER_TORCH_DTYPE must be one of: float16, bfloat16, float32"
+        )
+    return value
+
+
+def _normalize_positive_float(raw: str | None, *, env_var: str, default: float) -> float:
+    if raw is None:
+        return default
+
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"{env_var} must not be empty")
+
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{env_var} must be a number") from exc
+
+    if parsed <= 0:
+        raise ValueError(f"{env_var} must be greater than zero")
+    return parsed
+
+
+def _normalize_positive_int(raw: str | None, *, env_var: str, default: int) -> int:
+    if raw is None:
+        return default
+
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"{env_var} must not be empty")
+
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{env_var} must be an integer") from exc
+
+    if parsed <= 0:
+        raise ValueError(f"{env_var} must be greater than zero")
+    return parsed
+
+
+def _normalize_output_stream_latency(raw: str | None) -> str | float:
+    value = (raw or DEFAULT_OUTPUT_STREAM_LATENCY).strip().lower()
+    if value in {"low", "high"}:
+        return value
+
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(
+            "SPEAK_TO_USER_OUTPUT_STREAM_LATENCY must be low, high, or a number"
+        ) from exc
+
+    if parsed <= 0:
+        raise ValueError("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY must be greater than zero")
+    return parsed
+
+
 def _normalize_language(value: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -87,6 +155,25 @@ def _normalize_language(value: str) -> str:
                 return alias
 
     return normalized
+
+
+def _runtime_dependency_status() -> dict[str, bool]:
+    return {
+        "sox_available": shutil.which("sox") is not None,
+        "qwen_tts_available": importlib.util.find_spec("qwen_tts") is not None,
+        "torch_available": importlib.util.find_spec("torch") is not None,
+        "torchaudio_available": importlib.util.find_spec("torchaudio") is not None,
+    }
+
+
+def _runtime_dependencies_ready() -> bool:
+    status = _runtime_dependency_status()
+    return bool(status["sox_available"] and status["qwen_tts_available"])
+
+
+def _meta_tensor_runtime_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "meta tensor" in message and "tensor.item()" in message
 
 
 def safe_print(*args: Any, **kwargs: Any) -> None:
@@ -136,11 +223,21 @@ class TTSRuntime:
         *,
         model_id: str,
         device_preference: str,
+        torch_dtype_name: str | None = None,
         speech_queue_maxsize: int = DEFAULT_SPEECH_QUEUE_MAXSIZE,
+        playback_preroll_seconds: float = DEFAULT_PLAYBACK_PREROLL_SECONDS,
+        playback_preroll_chunks: int = DEFAULT_PLAYBACK_PREROLL_CHUNKS,
+        playback_waveform_queue_maxsize: int = DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
+        output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
     ) -> None:
         self.model_id = model_id
         self.device_preference = device_preference
+        self.torch_dtype_name = torch_dtype_name
         self.speech_queue_maxsize = speech_queue_maxsize
+        self.playback_preroll_seconds = playback_preroll_seconds
+        self.playback_preroll_chunks = playback_preroll_chunks
+        self.playback_waveform_queue_maxsize = playback_waveform_queue_maxsize
+        self.output_stream_latency = output_stream_latency
 
         self._lock = threading.RLock()
         self._shutdown_requested = threading.Event()
@@ -155,6 +252,7 @@ class TTSRuntime:
         self._last_error: str | None = None
         self._last_used_at: dt.datetime | None = None
         self._last_loaded_at: dt.datetime | None = None
+        self._cpu_fallback_active = False
 
         self._speech_in_progress = False
         self._speech_phase = DEFAULT_SPEECH_PHASE
@@ -173,6 +271,25 @@ class TTSRuntime:
         return cls(
             model_id=os.getenv("SPEAK_TO_USER_MODEL_ID", DEFAULT_MODEL_ID),
             device_preference=_normalize_device(os.getenv("SPEAK_TO_USER_DEVICE")),
+            torch_dtype_name=_normalize_torch_dtype(os.getenv("SPEAK_TO_USER_TORCH_DTYPE")),
+            playback_preroll_seconds=_normalize_positive_float(
+                os.getenv("SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS"),
+                env_var="SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS",
+                default=DEFAULT_PLAYBACK_PREROLL_SECONDS,
+            ),
+            playback_preroll_chunks=_normalize_positive_int(
+                os.getenv("SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS"),
+                env_var="SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS",
+                default=DEFAULT_PLAYBACK_PREROLL_CHUNKS,
+            ),
+            playback_waveform_queue_maxsize=_normalize_positive_int(
+                os.getenv("SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE"),
+                env_var="SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE",
+                default=DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
+            ),
+            output_stream_latency=_normalize_output_stream_latency(
+                os.getenv("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY")
+            ),
         )
 
     def preload(self) -> dict[str, Any]:
@@ -220,6 +337,18 @@ class TTSRuntime:
             return self._status_payload_locked()
 
     def load_model(self) -> dict[str, Any]:
+        if not _runtime_dependencies_ready():
+            dependency_status = _runtime_dependency_status()
+            missing: list[str] = []
+            if not dependency_status["sox_available"]:
+                missing.append("sox")
+            if not dependency_status["qwen_tts_available"]:
+                missing.append("qwen_tts")
+            message = f"runtime dependencies are unavailable: {', '.join(missing)}"
+            with self._lock:
+                self._last_error = message
+            raise RuntimeError(message)
+
         with self._lock:
             if self._shutdown_requested.is_set():
                 raise RuntimeError("runtime is shutting down")
@@ -339,7 +468,7 @@ class TTSRuntime:
         producer_error: list[BaseException] = []
         synthesis_done = threading.Event()
         waveform_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(
-            maxsize=DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE
+            maxsize=self.playback_waveform_queue_maxsize
         )
         queue_sentinel = object()
 
@@ -399,7 +528,7 @@ class TTSRuntime:
                     channel_count = self._waveform_channel_count(waveform)
                     preroll_sample_target = max(
                         1,
-                        int(sample_rate * DEFAULT_PLAYBACK_PREROLL_SECONDS),
+                        int(sample_rate * self.playback_preroll_seconds),
                     )
                     model_id = current_model_id
                     device = current_device
@@ -433,7 +562,7 @@ class TTSRuntime:
                     have_enough_preroll_audio = buffered_sample_count >= preroll_sample_target
                     have_enough_preroll_chunks = (
                         buffered_chunk_count >= min(
-                            DEFAULT_PLAYBACK_PREROLL_CHUNKS,
+                            self.playback_preroll_chunks,
                             len(normalized_chunks),
                         )
                     )
@@ -544,14 +673,27 @@ class TTSRuntime:
                 self._speech_queue.task_done()
 
     def _status_payload_locked(self) -> dict[str, Any]:
+        dependency_status = _runtime_dependency_status()
         return {
-            "ready": self._model is not None and self._last_error is None,
+            "ready": (
+                _runtime_dependencies_ready()
+                and self._model is not None
+                and self._last_error is None
+            ),
             "model_loaded": self._model is not None,
+            "device_preference": self.device_preference,
             "device": self._resolved_device,
             "model_id": self.model_id,
+            "torch_dtype": self.torch_dtype_name,
+            "cpu_fallback_active": self._cpu_fallback_active,
+            "playback_preroll_seconds": self.playback_preroll_seconds,
+            "playback_preroll_chunks": self.playback_preroll_chunks,
+            "playback_waveform_queue_maxsize": self.playback_waveform_queue_maxsize,
+            "output_stream_latency": self.output_stream_latency,
             "last_used_at": _timestamp_value(self._last_used_at),
             "last_loaded_at": _timestamp_value(self._last_loaded_at),
             "last_error": self._last_error,
+            **dependency_status,
             **self._speech_status_payload_locked(),
         }
 
@@ -581,6 +723,60 @@ class TTSRuntime:
             raise ValueError("chunks must not be empty")
         return normalized_chunks
 
+    def _resolve_torch_dtype(self, torch_module: Any) -> Any | None:
+        if self.torch_dtype_name is None:
+            return None
+
+        if self.torch_dtype_name == "float16":
+            return torch_module.float16
+        if self.torch_dtype_name == "bfloat16":
+            return torch_module.bfloat16
+        if self.torch_dtype_name == "float32":
+            return torch_module.float32
+        raise RuntimeError("unsupported torch dtype configuration")
+
+    def _load_model_kwargs(self, torch_module: Any) -> dict[str, Any]:
+        load_kwargs: dict[str, Any] = {}
+        torch_dtype = self._resolve_torch_dtype(torch_module)
+
+        if self._cpu_fallback_active and self.device_preference == "auto":
+            load_kwargs["device_map"] = "cpu"
+            load_kwargs["torch_dtype"] = torch_dtype or torch_module.float32
+            return load_kwargs
+
+        load_kwargs["device_map"] = self._resolve_device(torch_module)
+        if torch_dtype is not None:
+            load_kwargs["torch_dtype"] = torch_dtype
+        return load_kwargs
+
+    def _reload_model_with_cpu_fallback(self) -> None:
+        with self._lock:
+            if self.device_preference != "auto":
+                raise RuntimeError(
+                    "CPU fallback is only supported when SPEAK_TO_USER_DEVICE=auto"
+                )
+            previous_model = self._model
+            previous_device = self._resolved_device
+            self._model = None
+            self._resolved_device = None
+            self._cpu_fallback_active = True
+
+        self._release_model_resources(previous_model, resolved_device=previous_device)
+        gc.collect()
+
+        loaded_model = self._load_model_impl()
+
+        with self._lock:
+            if self._shutdown_requested.is_set():
+                self._release_model_resources(loaded_model, resolved_device=self._resolved_device)
+                self._resolved_device = None
+                raise RuntimeError("model reload aborted during shutdown")
+
+            self._model = loaded_model
+            self._last_error = None
+            self._last_loaded_at = _utc_now()
+            self._touch_locked(self._last_loaded_at)
+
     def _synthesize_audio_chunk(
         self,
         *,
@@ -595,24 +791,48 @@ class TTSRuntime:
             self.load_model()
 
         with self._lock:
-            assert self._model is not None
-            try:
-                wavs, sample_rate = self._model.generate_voice_design(
-                    text=[text],
-                    language=[language],
-                    instruct=[voice_description],
-                )
-            except Exception as exc:
-                self._last_error = str(exc)
+            model = self._model
+
+        assert model is not None
+
+        def generate(active_model: Any) -> tuple[list[Any], int]:
+            wavs, sample_rate = active_model.generate_voice_design(
+                text=text,
+                language=language,
+                instruct=voice_description,
+            )
+            return cast(list[Any], wavs), int(sample_rate)
+
+        try:
+            wavs, sample_rate = generate(model)
+        except Exception as exc:
+            if _meta_tensor_runtime_error(exc):
+                try:
+                    self._reload_model_with_cpu_fallback()
+                    with self._lock:
+                        reloaded_model = self._model
+                    if reloaded_model is None:
+                        raise RuntimeError("CPU fallback reload completed without a loaded model")
+                    wavs, sample_rate = generate(reloaded_model)
+                except Exception as retry_exc:
+                    with self._lock:
+                        self._last_error = f"synthesis failed after CPU fallback retry: {retry_exc}"
+                    raise RuntimeError(
+                        f"synthesis failed after CPU fallback retry: {retry_exc}"
+                    ) from retry_exc
+            else:
+                with self._lock:
+                    self._last_error = str(exc)
                 raise
 
-            waveforms = [self._coerce_waveform(waveform) for waveform in wavs]
-            if not waveforms:
-                raise RuntimeError("model returned no waveform for synthesized chunk")
+        waveforms = [self._coerce_waveform(waveform) for waveform in wavs]
+        if not waveforms:
+            raise RuntimeError("model returned no waveform for synthesized chunk")
+
+        with self._lock:
             now = _utc_now()
             self._last_error = None
             self._touch_locked(now)
-
             return {
                 "waveform": waveforms[0],
                 "sample_rate": sample_rate,
@@ -626,12 +846,10 @@ class TTSRuntime:
             import torch
             from qwen_tts import Qwen3TTSModel  # type: ignore[import-untyped]
 
-            resolved_device = self._resolve_device(torch)
+            load_kwargs = self._load_model_kwargs(torch)
+            resolved_device = str(load_kwargs["device_map"])
             self._resolved_device = resolved_device
-            return Qwen3TTSModel.from_pretrained(
-                self.model_id,
-                device_map=resolved_device,
-            )
+            return Qwen3TTSModel.from_pretrained(self.model_id, **load_kwargs)
 
     def _resolve_device(self, torch_module: Any) -> str:
         if self.device_preference == "cpu":
@@ -708,6 +926,7 @@ class TTSRuntime:
             samplerate=sample_rate,
             channels=channel_count,
             dtype="float32",
+            latency=self.output_stream_latency,
         )
         stream.start()
         return stream

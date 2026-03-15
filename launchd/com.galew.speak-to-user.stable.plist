@@ -6,13 +6,8 @@
     <string>com.galew.speak-to-user.stable</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/homebrew/bin/uv</string>
-        <string>run</string>
-        <string>python</string>
-        <string>app/server.py</string>
+        <string>/Users/galew/Workspace/speak-to-gale/scripts/run_service.sh</string>
     </array>
-    <key>WorkingDirectory</key>
-    <string>/Users/galew/Workspace/speak-to-gale</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>SPEAK_TO_USER_HOST</key>

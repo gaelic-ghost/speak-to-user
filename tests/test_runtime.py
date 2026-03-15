@@ -41,6 +41,21 @@ def make_runtime(tmp_path: Path) -> TTSRuntime:
     )
 
 
+@pytest.fixture(autouse=True)
+def runtime_dependencies_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runtime_module, "_runtime_dependencies_ready", lambda: True)
+    monkeypatch.setattr(
+        runtime_module,
+        "_runtime_dependency_status",
+        lambda: {
+            "sox_available": True,
+            "qwen_tts_available": True,
+            "torch_available": True,
+            "torchaudio_available": True,
+        },
+    )
+
+
 # MARK: Module Helpers
 
 def test_stdout_suppression_uses_module_level_safe_print() -> None:
@@ -298,6 +313,50 @@ def test_speech_worker_reports_synthesizing_phase_before_playback(
     runtime._speech_worker_loop()
 
     assert phases == ["synthesizing", "playing"]
+
+
+def test_synthesize_audio_chunk_retries_with_cpu_fallback_for_meta_tensor_error(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.device_preference = "auto"
+    first_model = SimpleNamespace()
+    second_model = FakeModel()
+
+    def failing_generate_voice_design(**kwargs: object) -> tuple[list[list[float]], int]:
+        del kwargs
+        raise RuntimeError("meta tensor failure during tensor.item()")
+
+    first_model.generate_voice_design = failing_generate_voice_design
+    runtime._model = first_model
+    runtime._resolved_device = "mps"
+
+    reload_calls = {"count": 0}
+
+    def reload_with_cpu_fallback() -> None:
+        reload_calls["count"] += 1
+        runtime._model = second_model
+        runtime._resolved_device = "cpu"
+        runtime._cpu_fallback_active = True
+
+    monkeypatch.setattr(runtime, "_reload_model_with_cpu_fallback", reload_with_cpu_fallback)
+
+    result = runtime._synthesize_audio_chunk(
+        text="hello",
+        voice_description="warm",
+        language="English",
+    )
+
+    assert reload_calls["count"] == 1
+    assert result["device"] == "cpu"
+    assert second_model.calls == [
+        {
+            "text": "hello",
+            "language": "English",
+            "instruct": "warm",
+        }
+    ]
 
 
 # MARK: Playback
