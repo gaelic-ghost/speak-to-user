@@ -314,51 +314,40 @@ class TTSRuntime:
         sample_rate = int(batch_result["sample_rate"])
         channel_count = self._waveform_channel_count(waveforms[0])
         total_sample_count = 0
-        buffered_sample_count = 0
-        preroll_sample_target = max(1, int(sample_rate * DEFAULT_PLAYBACK_PREROLL_SECONDS))
-        buffered_waveforms: list[np.ndarray] = []
-        remaining_waveforms: list[np.ndarray] = []
+        prepared_waveforms: list[np.ndarray] = []
 
         for waveform in waveforms:
             current_channel_count = self._waveform_channel_count(waveform)
             if current_channel_count != channel_count:
                 raise RuntimeError("streamed speech chunk channel count changed during playback")
+            prepared_waveforms.append(waveform)
+            total_sample_count += int(waveform.shape[0])
 
-            if buffered_sample_count < preroll_sample_target:
-                buffered_waveforms.append(waveform)
-                buffered_sample_count += int(waveform.shape[0])
-            else:
-                remaining_waveforms.append(waveform)
+        with self._lock:
+            self._speech_phase = "playing"
+            self._speech_current_chunk_index = len(prepared_waveforms)
+            self._speech_current_chunk_count = len(prepared_waveforms)
 
-        stream: sd.OutputStream | None = None
-        try:
-            with self._lock:
-                self._speech_phase = "opening_output"
-            stream = self._open_output_stream(
-                sample_rate=sample_rate,
-                channel_count=channel_count,
-            )
-            for index, waveform in enumerate(buffered_waveforms + remaining_waveforms, start=1):
-                with self._lock:
-                    self._speech_phase = "playing"
-                    self._speech_current_chunk_index = index
-                    self._speech_current_chunk_count = len(waveforms)
-                self._write_output_stream_chunk(stream, waveform)
-                total_sample_count += int(waveform.shape[0])
+        combined_waveform = self._combine_waveforms_for_playback(
+            waveforms=prepared_waveforms,
+            channel_count=channel_count,
+        )
+        self._play_waveform_blocking(
+            waveform=combined_waveform,
+            sample_rate=sample_rate,
+            channel_count=channel_count,
+        )
 
-            return {
-                "played": True,
-                "sample_rate": sample_rate,
-                "sample_count": total_sample_count,
-                "duration_seconds": round(total_sample_count / sample_rate, 3),
-                "model_id": batch_result["model_id"],
-                "device": batch_result["device"],
-                "language": batch_result["language"],
-                "player": "sounddevice-stream",
-            }
-        finally:
-            if stream is not None:
-                stream.close()
+        return {
+            "played": True,
+            "sample_rate": sample_rate,
+            "sample_count": total_sample_count,
+            "duration_seconds": round(total_sample_count / sample_rate, 3),
+            "model_id": batch_result["model_id"],
+            "device": batch_result["device"],
+            "language": batch_result["language"],
+            "player": "sounddevice-play",
+        }
 
     def _speech_worker_loop(self) -> None:
         while True:
@@ -560,25 +549,27 @@ class TTSRuntime:
             return int(waveform.shape[1])
         raise ValueError("waveform must be mono or multi-channel frame data")
 
-    def _open_output_stream(
+    def _combine_waveforms_for_playback(
         self,
         *,
+        waveforms: list[np.ndarray],
+        channel_count: int,
+    ) -> np.ndarray:
+        if not waveforms:
+            raise ValueError("waveforms must not be empty")
+        if channel_count == 1:
+            return np.ascontiguousarray(np.concatenate(waveforms, axis=0), dtype=np.float32)
+        return np.ascontiguousarray(np.concatenate(waveforms, axis=0), dtype=np.float32)
+
+    def _play_waveform_blocking(
+        self,
+        *,
+        waveform: np.ndarray,
         sample_rate: int,
         channel_count: int,
-    ) -> sd.OutputStream:
-        stream = sd.OutputStream(
-            samplerate=sample_rate,
-            channels=channel_count,
-            dtype="float32",
-        )
-        stream.start()
-        return stream
-
-    def _write_output_stream_chunk(
-        self,
-        stream: sd.OutputStream,
-        waveform: np.ndarray,
     ) -> None:
-        underflowed = stream.write(waveform)
-        if underflowed:
-            raise RuntimeError("audio output underflowed during streamed playback")
+        if channel_count == 1 and waveform.ndim != 1:
+            raise ValueError("mono playback requires a one-dimensional waveform")
+        if channel_count > 1 and waveform.ndim != 2:
+            raise ValueError("multi-channel playback requires two-dimensional waveform data")
+        sd.play(waveform, samplerate=sample_rate, blocking=True)
