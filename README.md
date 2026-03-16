@@ -9,6 +9,14 @@ It uses a resident voice-design model for normal TTS and can also keep a separat
 
 The intended deployment mode is one long-lived local Streamable HTTP MCP service so multiple Codex clients can share the same resident TTS model instead of launching separate stdio subprocesses.
 
+## Model Roles
+
+- `speak_text` uses the resident 1.7B voice-design model for normal narrated replies driven by `voice_description`.
+- `speak_text_as_clone` uses the resident 0.6B clone model for one-off reference-audio cloning.
+- `generate_speech_profile` and `speak_with_profile` use the same 0.6B clone model, but save and reuse a precomputed clone prompt so repeated playback does not need to rebuild the prompt from the original reference clip every time.
+
+The two models solve different problems. Voice design is the default spoken-reply path. Clone tools are for matching a specific voice from reference audio.
+
 ## Tools
 
 - `health`: simple smoke-test response.
@@ -45,6 +53,8 @@ By default, the entrypoint serves MCP over HTTP at `http://127.0.0.1:8765/mcp`.
 
 Server startup blocks until all enabled models are loaded. After that, both `speak_text` and `speak_text_as_clone` push one full text job into one in-process FIFO queue. Every request is chunked before playback, the worker synthesizes ahead into a bounded waveform queue, opens playback only after preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback, plus which synthesis mode is active.
 
+Because playback is intentionally global and serial, multiple MCP clients can stay connected at once, but only one speech job plays at a time.
+
 For the dev checkout, prefer a different port so it does not collide with the stable service:
 
 ```bash
@@ -67,6 +77,22 @@ Clone inference uses the installed `qwen_tts` clone API in two modes:
 
 The reference audio must be a readable local file. WAV or FLAC is the safest choice.
 
+### Clone Best Practices
+
+For the best results with the 0.6B clone model:
+
+- use a short, clean sample from one speaker only
+- prefer roughly 5 to 20 seconds of speech
+- avoid music, reverb, cross-talk, clipping, heavy background noise, and long silences
+- trim leading and trailing silence when possible
+- prefer WAV or FLAC over lossy formats
+- keep the speaker emotionally and acoustically consistent across the clip
+- if you have an accurate transcript for the reference clip, include it as `reference_text`
+
+`reference_text` is worth using when it is genuinely accurate. It gives the model stronger conditioning than speaker-embedding-only mode. If the transcript is wrong, partial, or loosely paraphrased, omit it and let the service use `x_vector_only_mode=True`.
+
+For one-off requests, use `speak_text_as_clone`. For a voice you expect to reuse, create a named profile first and then use `speak_with_profile`.
+
 ## Speech Profiles
 
 Profiles are reusable named clone prompts backed by the FastMCP server's persistent state store.
@@ -86,6 +112,14 @@ Profile behavior:
 - profile names must be unique; duplicate creation fails
 - profiles store a precomputed Qwen clone prompt artifact rather than the original file path alone
 - `speak_with_profile` fails if the current clone model ID does not match the saved profile
+
+Recommended profile workflow:
+
+- use `generate_speech_profile` once with a clean reference clip
+- provide `reference_text` only when it closely matches the spoken clip
+- use `list_speech_profiles` to confirm the saved profile metadata
+- use `speak_with_profile` for repeat playback instead of resupplying the same reference audio every time
+- delete old or low-quality profiles and recreate them from better source audio rather than trying to reuse a weak prompt forever
 
 ## Configuration
 
@@ -124,6 +158,14 @@ Profile behavior:
 
 Runtime language inputs accept either full language names understood by the model, short codes like `en`, or common locale variants like `en-US` and `pt_BR`.
 
+Operational notes:
+
+- enabling both resident models increases steady RAM usage
+- startup time increases when both models are enabled because preload waits for both
+- `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
+- `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects output-stream buffering only; it does not reduce model inference time
+- first-audio latency is usually dominated by model synthesis, especially on the 1.7B voice-design model
+
 ## LaunchAgents
 
 This repo includes LaunchAgent plists in [launchd/com.galew.speak-to-user.stable.plist](/Users/galew/Workspace/speak-to-user/launchd/com.galew.speak-to-user.stable.plist) and [launchd/com.galew.speak-to-user.dev.plist](/Users/galew/Workspace/speak-to-user/launchd/com.galew.speak-to-user.dev.plist).
@@ -135,6 +177,11 @@ They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/
 
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
 At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, completion, and failure. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
+
+When diagnosing clone quality or playback problems, check both:
+
+- `tts_status` for live queue, model, and recent-event state
+- the LaunchAgent stderr log for the full structured event stream across requests and reconnects
 
 Install or refresh the LaunchAgents:
 
