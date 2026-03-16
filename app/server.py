@@ -12,9 +12,13 @@ from fastmcp.server.lifespan import lifespan
 
 from app.runtime import TTSRuntime
 from app.tools import (
+    delete_speech_profile as delete_speech_profile_tool,
+    generate_speech_profile as generate_speech_profile_tool,
     health_payload,
+    list_speech_profiles as list_speech_profiles_tool,
     speak_text as speak_text_tool,
     speak_text_as_clone as speak_text_as_clone_tool,
+    speak_with_profile as speak_with_profile_tool,
     tts_status as tts_status_tool,
 )
 
@@ -99,6 +103,40 @@ def health() -> dict[str, str]:
 
 
 @mcp.tool
+async def generate_speech_profile(
+    name: str,
+    reference_audio_path: str,
+    reference_text: str | None = None,
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Create a named reusable speech profile from clone reference audio."""
+    return await generate_speech_profile_tool(
+        ctx,
+        name=name,
+        reference_audio_path=reference_audio_path,
+        reference_text=reference_text,
+    )
+
+
+@mcp.tool
+async def list_speech_profiles(ctx: Context = current_context) -> dict[str, object]:
+    """List saved reusable speech profiles."""
+    return await list_speech_profiles_tool(ctx)
+
+
+@mcp.tool
+async def delete_speech_profile(
+    name: str,
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Delete a saved reusable speech profile by name."""
+    return await delete_speech_profile_tool(
+        ctx,
+        name=name,
+    )
+
+
+@mcp.tool
 def tts_status(ctx: Context = current_context) -> dict[str, object]:
     """Return current TTS runtime state."""
     return tts_status_tool(ctx)
@@ -134,6 +172,22 @@ def speak_text_as_clone(
         text=text,
         reference_audio_path=reference_audio_path,
         reference_text=reference_text,
+        language=language,
+    )
+
+
+@mcp.tool
+async def speak_with_profile(
+    name: str,
+    text: str,
+    language: str = "en",
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Queue one full text job for local playback using a saved speech profile."""
+    return await speak_with_profile_tool(
+        ctx,
+        name=name,
+        text=text,
         language=language,
     )
 

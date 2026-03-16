@@ -65,6 +65,8 @@ class StubRuntime:
             "current_phase_started_at": None,
         }
         self.queued_jobs: list[dict[str, object]] = []
+        self.generated_profiles: list[dict[str, object]] = []
+        self.deleted_profiles: list[str] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
@@ -150,10 +152,111 @@ class StubRuntime:
             "speech_last_event": "speech_job_queued",
         }
 
+    async def generate_speech_profile(self, **kwargs: object) -> dict[str, object]:
+        self.generated_profiles.append(dict(kwargs))
+        return {
+            "result": "success",
+            "name": kwargs["name"],
+            "clone_model_id": "Qwen/test-clone",
+            "clone_mode": "reference_text"
+            if kwargs.get("reference_text") is not None
+            else "x_vector_only",
+            "created_at": "2026-03-14T00:00:00+00:00",
+            "updated_at": "2026-03-14T00:00:00+00:00",
+            "reference_text_included": kwargs.get("reference_text") is not None,
+        }
+
+    async def list_speech_profiles(self, **kwargs: object) -> dict[str, object]:
+        del kwargs
+        return {
+            "result": "success",
+            "profiles": [
+                {
+                    "name": "demo",
+                    "clone_model_id": "Qwen/test-clone",
+                    "clone_mode": "x_vector_only",
+                    "created_at": "2026-03-14T00:00:00+00:00",
+                    "updated_at": "2026-03-14T00:00:00+00:00",
+                    "reference_text_included": False,
+                }
+            ],
+            "profile_count": 1,
+        }
+
+    async def delete_speech_profile(self, **kwargs: object) -> dict[str, object]:
+        name = cast(str, kwargs["name"])
+        self.deleted_profiles.append(name)
+        return {
+            "result": "success",
+            "deleted": True,
+            "name": name,
+            "profile_count": 0,
+        }
+
+    async def speak_with_profile(self, **kwargs: object) -> dict[str, object]:
+        chunks = list(cast(list[str], kwargs.get("chunks", [])))
+        self.queued_jobs.append(
+            {
+                "mode": "profile",
+                "name": kwargs["name"],
+                "chunks": chunks,
+                "language": kwargs.get("language", "en"),
+            }
+        )
+        return {
+            "result": "success",
+            "queued": True,
+            "job_id": len(self.queued_jobs),
+            "chunked": len(chunks) > 1,
+            "chunk_count": len(chunks),
+            "language": kwargs.get("language", "en"),
+            "enqueued_at": "2026-03-14T00:00:00+00:00",
+            "playback_mode": "in-process-queue",
+            "mode": "clone",
+            "profile_name": kwargs["name"],
+            "clone_mode": "x_vector_only",
+            "clone_model_id": "Qwen/test-clone",
+            "speech_in_progress": False,
+            "speech_phase": "idle",
+            "speech_current_job_id": None,
+            "speech_current_chunk_index": None,
+            "speech_current_chunk_count": None,
+            "speech_queue_depth": len(self.queued_jobs),
+            "speech_queue_maxsize": 32,
+            "speech_jobs_queued": len(self.queued_jobs),
+            "speech_jobs_completed": 0,
+            "speech_jobs_failed": 0,
+            "speech_last_enqueued_at": "2026-03-14T00:00:00+00:00",
+            "speech_last_completed_at": None,
+            "speech_last_error": None,
+            "speech_last_event_at": None,
+            "speech_last_event": "speech_job_queued",
+        }
+
+
+class StubStateStore:
+    async def put(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def get(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        return None
+
+    async def delete(self, *args: object, **kwargs: object) -> bool:
+        del args, kwargs
+        return True
+
+
+class StubFastMCP:
+    def __init__(self) -> None:
+        self._state_store = StubStateStore()
+
 
 class StubContext:
     def __init__(self, runtime: object) -> None:
         self.lifespan_context = {"runtime": runtime}
+        self.fastmcp = StubFastMCP()
 
 
 def test_tts_status_uses_lifespan_runtime() -> None:
@@ -285,6 +388,32 @@ def test_speak_text_as_clone_is_plain_tool() -> None:
     asyncio.run(run())
 
 
+def test_generate_speech_profile_is_plain_tool() -> None:
+    async def run() -> None:
+        tool = await server.mcp.get_tool("generate_speech_profile")
+        assert tool is not None
+        assert tool.task_config is not None
+        assert tool.task_config.mode == "forbidden"
+        properties = cast(dict[str, object], tool.parameters["properties"])
+        assert "name" in properties
+        assert "reference_audio_path" in properties
+
+    asyncio.run(run())
+
+
+def test_speak_with_profile_is_plain_tool() -> None:
+    async def run() -> None:
+        tool = await server.mcp.get_tool("speak_with_profile")
+        assert tool is not None
+        assert tool.task_config is not None
+        assert tool.task_config.mode == "forbidden"
+        properties = cast(dict[str, object], tool.parameters["properties"])
+        assert "name" in properties
+        assert "text" in properties
+
+    asyncio.run(run())
+
+
 def test_speak_text_queues_audio() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
@@ -329,3 +458,74 @@ def test_speak_text_as_clone_queues_audio() -> None:
             "language": "en",
         }
     ]
+
+
+def test_generate_speech_profile_uses_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(
+        server.generate_speech_profile(
+            "demo",
+            "voice.wav",
+            "reference text",
+            ctx=cast(Context, ctx),
+        )
+    )
+
+    assert result["result"] == "success"
+    assert runtime.generated_profiles == [
+        {
+            "state_store": ctx.fastmcp._state_store,
+            "name": "demo",
+            "reference_audio_path": "voice.wav",
+            "reference_text": "reference text",
+        }
+    ]
+
+
+def test_list_speech_profiles_uses_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(server.list_speech_profiles(ctx=cast(Context, ctx)))
+
+    assert result["result"] == "success"
+    assert result["profile_count"] == 1
+
+
+def test_delete_speech_profile_uses_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(
+        server.delete_speech_profile(
+            "demo",
+            ctx=cast(Context, ctx),
+        )
+    )
+
+    assert result["deleted"] is True
+    assert runtime.deleted_profiles == ["demo"]
+
+
+def test_speak_with_profile_queues_audio() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(
+        server.speak_with_profile(
+            "demo",
+            "hello",
+            ctx=cast(Context, ctx),
+        )
+    )
+
+    assert result["result"] == "success"
+    assert result["profile_name"] == "demo"
+    assert runtime.queued_jobs[-1] == {
+        "mode": "profile",
+        "name": "demo",
+        "chunks": ["hello"],
+        "language": "en",
+    }

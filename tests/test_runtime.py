@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app.runtime as runtime_module
 from app.runtime import CLONE_MODEL_KIND, TTSRuntime, VOICE_DESIGN_MODEL_KIND
+from fastmcp.server.server import StateValue
 
 
 class FakeVoiceDesignModel:
@@ -51,6 +53,46 @@ class FakeCloneModel:
     def generate_voice_clone(self, **kwargs: object) -> tuple[list[list[float]], int]:
         self.calls.append(dict(kwargs))
         return [list(self.waveform)], self.sample_rate
+
+    def create_voice_clone_prompt(self, **kwargs: object) -> list[SimpleNamespace]:
+        self.calls.append(dict(kwargs))
+        return [
+            SimpleNamespace(
+                ref_code=np.array([[1, 2], [3, 4]], dtype=np.int64),
+                ref_spk_embedding=np.array([0.1, 0.2, 0.3], dtype=np.float32),
+                x_vector_only_mode=bool(kwargs["x_vector_only_mode"]),
+                icl_mode=not bool(kwargs["x_vector_only_mode"]),
+                ref_text=kwargs.get("ref_text"),
+            )
+        ]
+
+
+class FakeStateStore:
+    def __init__(self) -> None:
+        self.values: dict[tuple[str, str | None], StateValue] = {}
+
+    async def put(
+        self,
+        key: str,
+        value: StateValue,
+        *,
+        collection: str | None = None,
+        ttl: object | None = None,
+    ) -> None:
+        del ttl
+        self.values[(key, collection)] = value
+
+    async def get(
+        self,
+        key: str,
+        *,
+        collection: str | None = None,
+        default: StateValue | None = None,
+    ) -> StateValue | None:
+        return self.values.get((key, collection), default)
+
+    async def delete(self, key: str, *, collection: str | None = None) -> bool:
+        return self.values.pop((key, collection), None) is not None
 
 
 def make_runtime(tmp_path: Path) -> TTSRuntime:
@@ -244,6 +286,156 @@ def test_speak_text_as_clone_enqueues_one_job(
     assert job["mode"] == CLONE_MODEL_KIND
     assert job["reference_audio"] == reference_audio
     assert job["reference_text"] == "Reference text"
+
+
+def test_generate_speech_profile_persists_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    fake_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+    monkeypatch.setattr(
+        runtime,
+        "_decode_reference_audio_file",
+        lambda path: (np.array([0.0, 0.1], dtype=np.float32), 16000),
+    )
+
+    result = asyncio.run(
+        runtime.generate_speech_profile(
+            state_store=state_store,
+            name="demo",
+            reference_audio_path="voice.wav",
+            reference_text="reference text",
+        )
+    )
+
+    assert result["result"] == "success"
+    stored_profile = asyncio.run(
+        state_store.get(
+            "profile:demo",
+            collection=runtime_module.SPEECH_PROFILE_COLLECTION,
+        )
+    )
+    assert stored_profile is not None
+    profile_payload = cast(dict[str, object], stored_profile.value)
+    assert profile_payload["clone_model_id"] == "Qwen/test-clone"
+    assert profile_payload["clone_mode"] == "reference_text"
+
+
+def test_generate_speech_profile_rejects_duplicate_name(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    fake_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+    monkeypatch.setattr(
+        runtime,
+        "_decode_reference_audio_file",
+        lambda path: (np.array([0.0, 0.1], dtype=np.float32), 16000),
+    )
+
+    asyncio.run(
+        runtime.generate_speech_profile(
+            state_store=state_store,
+            name="demo",
+            reference_audio_path="voice.wav",
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="already exists"):
+        asyncio.run(
+            runtime.generate_speech_profile(
+                state_store=state_store,
+                name="demo",
+                reference_audio_path="voice.wav",
+            )
+        )
+
+
+def test_list_and_delete_speech_profiles(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    profile = runtime_module.StoredSpeechProfile(
+        name="demo",
+        clone_model_id="Qwen/test-clone",
+        clone_mode="x_vector_only",
+        created_at="2026-03-14T00:00:00+00:00",
+        updated_at="2026-03-14T00:00:00+00:00",
+        prompt_items=[
+            runtime_module.StoredSpeechProfilePromptItem(
+                ref_code=None,
+                ref_spk_embedding=runtime_module.SerializedTensor(
+                    dtype="float32",
+                    data=[0.1, 0.2],
+                ),
+                x_vector_only_mode=True,
+                icl_mode=False,
+                ref_text=None,
+            )
+        ],
+    )
+    asyncio.run(runtime._save_speech_profile(state_store=state_store, profile=profile))
+    asyncio.run(runtime._save_speech_profile_names(state_store, ["demo"]))
+
+    list_result = asyncio.run(runtime.list_speech_profiles(state_store=state_store))
+    delete_result = asyncio.run(runtime.delete_speech_profile(state_store=state_store, name="demo"))
+
+    assert list_result["profile_count"] == 1
+    assert delete_result["deleted"] is True
+    assert asyncio.run(
+        state_store.get(
+            "profile:demo",
+            collection=runtime_module.SPEECH_PROFILE_COLLECTION,
+        )
+    ) is None
+
+
+def test_speak_with_profile_enqueues_clone_job(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    profile = runtime_module.StoredSpeechProfile(
+        name="demo",
+        clone_model_id="Qwen/test-clone",
+        clone_mode="x_vector_only",
+        created_at="2026-03-14T00:00:00+00:00",
+        updated_at="2026-03-14T00:00:00+00:00",
+        prompt_items=[
+            runtime_module.StoredSpeechProfilePromptItem(
+                ref_code=None,
+                ref_spk_embedding=runtime_module.SerializedTensor(
+                    dtype="float32",
+                    data=[0.1, 0.2],
+                ),
+                x_vector_only_mode=True,
+                icl_mode=False,
+                ref_text=None,
+            )
+        ],
+    )
+    asyncio.run(runtime._save_speech_profile(state_store=state_store, profile=profile))
+    asyncio.run(runtime._save_speech_profile_names(state_store, ["demo"]))
+    runtime.start_speech_worker = lambda: False  # type: ignore[method-assign]
+
+    result = asyncio.run(
+        runtime.speak_with_profile(
+            state_store=state_store,
+            name="demo",
+            chunks=["Hello there"],
+            language="en",
+        )
+    )
+
+    assert result["result"] == "success"
+    job = cast(dict[str, object], runtime._speech_queue.get_nowait())
+    assert job["mode"] == CLONE_MODEL_KIND
+    assert job["profile_name"] == "demo"
+    assert "voice_clone_prompt_items" in job
 
 
 def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(

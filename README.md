@@ -15,6 +15,10 @@ The intended deployment mode is one long-lived local Streamable HTTP MCP service
 - `tts_status`: reports queue status, observability events, and separate status for the voice-design and clone models.
 - `speak_text`: enqueues one full text job for the voice-design model.
 - `speak_text_as_clone`: enqueues one full text job for the clone model using a local reference audio file and optional reference text.
+- `generate_speech_profile`: stores a named reusable clone prompt artifact in the server's persistent state store.
+- `list_speech_profiles`: lists saved speech profiles and their metadata.
+- `delete_speech_profile`: deletes a saved speech profile by name.
+- `speak_with_profile`: enqueues one full text job using a previously saved speech profile.
 
 There is no manual load tool, no unload tool, no idle auto-unload, no detached helper process, and no file-generation path.
 
@@ -62,6 +66,26 @@ Clone inference uses the installed `qwen_tts` clone API in two modes:
 - with `reference_text`: `x_vector_only_mode=False`
 
 The reference audio must be a readable local file. WAV or FLAC is the safest choice.
+
+## Speech Profiles
+
+Profiles are reusable named clone prompts backed by the FastMCP server's persistent state store.
+
+- `generate_speech_profile` takes:
+  - `name`
+  - `reference_audio_path`
+  - optional `reference_text`
+- `speak_with_profile` takes:
+  - `name`
+  - `text`
+  - optional `language`
+
+Profile behavior:
+
+- profiles are bound to the active clone model ID at creation time
+- profile names must be unique; duplicate creation fails
+- profiles store a precomputed Qwen clone prompt artifact rather than the original file path alone
+- `speak_with_profile` fails if the current clone model ID does not match the saved profile
 
 ## Configuration
 

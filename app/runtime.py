@@ -17,6 +17,9 @@ from typing import Any, cast
 
 import numpy as np
 import sounddevice as sd  # type: ignore[import-untyped]
+from pydantic import BaseModel
+
+from fastmcp.server.server import StateValue
 
 # MARK: Constants
 
@@ -34,6 +37,8 @@ DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_RECENT_EVENT_LIMIT = 100
+SPEECH_PROFILE_COLLECTION = "speak_to_user_profiles"
+SPEECH_PROFILE_INDEX_KEY = "index"
 LOG_LEVEL_PRIORITY = {"minimal": 0, "info": 1, "debug": 2}
 LANGUAGE_ALIASES = {
     "auto": "Auto",
@@ -64,6 +69,32 @@ _ORIGINAL_PRINT = builtins.print
 _PRINT_REDIRECT_LOCK = threading.RLock()
 _PRINT_REDIRECT_THREAD_COUNTS: dict[int, int] = {}
 _ACTIVE_PRINT_REDIRECTS = 0
+
+
+class SerializedTensor(BaseModel):
+    dtype: str
+    data: list[Any]
+
+
+class StoredSpeechProfilePromptItem(BaseModel):
+    ref_code: SerializedTensor | None = None
+    ref_spk_embedding: SerializedTensor
+    x_vector_only_mode: bool
+    icl_mode: bool
+    ref_text: str | None = None
+
+
+class StoredSpeechProfile(BaseModel):
+    name: str
+    clone_model_id: str
+    clone_mode: str
+    created_at: str
+    updated_at: str
+    prompt_items: list[StoredSpeechProfilePromptItem]
+
+
+class StoredSpeechProfileIndex(BaseModel):
+    names: list[str]
 
 
 # MARK: Module Helpers
@@ -330,6 +361,8 @@ class TTSRuntime:
         self._speech_last_event_at: dt.datetime | None = None
         self._speech_last_event: str | None = None
         self._recent_events: deque[dict[str, Any]] = deque(maxlen=DEFAULT_RECENT_EVENT_LIMIT)
+        self._speech_profile_count: int | None = None
+        self._speech_profile_last_error: str | None = None
 
     @classmethod
     def from_env(cls) -> TTSRuntime:
@@ -578,6 +611,169 @@ class TTSRuntime:
         result["clone_model_id"] = self.clone_model_id
         return result
 
+    async def generate_speech_profile(
+        self,
+        *,
+        state_store: Any,
+        name: str,
+        reference_audio_path: str,
+        reference_text: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_name = self._normalize_profile_name(name)
+        normalized_reference_text = reference_text.strip() if reference_text is not None else None
+        if normalized_reference_text == "":
+            normalized_reference_text = None
+
+        existing_profile = await self._load_speech_profile(
+            state_store=state_store,
+            name=normalized_name,
+        )
+        if existing_profile is not None:
+            message = f"speech profile `{normalized_name}` already exists"
+            self._speech_profile_last_error = message
+            raise RuntimeError(message)
+
+        reference_audio = self._decode_reference_audio_file(reference_audio_path)
+        prompt_items = self._create_voice_clone_prompt_items(
+            reference_audio=reference_audio,
+            reference_text=normalized_reference_text,
+        )
+        now = _utc_now()
+        profile = StoredSpeechProfile(
+            name=normalized_name,
+            clone_model_id=self.clone_model_id,
+            clone_mode=(
+                "reference_text" if normalized_reference_text is not None else "x_vector_only"
+            ),
+            created_at=now.isoformat(),
+            updated_at=now.isoformat(),
+            prompt_items=[
+                self._serialize_voice_clone_prompt_item(prompt_item)
+                for prompt_item in prompt_items
+            ],
+        )
+
+        names = await self._load_speech_profile_names(state_store)
+        names.append(normalized_name)
+        names = sorted(set(names))
+        await self._save_speech_profile(
+            state_store=state_store,
+            profile=profile,
+        )
+        await self._save_speech_profile_names(state_store, names)
+
+        self._speech_profile_count = len(names)
+        self._speech_profile_last_error = None
+        self._emit_runtime_event(
+            "speech_profile_created",
+            level="minimal",
+            profile_name=normalized_name,
+            clone_model_id=self.clone_model_id,
+            clone_mode=profile.clone_mode,
+        )
+        return {
+            "result": "success",
+            **self._speech_profile_metadata(profile),
+        }
+
+    async def list_speech_profiles(self, *, state_store: Any) -> dict[str, Any]:
+        names = await self._load_speech_profile_names(state_store)
+        profiles: list[dict[str, Any]] = []
+        for name in names:
+            profile = await self._load_speech_profile(state_store=state_store, name=name)
+            if profile is None:
+                continue
+            profiles.append(self._speech_profile_metadata(profile))
+
+        self._speech_profile_count = len(profiles)
+        self._speech_profile_last_error = None
+        return {
+            "result": "success",
+            "profiles": profiles,
+            "profile_count": len(profiles),
+        }
+
+    async def delete_speech_profile(self, *, state_store: Any, name: str) -> dict[str, Any]:
+        normalized_name = self._normalize_profile_name(name)
+        existing_profile = await self._load_speech_profile(
+            state_store=state_store,
+            name=normalized_name,
+        )
+        if existing_profile is None:
+            message = f"speech profile `{normalized_name}` does not exist"
+            self._speech_profile_last_error = message
+            raise RuntimeError(message)
+
+        await state_store.delete(
+            key=self._speech_profile_key(normalized_name),
+            collection=SPEECH_PROFILE_COLLECTION,
+        )
+        names = [
+            candidate
+            for candidate in await self._load_speech_profile_names(state_store)
+            if candidate != normalized_name
+        ]
+        await self._save_speech_profile_names(state_store, names)
+        self._speech_profile_count = len(names)
+        self._speech_profile_last_error = None
+        self._emit_runtime_event(
+            "speech_profile_deleted",
+            level="minimal",
+            profile_name=normalized_name,
+        )
+        return {
+            "result": "success",
+            "deleted": True,
+            "name": normalized_name,
+            "profile_count": len(names),
+        }
+
+    async def speak_with_profile(
+        self,
+        *,
+        state_store: Any,
+        chunks: list[str],
+        name: str,
+        language: str = "en",
+    ) -> dict[str, Any]:
+        normalized_name = self._normalize_profile_name(name)
+        profile = await self._load_speech_profile(
+            state_store=state_store,
+            name=normalized_name,
+        )
+        if profile is None:
+            message = f"speech profile `{normalized_name}` does not exist"
+            self._speech_profile_last_error = message
+            raise RuntimeError(message)
+        if profile.clone_model_id != self.clone_model_id:
+            message = (
+                f"speech profile `{normalized_name}` is bound to clone model "
+                f"`{profile.clone_model_id}`, but the active clone model is `{self.clone_model_id}`"
+            )
+            self._speech_profile_last_error = message
+            raise RuntimeError(message)
+
+        prompt_items = self._deserialize_voice_clone_prompt_items(profile.prompt_items)
+        result = self._enqueue_speech_job(
+            mode=CLONE_MODEL_KIND,
+            chunks=self._normalize_chunks(chunks),
+            language=_normalize_language(language),
+            voice_clone_prompt_items=prompt_items,
+            profile_name=normalized_name,
+        )
+        result["profile_name"] = normalized_name
+        result["clone_mode"] = profile.clone_mode
+        result["clone_model_id"] = profile.clone_model_id
+        self._speech_profile_last_error = None
+        self._emit_runtime_event(
+            "speech_profile_enqueued",
+            level="minimal",
+            profile_name=normalized_name,
+            clone_model_id=profile.clone_model_id,
+            clone_mode=profile.clone_mode,
+        )
+        return result
+
     def play_speech_chunks(
         self,
         *,
@@ -587,6 +783,7 @@ class TTSRuntime:
         voice_description: str | None = None,
         reference_audio: tuple[np.ndarray, int] | None = None,
         reference_text: str | None = None,
+        voice_clone_prompt_items: list[Any] | None = None,
     ) -> dict[str, Any]:
         if not chunks:
             raise ValueError("chunks must not be empty")
@@ -599,8 +796,11 @@ class TTSRuntime:
                 raise ValueError("voice_description must not be empty")
         else:
             normalized_description = None
-            if reference_audio is None:
-                raise ValueError("reference_audio must not be empty for clone playback")
+            if reference_audio is None and voice_clone_prompt_items is None:
+                raise ValueError(
+                    "reference_audio or voice_clone_prompt_items must be provided "
+                    "for clone playback"
+                )
 
         total_sample_count = 0
         buffered_sample_count = 0
@@ -640,6 +840,7 @@ class TTSRuntime:
                         language=normalized_language,
                         reference_audio=reference_audio,
                         reference_text=reference_text,
+                        voice_clone_prompt_items=voice_clone_prompt_items,
                     )
                     waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
                     self._emit_runtime_event(
@@ -935,8 +1136,15 @@ class TTSRuntime:
                         mode=mode,
                         chunks=chunks,
                         language=language,
-                        reference_audio=cast(tuple[np.ndarray, int], job["reference_audio"]),
+                        reference_audio=cast(
+                            tuple[np.ndarray, int] | None,
+                            job.get("reference_audio"),
+                        ),
                         reference_text=cast(str | None, job.get("reference_text")),
+                        voice_clone_prompt_items=cast(
+                            list[Any] | None,
+                            job.get("voice_clone_prompt_items"),
+                        ),
                     )
                 else:
                     raise RuntimeError(f"unsupported speech mode `{mode}`")
@@ -1024,6 +1232,9 @@ class TTSRuntime:
                 self._speech_in_progress
                 and self._speech_current_mode == CLONE_MODEL_KIND
             ),
+            "speech_profile_storage_ready": True,
+            "speech_profile_count": self._speech_profile_count,
+            "speech_profile_last_error": self._speech_profile_last_error,
             "current_job_started_at": _timestamp_value(self._current_job_started_at),
             "current_chunk_started_at": _timestamp_value(self._current_chunk_started_at),
             "current_phase_started_at": _timestamp_value(self._current_phase_started_at),
@@ -1079,6 +1290,8 @@ class TTSRuntime:
         reference_audio: tuple[np.ndarray, int] | None = None,
         reference_audio_path: str | None = None,
         reference_text: str | None = None,
+        voice_clone_prompt_items: list[Any] | None = None,
+        profile_name: str | None = None,
     ) -> dict[str, Any]:
         self.start_speech_worker()
 
@@ -1104,6 +1317,10 @@ class TTSRuntime:
                 job["reference_audio_path"] = reference_audio_path
             if reference_text is not None:
                 job["reference_text"] = reference_text
+            if voice_clone_prompt_items is not None:
+                job["voice_clone_prompt_items"] = voice_clone_prompt_items
+            if profile_name is not None:
+                job["profile_name"] = profile_name
 
             try:
                 self._speech_queue.put_nowait(job)
@@ -1126,6 +1343,7 @@ class TTSRuntime:
                 language=language,
                 queue_depth=self._speech_queue.qsize(),
                 reference_text_included=reference_text is not None,
+                profile_name=profile_name,
             )
             return {
                 "result": "success",
@@ -1217,6 +1435,7 @@ class TTSRuntime:
         voice_description: str | None = None,
         reference_audio: tuple[np.ndarray, int] | None = None,
         reference_text: str | None = None,
+        voice_clone_prompt_items: list[Any] | None = None,
     ) -> dict[str, Any]:
         with self._lock:
             model_missing = self._model_state(mode)["model"] is None
@@ -1240,16 +1459,19 @@ class TTSRuntime:
                 )
                 return cast(list[Any], wavs), int(sample_rate)
 
-            assert reference_audio is not None
             generate_kwargs: dict[str, Any] = {
                 "text": text,
                 "language": language,
-                "ref_audio": reference_audio,
-                "x_vector_only_mode": reference_text is None,
                 "non_streaming_mode": True,
             }
-            if reference_text is not None:
-                generate_kwargs["ref_text"] = reference_text
+            if voice_clone_prompt_items is not None:
+                generate_kwargs["voice_clone_prompt"] = voice_clone_prompt_items
+            else:
+                assert reference_audio is not None
+                generate_kwargs["ref_audio"] = reference_audio
+                generate_kwargs["x_vector_only_mode"] = reference_text is None
+                if reference_text is not None:
+                    generate_kwargs["ref_text"] = reference_text
             wavs, sample_rate = active_model.generate_voice_clone(**generate_kwargs)
             return cast(list[Any], wavs), int(sample_rate)
 
@@ -1455,6 +1677,197 @@ class TTSRuntime:
         if waveform_array.size == 0:
             raise ValueError(f"reference audio file is empty: {expanded_path}")
         return waveform_array, int(sample_rate)
+
+    def _normalize_profile_name(self, name: str) -> str:
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("name must not be empty")
+        return normalized
+
+    def _speech_profile_key(self, name: str) -> str:
+        return f"profile:{name}"
+
+    async def _load_speech_profile_names(self, state_store: Any) -> list[str]:
+        result = await state_store.get(
+            key=SPEECH_PROFILE_INDEX_KEY,
+            collection=SPEECH_PROFILE_COLLECTION,
+            default=StateValue(value={"names": []}),
+        )
+        if result is None:
+            return []
+        index = StoredSpeechProfileIndex.model_validate(result.value)
+        return list(index.names)
+
+    async def _save_speech_profile_names(self, state_store: Any, names: list[str]) -> None:
+        index = StoredSpeechProfileIndex(names=sorted(names))
+        await state_store.put(
+            key=SPEECH_PROFILE_INDEX_KEY,
+            value=StateValue(value=index.model_dump(mode="json")),
+            collection=SPEECH_PROFILE_COLLECTION,
+        )
+
+    async def _save_speech_profile(self, *, state_store: Any, profile: StoredSpeechProfile) -> None:
+        await state_store.put(
+            key=self._speech_profile_key(profile.name),
+            value=StateValue(value=profile.model_dump(mode="json")),
+            collection=SPEECH_PROFILE_COLLECTION,
+        )
+
+    async def _load_speech_profile(
+        self,
+        *,
+        state_store: Any,
+        name: str,
+    ) -> StoredSpeechProfile | None:
+        result = await state_store.get(
+            key=self._speech_profile_key(name),
+            collection=SPEECH_PROFILE_COLLECTION,
+        )
+        if result is None:
+            return None
+        return StoredSpeechProfile.model_validate(result.value)
+
+    def _speech_profile_metadata(self, profile: StoredSpeechProfile) -> dict[str, Any]:
+        return {
+            "name": profile.name,
+            "clone_model_id": profile.clone_model_id,
+            "clone_mode": profile.clone_mode,
+            "created_at": profile.created_at,
+            "updated_at": profile.updated_at,
+            "reference_text_included": profile.clone_mode == "reference_text",
+        }
+
+    def _serialize_voice_clone_prompt_item(self, prompt_item: Any) -> StoredSpeechProfilePromptItem:
+        return StoredSpeechProfilePromptItem(
+            ref_code=self._serialize_tensor(prompt_item.ref_code)
+            if prompt_item.ref_code is not None
+            else None,
+            ref_spk_embedding=self._serialize_tensor(prompt_item.ref_spk_embedding),
+            x_vector_only_mode=bool(prompt_item.x_vector_only_mode),
+            icl_mode=bool(prompt_item.icl_mode),
+            ref_text=cast(str | None, prompt_item.ref_text),
+        )
+
+    def _deserialize_voice_clone_prompt_items(
+        self,
+        prompt_items: list[StoredSpeechProfilePromptItem],
+    ) -> list[Any]:
+        from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem  # type: ignore[import-untyped]
+
+        return [
+            VoiceClonePromptItem(
+                ref_code=self._deserialize_tensor(prompt_item.ref_code)
+                if prompt_item.ref_code is not None
+                else None,
+                ref_spk_embedding=cast(
+                    Any,
+                    self._deserialize_tensor(prompt_item.ref_spk_embedding),
+                ),
+                x_vector_only_mode=prompt_item.x_vector_only_mode,
+                icl_mode=prompt_item.icl_mode,
+                ref_text=prompt_item.ref_text,
+            )
+            for prompt_item in prompt_items
+        ]
+
+    def _serialize_tensor(self, tensor: Any) -> SerializedTensor:
+        if hasattr(tensor, "detach"):
+            tensor = tensor.detach()
+        if hasattr(tensor, "cpu"):
+            tensor = tensor.cpu()
+        if hasattr(tensor, "tolist"):
+            data = tensor.tolist()
+        else:
+            data = np.asarray(tensor).tolist()
+        dtype_name = str(getattr(tensor, "dtype", np.asarray(tensor).dtype))
+        return SerializedTensor(dtype=dtype_name, data=cast(list[Any], data))
+
+    def _deserialize_tensor(self, serialized: SerializedTensor) -> Any:
+        import torch
+
+        return torch.tensor(
+            serialized.data,
+            dtype=self._torch_dtype_from_name(serialized.dtype, torch),
+        )
+
+    def _torch_dtype_from_name(self, dtype_name: str, torch_module: Any) -> Any:
+        name = dtype_name.removeprefix("torch.")
+        if hasattr(torch_module, name):
+            return getattr(torch_module, name)
+        if name == "float32":
+            return torch_module.float32
+        if name == "float16":
+            return torch_module.float16
+        if name == "bfloat16":
+            return torch_module.bfloat16
+        if name == "int64":
+            return torch_module.int64
+        if name == "int32":
+            return torch_module.int32
+        if name == "int16":
+            return torch_module.int16
+        if name == "int8":
+            return torch_module.int8
+        if name == "uint8":
+            return torch_module.uint8
+        raise RuntimeError(f"unsupported serialized tensor dtype `{dtype_name}`")
+
+    def _create_voice_clone_prompt_items(
+        self,
+        *,
+        reference_audio: tuple[np.ndarray, int],
+        reference_text: str | None = None,
+    ) -> list[Any]:
+        with self._lock:
+            model_missing = self._model_state(CLONE_MODEL_KIND)["model"] is None
+
+        if model_missing:
+            self.load_model(model_kind=CLONE_MODEL_KIND)
+
+        with self._lock:
+            model = self._model_state(CLONE_MODEL_KIND)["model"]
+
+        assert model is not None
+
+        def build_prompt(active_model: Any) -> list[Any]:
+            return cast(
+                list[Any],
+                active_model.create_voice_clone_prompt(
+                    ref_audio=reference_audio,
+                    ref_text=reference_text,
+                    x_vector_only_mode=reference_text is None,
+                ),
+            )
+
+        try:
+            prompt_items = build_prompt(model)
+        except Exception as exc:
+            if _meta_tensor_runtime_error(exc):
+                self._emit_runtime_event(
+                    "speech_profile_prompt_retrying_with_cpu_fallback",
+                    level="minimal",
+                    error=str(exc),
+                )
+                self._reload_model_with_cpu_fallback(CLONE_MODEL_KIND)
+                with self._lock:
+                    reloaded_model = self._model_state(CLONE_MODEL_KIND)["model"]
+                if reloaded_model is None:
+                    raise RuntimeError(
+                        "CPU fallback reload completed without a clone model"
+                    ) from exc
+                prompt_items = build_prompt(reloaded_model)
+            else:
+                self._speech_profile_last_error = str(exc)
+                self._emit_runtime_event(
+                    "speech_profile_prompt_build_failed",
+                    level="minimal",
+                    error=str(exc),
+                )
+                raise
+
+        with self._lock:
+            self._touch_model_locked(CLONE_MODEL_KIND)
+        return prompt_items
 
     def _open_output_stream(
         self,
