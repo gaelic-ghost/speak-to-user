@@ -32,6 +32,7 @@ DEFAULT_ENABLE_CLONE_MODEL = True
 DEFAULT_PLAYBACK_PREROLL_SECONDS = 3.0
 DEFAULT_PLAYBACK_PREROLL_CHUNKS = 2
 DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 16
+DEFAULT_PLAYBACK_UNDERFLOW_RETRIES = 2
 DEFAULT_OUTPUT_STREAM_LATENCY = "high"
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
@@ -178,6 +179,24 @@ def _normalize_positive_int(raw: str | None, *, env_var: str, default: int) -> i
     return parsed
 
 
+def _normalize_nonnegative_int(raw: str | None, *, env_var: str, default: int) -> int:
+    if raw is None:
+        return default
+
+    value = raw.strip()
+    if not value:
+        raise ValueError(f"{env_var} must not be empty")
+
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{env_var} must be an integer") from exc
+
+    if parsed < 0:
+        raise ValueError(f"{env_var} must be zero or greater")
+    return parsed
+
+
 def _normalize_output_stream_latency(raw: str | None) -> str | float:
     value = (raw or DEFAULT_OUTPUT_STREAM_LATENCY).strip().lower()
     if value in {"low", "high"}:
@@ -307,6 +326,7 @@ class TTSRuntime:
         playback_preroll_seconds: float = DEFAULT_PLAYBACK_PREROLL_SECONDS,
         playback_preroll_chunks: int = DEFAULT_PLAYBACK_PREROLL_CHUNKS,
         playback_waveform_queue_maxsize: int = DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
+        playback_underflow_retries: int = DEFAULT_PLAYBACK_UNDERFLOW_RETRIES,
         output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
         log_level: str = DEFAULT_LOG_LEVEL,
     ) -> None:
@@ -320,6 +340,7 @@ class TTSRuntime:
         self.playback_preroll_seconds = playback_preroll_seconds
         self.playback_preroll_chunks = playback_preroll_chunks
         self.playback_waveform_queue_maxsize = playback_waveform_queue_maxsize
+        self.playback_underflow_retries = playback_underflow_retries
         self.output_stream_latency = output_stream_latency
         self.log_level = log_level
 
@@ -401,6 +422,11 @@ class TTSRuntime:
                 os.getenv("SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE"),
                 env_var="SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE",
                 default=DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
+            ),
+            playback_underflow_retries=_normalize_nonnegative_int(
+                os.getenv("SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES"),
+                env_var="SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES",
+                default=DEFAULT_PLAYBACK_UNDERFLOW_RETRIES,
             ),
             output_stream_latency=_normalize_output_stream_latency(
                 os.getenv("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY")
@@ -818,7 +844,100 @@ class TTSRuntime:
         )
         queue_sentinel = object()
 
-        stream: sd.OutputStream | None = None
+        stream_holder: list[sd.OutputStream | None] = [None]
+
+        def close_output_stream(current_stream: sd.OutputStream) -> None:
+            self._emit_runtime_event(
+                "speech_output_stream_closing",
+                level="debug",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+            )
+            current_stream.stop()
+            current_stream.close()
+            stream_holder[0] = None
+            self._emit_runtime_event(
+                "speech_output_stream_closed",
+                level="debug",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+            )
+
+        def open_output_stream_for_playback() -> sd.OutputStream:
+            assert sample_rate is not None
+            assert channel_count is not None
+            with self._lock:
+                self._set_speech_phase_locked("opening_output")
+            self._emit_runtime_event(
+                "speech_output_stream_opening",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                sample_rate=sample_rate,
+                channel_count=channel_count,
+                buffered_chunk_count=buffered_chunk_count,
+                buffered_sample_count=buffered_sample_count,
+            )
+            opened_stream = self._open_output_stream(
+                sample_rate=sample_rate,
+                channel_count=channel_count,
+            )
+            stream_holder[0] = opened_stream
+            self._emit_runtime_event(
+                "speech_output_stream_opened",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                sample_rate=sample_rate,
+                channel_count=channel_count,
+            )
+            return opened_stream
+
+        def write_chunk_with_recovery(
+            current_stream: sd.OutputStream,
+            *,
+            chunk_index: int,
+            waveform_to_write: np.ndarray,
+            chunk_started_at: dt.datetime,
+        ) -> sd.OutputStream:
+            attempt = 0
+            stream_for_write = current_stream
+            while True:
+                underflowed = self._write_output_stream_chunk(stream_for_write, waveform_to_write)
+                if not underflowed:
+                    return stream_for_write
+
+                self._emit_runtime_event(
+                    "speech_chunk_playback_underflow",
+                    level="minimal",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    chunk_index=chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    retry_attempt=attempt + 1,
+                    max_retries=self.playback_underflow_retries,
+                )
+                if attempt >= self.playback_underflow_retries:
+                    raise RuntimeError(
+                        "audio output underflowed during streamed playback "
+                        f"after {attempt + 1} attempt(s)"
+                    )
+
+                close_output_stream(stream_for_write)
+                stream_for_write = open_output_stream_for_playback()
+                playback_recovery_duration_ms = _duration_ms(chunk_started_at, _utc_now())
+                self._emit_runtime_event(
+                    "speech_chunk_playback_retrying",
+                    level="minimal",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    chunk_index=chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    retry_attempt=attempt + 1,
+                    max_retries=self.playback_underflow_retries,
+                    recovery_duration_ms=playback_recovery_duration_ms,
+                )
+                attempt += 1
 
         def synthesize_into_queue() -> None:
             try:
@@ -929,7 +1048,7 @@ class TTSRuntime:
                             "streamed speech chunk language changed during playback"
                         )
 
-                if stream is None:
+                if stream_holder[0] is None:
                     buffered_waveforms.append(waveform)
                     buffered_sample_count += int(waveform.shape[0])
                     buffered_chunk_count += 1
@@ -960,31 +1079,8 @@ class TTSRuntime:
                         )
                         continue
 
-                    with self._lock:
-                        self._set_speech_phase_locked("opening_output")
-                    self._emit_runtime_event(
-                        "speech_output_stream_opening",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        sample_rate=sample_rate,
-                        channel_count=channel_count,
-                        buffered_chunk_count=buffered_chunk_count,
-                        buffered_sample_count=buffered_sample_count,
-                    )
-                    stream = self._open_output_stream(
-                        sample_rate=sample_rate,
-                        channel_count=channel_count,
-                    )
+                    stream_holder[0] = open_output_stream_for_playback()
                     playback_started_at = _utc_now()
-                    self._emit_runtime_event(
-                        "speech_output_stream_opened",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        sample_rate=sample_rate,
-                        channel_count=channel_count,
-                    )
 
                     for buffered_waveform in buffered_waveforms:
                         with self._lock:
@@ -1001,7 +1097,13 @@ class TTSRuntime:
                             chunk_count=len(normalized_chunks),
                             sample_count=int(buffered_waveform.shape[0]),
                         )
-                        self._write_output_stream_chunk(stream, buffered_waveform)
+                        assert self._current_chunk_started_at is not None
+                        stream_holder[0] = write_chunk_with_recovery(
+                            stream_holder[0],
+                            chunk_index=next_chunk_index,
+                            waveform_to_write=buffered_waveform,
+                            chunk_started_at=self._current_chunk_started_at,
+                        )
                         total_sample_count += int(buffered_waveform.shape[0])
                         self._emit_runtime_event(
                             "speech_chunk_playback_completed",
@@ -1019,7 +1121,7 @@ class TTSRuntime:
                     buffered_waveforms.clear()
                     continue
 
-                assert stream is not None
+                assert stream_holder[0] is not None
                 with self._lock:
                     self._set_speech_phase_locked("playing")
                     self._speech_current_chunk_index = next_chunk_index
@@ -1034,7 +1136,13 @@ class TTSRuntime:
                     chunk_count=len(normalized_chunks),
                     sample_count=int(waveform.shape[0]),
                 )
-                self._write_output_stream_chunk(stream, waveform)
+                assert self._current_chunk_started_at is not None
+                stream_holder[0] = write_chunk_with_recovery(
+                    stream_holder[0],
+                    chunk_index=next_chunk_index,
+                    waveform_to_write=waveform,
+                    chunk_started_at=self._current_chunk_started_at,
+                )
                 total_sample_count += int(waveform.shape[0])
                 self._emit_runtime_event(
                     "speech_chunk_playback_completed",
@@ -1053,7 +1161,7 @@ class TTSRuntime:
             if producer_error:
                 raise RuntimeError(str(producer_error[0])) from producer_error[0]
 
-            if stream is None:
+            if stream_holder[0] is None:
                 raise RuntimeError("no speech chunks were available for playback")
 
             assert sample_rate is not None
@@ -1072,21 +1180,8 @@ class TTSRuntime:
             }
         finally:
             producer_thread.join(timeout=1)
-            if stream is not None:
-                self._emit_runtime_event(
-                    "speech_output_stream_closing",
-                    level="debug",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                )
-                stream.stop()
-                stream.close()
-                self._emit_runtime_event(
-                    "speech_output_stream_closed",
-                    level="debug",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                )
+            if stream_holder[0] is not None:
+                close_output_stream(stream_holder[0])
 
     def _speech_worker_loop(self) -> None:
         while True:
@@ -1207,6 +1302,7 @@ class TTSRuntime:
             "playback_preroll_seconds": self.playback_preroll_seconds,
             "playback_preroll_chunks": self.playback_preroll_chunks,
             "playback_waveform_queue_maxsize": self.playback_waveform_queue_maxsize,
+            "playback_underflow_retries": self.playback_underflow_retries,
             "output_stream_latency": self.output_stream_latency,
             "log_level": self.log_level,
             "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
@@ -1888,7 +1984,6 @@ class TTSRuntime:
         self,
         stream: sd.OutputStream,
         waveform: np.ndarray,
-    ) -> None:
+    ) -> bool:
         underflowed = stream.write(waveform)
-        if underflowed:
-            raise RuntimeError("audio output underflowed during streamed playback")
+        return bool(underflowed)

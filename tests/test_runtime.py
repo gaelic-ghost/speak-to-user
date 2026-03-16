@@ -6,7 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 import threading
-from typing import cast
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -706,6 +706,142 @@ def test_play_speech_chunks_generates_and_writes_clone_chunks(
     assert opened_streams[0].closed is True
     assert played[0] == pytest.approx([0.0, 0.1, 0.2])
     assert played[1] == pytest.approx([0.3, 0.4, 0.5])
+
+
+def test_play_speech_chunks_recovers_from_output_underflow(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    played: list[list[float]] = []
+    opened_streams: list[Any] = []
+
+    class FakeStream:
+        def __init__(self, *, underflow_first_write: bool) -> None:
+            self.closed = False
+            self.stopped = False
+            self._underflow_first_write = underflow_first_write
+            self._write_count = 0
+
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: np.ndarray) -> bool:
+            self._write_count += 1
+            played.append(waveform.tolist())
+            if self._underflow_first_write and self._write_count == 1:
+                return True
+            return False
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    def open_output_stream(**kwargs: object) -> FakeStream:
+        del kwargs
+        stream = FakeStream(underflow_first_write=not opened_streams)
+        opened_streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(
+        runtime,
+        "_synthesize_audio_chunk",
+        lambda **kwargs: {
+            "waveform": np.array([0.0, 0.1, 0.2], dtype=np.float32),
+            "sample_rate": 24000,
+            "model_id": "Qwen/test-clone",
+            "device": "cpu",
+            "language": kwargs["language"],
+        },
+    )
+    monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
+
+    result = runtime.play_speech_chunks(
+        mode=CLONE_MODEL_KIND,
+        chunks=["Hello there"],
+        reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
+        reference_text="Reference text",
+        language="en",
+    )
+
+    assert result["played"] is True
+    assert len(opened_streams) == 2
+    assert opened_streams[0].stopped is True
+    assert opened_streams[0].closed is True
+    assert opened_streams[1].stopped is True
+    assert opened_streams[1].closed is True
+    assert played == [
+        pytest.approx([0.0, 0.1, 0.2]),
+        pytest.approx([0.0, 0.1, 0.2]),
+    ]
+
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert any(event["event"] == "speech_chunk_playback_underflow" for event in recent_events)
+    assert any(event["event"] == "speech_chunk_playback_retrying" for event in recent_events)
+
+
+def test_play_speech_chunks_fails_after_exhausting_underflow_retries(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.playback_underflow_retries = 1
+    opened_streams: list[Any] = []
+
+    class FakeStream:
+        def __init__(self) -> None:
+            self.closed = False
+            self.stopped = False
+
+        def start(self) -> None:
+            return None
+
+        def write(self, waveform: np.ndarray) -> bool:
+            del waveform
+            return True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    def open_output_stream(**kwargs: object) -> FakeStream:
+        del kwargs
+        stream = FakeStream()
+        opened_streams.append(stream)
+        return stream
+
+    monkeypatch.setattr(
+        runtime,
+        "_synthesize_audio_chunk",
+        lambda **kwargs: {
+            "waveform": np.array([0.0, 0.1, 0.2], dtype=np.float32),
+            "sample_rate": 24000,
+            "model_id": "Qwen/test-clone",
+            "device": "cpu",
+            "language": kwargs["language"],
+        },
+    )
+    monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
+
+    with pytest.raises(
+        RuntimeError,
+        match="audio output underflowed during streamed playback after 2 attempt\\(s\\)",
+    ):
+        runtime.play_speech_chunks(
+            mode=CLONE_MODEL_KIND,
+            chunks=["Hello there"],
+            reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
+            reference_text="Reference text",
+            language="en",
+        )
+
+    assert len(opened_streams) == 2
+    assert all(stream.stopped is True for stream in opened_streams)
+    assert all(stream.closed is True for stream in opened_streams)
 
 
 # MARK: Status

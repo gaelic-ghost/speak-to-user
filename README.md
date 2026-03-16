@@ -149,6 +149,8 @@ Recommended profile workflow:
   Default: `2`
 - `SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE`
   Default: `16`
+- `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES`
+  Default: `2`
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY`
   Allowed values: `low`, `high`, or a positive number
   Default: `high`
@@ -164,6 +166,7 @@ Operational notes:
 - startup time increases when both models are enabled because preload waits for both
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects output-stream buffering only; it does not reduce model inference time
+- `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback reopens the output stream and retries the current chunk after a stream underflow
 - first-audio latency is usually dominated by model synthesis, especially on the 1.7B voice-design model
 
 ## LaunchAgents
@@ -176,7 +179,7 @@ They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/
 - Dev service: `http://127.0.0.1:8766/mcp`
 
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
-At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, completion, and failure. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
+At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, underflow recovery, completion, and failure. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
 When diagnosing clone quality or playback problems, check both:
 
