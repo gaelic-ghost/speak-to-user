@@ -1,8 +1,9 @@
 [project]
 name = "speak-to-user"
-version = "0.1.0"
+version = "0.2.0"
 description = "A localhost FastMCP server for coding agents to interact with users via text to speech."
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastmcp>=3.1.0",
