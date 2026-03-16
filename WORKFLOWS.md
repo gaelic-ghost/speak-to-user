@@ -1,6 +1,6 @@
 # Tool Workflows
 
-`WORKFLOWS.md` documents the live MCP paths in this repo. It follows the current implementation in `app/server.py`, `app/tools.py`, `app/runtime.py`, and `app/text_chunking.py`.
+`WORKFLOWS.md` documents the current MCP paths in this repo. It follows the implementation in `app/server.py`, `app/tools.py`, `app/runtime.py`, and `app/text_chunking.py`.
 
 ## Shared Lifespan Flow
 
@@ -11,13 +11,13 @@ flowchart LR
     C --> D["TTSRuntime(...)"]
     D --> E["runtime.preload()"]
     E --> F["runtime.start_speech_worker()"]
-    E --> G["runtime.load_model()"]
+    E --> G["load enabled models"]
     B --> H["yield {'runtime': runtime} into lifespan_context"]
     H --> I["tool calls resolve ctx.lifespan_context['runtime']"]
     B --> J["runtime.shutdown()"]
 ```
 
-The server creates one `TTSRuntime` per FastMCP process during lifespan setup. Preload starts the in-process speech worker and blocks until the model is resident. The runtime is then shared by every tool call in that process and shut down when the server exits.
+The server creates one `TTSRuntime` per FastMCP process during lifespan setup. Preload starts the in-process speech worker and blocks until all enabled resident models are loaded. The runtime is then shared by every tool call in that process and shut down when the server exits.
 
 ## `health`
 
@@ -47,6 +47,8 @@ Important status behavior:
 - `speech_phase` is `synthesizing` while the model is generating audio for the active request.
 - `speech_phase` is `opening_output` while the output stream is being opened.
 - `speech_phase` is `playing` while waveform chunks are being written to the audio device.
+- separate voice-design and clone model state is always reported.
+- recent structured runtime events are included for live diagnosis.
 
 ## `speak_text`
 
@@ -56,39 +58,97 @@ flowchart LR
     B --> C["tools._runtime_from_context(ctx)"]
     C --> D["chunk_text_for_tts(text)"]
     D --> E["runtime.speak_text(...)"]
-    E --> F["normalize voice, language, chunks"]
-    F --> G["enqueue one job into in-process FIFO queue"]
-    G --> H["speech worker reads job"]
-    H --> I["play_speech_chunks(...)"]
-    I --> J["_synthesize_audio_chunk(text=chunk_1, ...)"]
-    J --> K["_model.generate_voice_design(...)"]
-    K --> L["small preroll buffer"]
-    L --> M["_open_output_stream(...)"]
-    M --> N["_write_output_stream_chunk(chunk_1)"]
-    N --> O["_synthesize_audio_chunk(text=chunk_2, ...) then write chunk_2, repeat"]
+    E --> F["enqueue one voice-design job"]
+    F --> G["speech worker reads job"]
+    G --> H["play_speech_chunks(...)"]
+    H --> I["_synthesize_audio_chunk(...)"]
+    I --> J["_model.generate_voice_design(...)"]
+    J --> K["small preroll buffer"]
+    K --> L["_open_output_stream(...)"]
+    L --> M["_write_output_stream_chunk(...)"]
 ```
 
-`speak_text` is a plain MCP tool. It enqueues one full text job for the caller's request, chunking longer text first so playback stays model-friendly. Playback then happens on the already-running in-process worker.
+`speak_text` is the normal voice-design playback path. It enqueues one full text job for the caller's request and returns immediately. Playback then happens on the already-running in-process worker.
 
-Important behavior:
+## `speak_text_as_clone`
 
-- one `speak_text` call creates one queued playback job
-- one playback job keeps one output stream open while chunks are synthesized and written in order
-- playback uses one output stream per speech request
-- playback audio is not persisted to disk
-- `speech_phase` exposes whether the job is still synthesizing or has reached playback
+```mermaid
+flowchart LR
+    A["MCP tool: server.speak_text_as_clone(...)"] --> B["tools.speak_text_as_clone(ctx, ...)"]
+    B --> C["tools._runtime_from_context(ctx)"]
+    C --> D["decode reference audio"]
+    D --> E["chunk_text_for_tts(text)"]
+    E --> F["runtime.speak_text_as_clone(...)"]
+    F --> G["enqueue one clone job"]
+    G --> H["speech worker reads job"]
+    H --> I["play_speech_chunks(...)"]
+    I --> J["_synthesize_audio_chunk(...)"]
+    J --> K["_model.generate_voice_clone(...)"]
+    K --> L["small preroll buffer"]
+    L --> M["_open_output_stream(...)"]
+    M --> N["_write_output_stream_chunk(...)"]
+```
+
+`speak_text_as_clone` is the ad hoc clone playback path. It reads a local reference clip, chooses clone mode from the presence of `reference_text`, and then enqueues one clone job into the same global playback queue used by `speak_text`.
+
+Important clone behavior:
+
+- without `reference_text`, the clone path uses `x_vector_only_mode=True`
+- with `reference_text`, the clone path uses `x_vector_only_mode=False`
+- clone playback uses the resident 0.6B clone model
+
+## Speech Profiles
+
+```mermaid
+flowchart LR
+    A["MCP tool: server.generate_speech_profile(...)"] --> B["tools.generate_speech_profile(ctx, ...)"]
+    B --> C["tools._runtime_from_context(ctx)"]
+    C --> D["decode reference audio"]
+    D --> E["runtime.generate_speech_profile(...)"]
+    E --> F["create Qwen voice clone prompt"]
+    F --> G["serialize prompt tensors"]
+    G --> H["store profile in FastMCP state store"]
+```
+
+Speech profiles are reusable named clone prompts persisted in FastMCP's underlying state store. They are bound to the active clone model ID at creation time.
+
+```mermaid
+flowchart LR
+    A["MCP tool: server.speak_with_profile(...)"] --> B["tools.speak_with_profile(ctx, ...)"]
+    B --> C["tools._runtime_from_context(ctx)"]
+    C --> D["chunk_text_for_tts(text)"]
+    D --> E["runtime.speak_with_profile(...)"]
+    E --> F["load stored prompt artifact"]
+    F --> G["enqueue one clone job with voice_clone_prompt"]
+    G --> H["speech worker reads job"]
+    H --> I["play_speech_chunks(...)"]
+    I --> J["_model.generate_voice_clone(...)"]
+```
+
+`speak_with_profile` skips reference-audio decoding at request time and reuses the saved prompt artifact directly.
 
 ## Text Chunking
 
 ```mermaid
 flowchart LR
-    A["chunk_text_for_tts(text, max_chars)"] --> B["split by sentence"]
-    B --> C{"sentence fits?"}
-    C -->|yes| D["append one sentence chunk"]
-    C -->|no| E["_chunk_words(...)"]
-    E --> F{"word fits?"}
-    F -->|yes| G["append word-packed chunk"]
-    F -->|no| H["_split_long_word(...)"]
+    A["chunk_text_for_tts(text, max_chars)"] --> B["scan toward max_chars"]
+    B --> C{"sentence boundary before limit?"}
+    C -->|yes| D["split at nearest sentence boundary"]
+    C -->|no| E{"word boundary before limit?"}
+    E -->|yes| F["split at nearest word boundary"]
+    E -->|no| G["hard split at limit"]
 ```
 
-Chunking is always sentence-first. Each sentence becomes its own chunk whenever possible, and only individual overlong sentences fall back to word splitting. It is used for every `speak_text` request before buffered rolling synthesis and playback.
+Chunking is now size-oriented rather than sentence-by-sentence. The chunker fills toward the configured character limit, prefers the nearest sentence boundary at or before that limit, then falls back to a word boundary, and only hard-splits when there is no softer break available.
+
+## Shared Queue And Playback
+
+All speech-producing tools share one in-process FIFO queue and one playback worker.
+
+Important behavior:
+
+- multiple MCP clients can stay connected at once
+- only one speech job plays at a time
+- one request keeps one output stream open while its chunks are synthesized and written in order
+- playback audio is not persisted to disk unless a future file-producing path is explicitly added
+- `tts_status` is the best live view into queue depth, active mode, recent events, and model readiness

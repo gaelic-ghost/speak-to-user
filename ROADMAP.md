@@ -6,9 +6,9 @@ This roadmap tracks likely next directions for `speak-to-user`. It is intentiona
 
 - Add persistent file storage for retained outputs and batch-generation workflows.
 - Expose agent-facing MCP Prompts and Resources with guidance for chunking, voice usage, and reliable server interaction.
-- Add voice description profile support so repeated usage patterns can be named and reused instead of rewritten each time.
-- Support voice profile selection through MCP user elicitation.
-- Support automatic voice profile switching with FastMCP Context.
+- Improve time-to-first-audio for the 1.7B voice-design path.
+- Evaluate smaller or alternate TTS backends that reduce latency on Apple Silicon.
+- Expand reusable profile support beyond clone prompts, including named voice-description presets for the voice-design path.
 
 ## Product Surface Expansion
 
@@ -18,6 +18,7 @@ This roadmap tracks likely next directions for `speak-to-user`. It is intentiona
 - Publish the package on PyPI.
 - Support composition with a FastAPI service.
 - Explore packaging and distribution as a macOS `MenuBarExtra` app.
+- Add saved-audio workflows when Gale explicitly wants retained outputs instead of immediate playback.
 
 ## Notes
 
