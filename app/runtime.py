@@ -8,6 +8,7 @@ import gc
 import importlib.util
 import json
 import os
+from pathlib import Path
 import queue
 import shutil
 import sys
@@ -19,7 +20,12 @@ import sounddevice as sd  # type: ignore[import-untyped]
 
 # MARK: Constants
 
-DEFAULT_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+VOICE_DESIGN_MODEL_KIND = "voice_design"
+CLONE_MODEL_KIND = "clone"
+DEFAULT_VOICE_DESIGN_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
+DEFAULT_CLONE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
+DEFAULT_ENABLE_VOICE_DESIGN_MODEL = True
+DEFAULT_ENABLE_CLONE_MODEL = True
 DEFAULT_PLAYBACK_PREROLL_SECONDS = 3.0
 DEFAULT_PLAYBACK_PREROLL_CHUNKS = 2
 DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 16
@@ -68,6 +74,23 @@ def _utc_now() -> dt.datetime:
 
 def _timestamp_value(value: dt.datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
+
+
+def _normalize_enabled_flag(
+    raw: str | None,
+    *,
+    env_var: str,
+    default: bool,
+) -> bool:
+    if raw is None:
+        return default
+
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{env_var} must be one of: true, false, 1, 0, yes, no, on, off")
 
 
 def _normalize_device(raw: str | None) -> str:
@@ -158,7 +181,6 @@ def _normalize_language(value: str) -> str:
     if alias is not None:
         return alias
 
-    # Accept common locale variants like en-US and pt_BR by folding to the base language.
     for separator in ("-", "_"):
         if separator in lowered:
             base_language = lowered.split(separator, 1)[0]
@@ -175,12 +197,17 @@ def _runtime_dependency_status() -> dict[str, bool]:
         "qwen_tts_available": importlib.util.find_spec("qwen_tts") is not None,
         "torch_available": importlib.util.find_spec("torch") is not None,
         "torchaudio_available": importlib.util.find_spec("torchaudio") is not None,
+        "soundfile_available": importlib.util.find_spec("soundfile") is not None,
     }
 
 
 def _runtime_dependencies_ready() -> bool:
     status = _runtime_dependency_status()
-    return bool(status["sox_available"] and status["qwen_tts_available"])
+    return bool(
+        status["sox_available"]
+        and status["qwen_tts_available"]
+        and status["soundfile_available"]
+    )
 
 
 def _meta_tensor_runtime_error(exc: Exception) -> bool:
@@ -239,7 +266,10 @@ class TTSRuntime:
     def __init__(
         self,
         *,
-        model_id: str,
+        voice_design_model_id: str = DEFAULT_VOICE_DESIGN_MODEL_ID,
+        clone_model_id: str = DEFAULT_CLONE_MODEL_ID,
+        enable_voice_design_model: bool = DEFAULT_ENABLE_VOICE_DESIGN_MODEL,
+        enable_clone_model: bool = DEFAULT_ENABLE_CLONE_MODEL,
         device_preference: str,
         torch_dtype_name: str | None = None,
         speech_queue_maxsize: int = DEFAULT_SPEECH_QUEUE_MAXSIZE,
@@ -249,7 +279,10 @@ class TTSRuntime:
         output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
         log_level: str = DEFAULT_LOG_LEVEL,
     ) -> None:
-        self.model_id = model_id
+        self.voice_design_model_id = voice_design_model_id
+        self.clone_model_id = clone_model_id
+        self.enable_voice_design_model = enable_voice_design_model
+        self.enable_clone_model = enable_clone_model
         self.device_preference = device_preference
         self.torch_dtype_name = torch_dtype_name
         self.speech_queue_maxsize = speech_queue_maxsize
@@ -267,18 +300,24 @@ class TTSRuntime:
         self._speech_worker_thread: threading.Thread | None = None
         self._speech_worker_started = False
 
-        self._model: Any | None = None
-        self._resolved_device: str | None = None
+        self._model_slots: dict[str, dict[str, Any]] = {
+            VOICE_DESIGN_MODEL_KIND: self._new_model_slot(
+                model_id=voice_design_model_id,
+                enabled=enable_voice_design_model,
+            ),
+            CLONE_MODEL_KIND: self._new_model_slot(
+                model_id=clone_model_id,
+                enabled=enable_clone_model,
+            ),
+        }
         self._last_error: str | None = None
-        self._last_used_at: dt.datetime | None = None
-        self._last_loaded_at: dt.datetime | None = None
-        self._cpu_fallback_active = False
 
         self._speech_in_progress = False
         self._speech_phase = DEFAULT_SPEECH_PHASE
         self._speech_current_job_id: int | None = None
         self._speech_current_chunk_index: int | None = None
         self._speech_current_chunk_count: int | None = None
+        self._speech_current_mode: str | None = None
         self._speech_jobs_queued = 0
         self._speech_jobs_completed = 0
         self._speech_jobs_failed = 0
@@ -295,7 +334,24 @@ class TTSRuntime:
     @classmethod
     def from_env(cls) -> TTSRuntime:
         return cls(
-            model_id=os.getenv("SPEAK_TO_USER_MODEL_ID", DEFAULT_MODEL_ID),
+            voice_design_model_id=os.getenv(
+                "SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID",
+                DEFAULT_VOICE_DESIGN_MODEL_ID,
+            ),
+            clone_model_id=os.getenv(
+                "SPEAK_TO_USER_CLONE_MODEL_ID",
+                DEFAULT_CLONE_MODEL_ID,
+            ),
+            enable_voice_design_model=_normalize_enabled_flag(
+                os.getenv("SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL"),
+                env_var="SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL",
+                default=DEFAULT_ENABLE_VOICE_DESIGN_MODEL,
+            ),
+            enable_clone_model=_normalize_enabled_flag(
+                os.getenv("SPEAK_TO_USER_ENABLE_CLONE_MODEL"),
+                env_var="SPEAK_TO_USER_ENABLE_CLONE_MODEL",
+                default=DEFAULT_ENABLE_CLONE_MODEL,
+            ),
             device_preference=_normalize_device(os.getenv("SPEAK_TO_USER_DEVICE")),
             torch_dtype_name=_normalize_torch_dtype(os.getenv("SPEAK_TO_USER_TORCH_DTYPE")),
             playback_preroll_seconds=_normalize_positive_float(
@@ -322,11 +378,21 @@ class TTSRuntime:
     def preload(self) -> dict[str, Any]:
         self._emit_runtime_event("runtime_preload_started", level="minimal")
         self.start_speech_worker()
-        result = self.load_model()
+
+        enabled_model_kinds = self._enabled_model_kinds()
+        for model_kind in enabled_model_kinds:
+            self.load_model(model_kind=model_kind)
+
+        result = {
+            "result": "success",
+            "loaded": self._all_enabled_models_loaded_locked(),
+            "loaded_model_kinds": enabled_model_kinds,
+            **self.status(),
+        }
         self._emit_runtime_event(
             "runtime_preload_completed",
             level="minimal",
-            model_loaded=bool(result["loaded"]),
+            enabled_model_kinds=enabled_model_kinds,
         )
         return result
 
@@ -364,78 +430,100 @@ class TTSRuntime:
             worker_thread.join(timeout=1)
 
         with self._lock:
-            if self._model is not None:
-                self._unload_locked()
+            for model_kind in list(self._model_slots):
+                self._unload_model_locked(model_kind)
         self._emit_runtime_event("runtime_shutdown_completed", level="minimal")
 
     def status(self) -> dict[str, Any]:
         with self._lock:
             return self._status_payload_locked()
 
-    def load_model(self) -> dict[str, Any]:
+    def load_model(self, *, model_kind: str = VOICE_DESIGN_MODEL_KIND) -> dict[str, Any]:
         if not _runtime_dependencies_ready():
             dependency_status = _runtime_dependency_status()
-            missing: list[str] = []
-            if not dependency_status["sox_available"]:
-                missing.append("sox")
-            if not dependency_status["qwen_tts_available"]:
-                missing.append("qwen_tts")
-            message = f"runtime dependencies are unavailable: {', '.join(missing)}"
+            missing = [
+                name.removesuffix("_available")
+                for name, available in dependency_status.items()
+                if not available and name
+            ]
+            message = f"runtime dependencies are unavailable: {', '.join(sorted(missing))}"
             with self._lock:
                 self._last_error = message
-            self._emit_runtime_event("model_load_failed", level="minimal", error=message)
+                self._model_state(model_kind)["last_error"] = message
+            self._emit_runtime_event(
+                "model_load_failed",
+                level="minimal",
+                model_kind=model_kind,
+                error=message,
+            )
             raise RuntimeError(message)
 
         with self._lock:
+            slot = self._model_state(model_kind)
             if self._shutdown_requested.is_set():
                 raise RuntimeError("runtime is shutting down")
-            if self._model is not None:
-                self._touch_locked()
+            if not slot["enabled"]:
+                raise RuntimeError(f"{model_kind} model is disabled")
+            if slot["model"] is not None:
+                self._touch_model_locked(model_kind)
                 self._emit_runtime_event(
                     "model_load_skipped_already_loaded",
                     level="debug",
-                    device=self._resolved_device,
+                    model_kind=model_kind,
+                    device=slot["resolved_device"],
                 )
                 return {
                     "result": "success",
                     "loaded": True,
-                    "info": "model already loaded",
+                    "info": f"{model_kind} model already loaded",
                     **self._status_payload_locked(),
                 }
 
         try:
-            loaded_model = self._load_model_impl()
+            loaded_model = self._load_model_impl(model_kind)
         except Exception as exc:
             with self._lock:
                 self._last_error = str(exc)
-            self._emit_runtime_event("model_load_failed", level="minimal", error=str(exc))
+                self._model_state(model_kind)["last_error"] = str(exc)
+            self._emit_runtime_event(
+                "model_load_failed",
+                level="minimal",
+                model_kind=model_kind,
+                error=str(exc),
+            )
             raise
 
         with self._lock:
+            slot = self._model_state(model_kind)
             if self._shutdown_requested.is_set():
-                self._release_model_resources(loaded_model, resolved_device=self._resolved_device)
-                self._resolved_device = None
+                self._release_model_resources(
+                    loaded_model,
+                    resolved_device=slot["resolved_device"],
+                )
+                slot["resolved_device"] = None
                 return {
                     "result": "success",
                     "loaded": False,
-                    "info": "model load aborted during shutdown",
+                    "info": f"{model_kind} model load aborted during shutdown",
                     **self._status_payload_locked(),
                 }
 
-            self._model = loaded_model
+            slot["model"] = loaded_model
+            slot["last_error"] = None
+            slot["last_loaded_at"] = _utc_now()
+            self._touch_model_locked(model_kind, slot["last_loaded_at"])
             self._last_error = None
-            self._last_loaded_at = _utc_now()
-            self._touch_locked(self._last_loaded_at)
             self._emit_runtime_event(
                 "model_load_completed",
                 level="minimal",
-                device=self._resolved_device,
-                cpu_fallback_active=self._cpu_fallback_active,
+                model_kind=model_kind,
+                device=slot["resolved_device"],
+                cpu_fallback_active=slot["cpu_fallback_active"],
             )
             return {
                 "result": "success",
                 "loaded": True,
-                "info": "model loaded",
+                "info": f"{model_kind} model loaded",
                 **self._status_payload_locked(),
             }
 
@@ -446,74 +534,74 @@ class TTSRuntime:
         voice_description: str,
         language: str = "en",
     ) -> dict[str, Any]:
-        normalized_chunks = self._normalize_chunks(chunks)
         normalized_description = voice_description.strip()
         if not normalized_description:
             raise ValueError("voice_description must not be empty")
-        normalized_language = _normalize_language(language)
 
-        self.start_speech_worker()
+        return self._enqueue_speech_job(
+            mode=VOICE_DESIGN_MODEL_KIND,
+            chunks=self._normalize_chunks(chunks),
+            language=_normalize_language(language),
+            voice_description=normalized_description,
+        )
 
-        with self._lock:
-            if self._shutdown_requested.is_set():
-                raise RuntimeError("runtime is shutting down and cannot accept speech jobs")
+    def speak_text_as_clone(
+        self,
+        *,
+        chunks: list[str],
+        reference_audio_path: str,
+        reference_text: str | None = None,
+        language: str = "en",
+    ) -> dict[str, Any]:
+        normalized_reference_audio_path = reference_audio_path.strip()
+        if not normalized_reference_audio_path:
+            raise ValueError("reference_audio_path must not be empty")
 
-            job_id = self._speech_jobs_queued + 1
-            job = {
-                "job_id": job_id,
-                "chunks": normalized_chunks,
-                "voice_description": normalized_description,
-                "language": normalized_language,
-            }
+        normalized_reference_text = reference_text.strip() if reference_text is not None else None
+        if normalized_reference_text == "":
+            normalized_reference_text = None
 
-            try:
-                self._speech_queue.put_nowait(job)
-            except queue.Full as exc:
-                self._speech_last_error = "speech queue is full"
-                self._last_error = self._speech_last_error
-                raise RuntimeError("speech queue is full") from exc
-
-            enqueued_at = _utc_now()
-            self._speech_jobs_queued = job_id
-            self._speech_last_enqueued_at = enqueued_at
-            self._speech_last_error = None
-            self._emit_runtime_event(
-                "speech_job_queued",
-                level="minimal",
-                job_id=job_id,
-                chunk_count=len(normalized_chunks),
-                chunk_char_count=sum(len(chunk) for chunk in normalized_chunks),
-                language=normalized_language,
-                queue_depth=self._speech_queue.qsize(),
-            )
-            return {
-                "result": "success",
-                "queued": True,
-                "job_id": job_id,
-                "chunked": len(normalized_chunks) > 1,
-                "chunk_count": len(normalized_chunks),
-                "language": normalized_language,
-                "enqueued_at": enqueued_at.isoformat(),
-                "playback_mode": "in-process-queue",
-                **self._speech_status_payload_locked(),
-            }
+        reference_audio = self._decode_reference_audio_file(normalized_reference_audio_path)
+        result = self._enqueue_speech_job(
+            mode=CLONE_MODEL_KIND,
+            chunks=self._normalize_chunks(chunks),
+            language=_normalize_language(language),
+            reference_audio=reference_audio,
+            reference_audio_path=normalized_reference_audio_path,
+            reference_text=normalized_reference_text,
+        )
+        result["clone_mode"] = (
+            "reference_text" if normalized_reference_text is not None else "x_vector_only"
+        )
+        result["reference_audio_path"] = normalized_reference_audio_path
+        result["reference_text_included"] = normalized_reference_text is not None
+        result["clone_model_id"] = self.clone_model_id
+        return result
 
     def play_speech_chunks(
         self,
         *,
+        mode: str,
         chunks: list[str],
-        voice_description: str,
         language: str = "en",
+        voice_description: str | None = None,
+        reference_audio: tuple[np.ndarray, int] | None = None,
+        reference_text: str | None = None,
     ) -> dict[str, Any]:
         if not chunks:
             raise ValueError("chunks must not be empty")
 
-        normalized_description = voice_description.strip()
-        if not normalized_description:
-            raise ValueError("voice_description must not be empty")
-
-        normalized_language = _normalize_language(language)
         normalized_chunks = self._normalize_chunks(chunks)
+        normalized_language = _normalize_language(language)
+        if mode == VOICE_DESIGN_MODEL_KIND:
+            normalized_description = (voice_description or "").strip()
+            if not normalized_description:
+                raise ValueError("voice_description must not be empty")
+        else:
+            normalized_description = None
+            if reference_audio is None:
+                raise ValueError("reference_audio must not be empty for clone playback")
+
         total_sample_count = 0
         buffered_sample_count = 0
         buffered_waveforms: list[np.ndarray] = []
@@ -540,20 +628,25 @@ class TTSRuntime:
                         "speech_chunk_synthesis_started",
                         level="info",
                         job_id=self._speech_current_job_id,
+                        mode=mode,
                         chunk_index=chunk_index,
                         chunk_count=len(normalized_chunks),
                         chunk_char_count=len(text_chunk),
                     )
                     chunk_result = self._synthesize_audio_chunk(
+                        mode=mode,
                         text=text_chunk,
                         voice_description=normalized_description,
                         language=normalized_language,
+                        reference_audio=reference_audio,
+                        reference_text=reference_text,
                     )
                     waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
                     self._emit_runtime_event(
                         "speech_chunk_synthesis_completed",
                         level="info",
                         job_id=self._speech_current_job_id,
+                        mode=mode,
                         chunk_index=chunk_index,
                         chunk_count=len(normalized_chunks),
                         synth_duration_ms=_duration_ms(synth_started_at, _utc_now()),
@@ -574,6 +667,7 @@ class TTSRuntime:
                     "speech_chunk_producer_failed",
                     level="minimal",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                     error=str(exc),
                 )
             finally:
@@ -658,6 +752,7 @@ class TTSRuntime:
                             "speech_preroll_waiting",
                             level="debug",
                             job_id=self._speech_current_job_id,
+                            mode=mode,
                             buffered_chunk_count=buffered_chunk_count,
                             buffered_sample_count=buffered_sample_count,
                             preroll_sample_target=preroll_sample_target,
@@ -670,6 +765,7 @@ class TTSRuntime:
                         "speech_output_stream_opening",
                         level="info",
                         job_id=self._speech_current_job_id,
+                        mode=mode,
                         sample_rate=sample_rate,
                         channel_count=channel_count,
                         buffered_chunk_count=buffered_chunk_count,
@@ -684,6 +780,7 @@ class TTSRuntime:
                         "speech_output_stream_opened",
                         level="info",
                         job_id=self._speech_current_job_id,
+                        mode=mode,
                         sample_rate=sample_rate,
                         channel_count=channel_count,
                     )
@@ -698,6 +795,7 @@ class TTSRuntime:
                             "speech_chunk_playback_started",
                             level="info",
                             job_id=self._speech_current_job_id,
+                            mode=mode,
                             chunk_index=next_chunk_index,
                             chunk_count=len(normalized_chunks),
                             sample_count=int(buffered_waveform.shape[0]),
@@ -708,6 +806,7 @@ class TTSRuntime:
                             "speech_chunk_playback_completed",
                             level="info",
                             job_id=self._speech_current_job_id,
+                            mode=mode,
                             chunk_index=next_chunk_index,
                             chunk_count=len(normalized_chunks),
                             playback_duration_ms=_duration_ms(
@@ -729,6 +828,7 @@ class TTSRuntime:
                     "speech_chunk_playback_started",
                     level="info",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                     chunk_index=next_chunk_index,
                     chunk_count=len(normalized_chunks),
                     sample_count=int(waveform.shape[0]),
@@ -739,6 +839,7 @@ class TTSRuntime:
                     "speech_chunk_playback_completed",
                     level="info",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                     chunk_index=next_chunk_index,
                     chunk_count=len(normalized_chunks),
                     playback_duration_ms=_duration_ms(
@@ -766,6 +867,7 @@ class TTSRuntime:
                 "device": device,
                 "language": normalized_language,
                 "player": "sounddevice-stream",
+                "mode": mode,
             }
         finally:
             producer_thread.join(timeout=1)
@@ -774,6 +876,7 @@ class TTSRuntime:
                     "speech_output_stream_closing",
                     level="debug",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                 )
                 stream.stop()
                 stream.close()
@@ -781,6 +884,7 @@ class TTSRuntime:
                     "speech_output_stream_closed",
                     level="debug",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                 )
 
     def _speech_worker_loop(self) -> None:
@@ -792,8 +896,8 @@ class TTSRuntime:
                 return
 
             job_id = int(job["job_id"])
+            mode = str(job["mode"])
             chunks = list(job["chunks"])
-            voice_description = str(job["voice_description"])
             language = str(job["language"])
 
             with self._lock:
@@ -803,11 +907,13 @@ class TTSRuntime:
                 self._speech_current_job_id = job_id
                 self._speech_current_chunk_index = 0
                 self._speech_current_chunk_count = len(chunks)
+                self._speech_current_mode = mode
                 self._speech_last_error = None
             self._emit_runtime_event(
                 "speech_job_started",
                 level="minimal",
                 job_id=job_id,
+                mode=mode,
                 chunk_count=len(chunks),
                 queue_depth=self._speech_queue.qsize(),
                 enqueue_to_start_ms=_duration_ms(
@@ -817,11 +923,23 @@ class TTSRuntime:
             )
 
             try:
-                self.play_speech_chunks(
-                    chunks=chunks,
-                    voice_description=voice_description,
-                    language=language,
-                )
+                if mode == VOICE_DESIGN_MODEL_KIND:
+                    self.play_speech_chunks(
+                        mode=mode,
+                        chunks=chunks,
+                        voice_description=str(job["voice_description"]),
+                        language=language,
+                    )
+                elif mode == CLONE_MODEL_KIND:
+                    self.play_speech_chunks(
+                        mode=mode,
+                        chunks=chunks,
+                        language=language,
+                        reference_audio=cast(tuple[np.ndarray, int], job["reference_audio"]),
+                        reference_text=cast(str | None, job.get("reference_text")),
+                    )
+                else:
+                    raise RuntimeError(f"unsupported speech mode `{mode}`")
             except Exception as exc:
                 with self._lock:
                     self._speech_jobs_failed += 1
@@ -831,6 +949,7 @@ class TTSRuntime:
                     "speech_job_failed",
                     level="minimal",
                     job_id=job_id,
+                    mode=mode,
                     phase=self._speech_phase,
                     error=str(exc),
                     total_job_duration_ms=_duration_ms(self._current_job_started_at, _utc_now()),
@@ -841,11 +960,11 @@ class TTSRuntime:
                     self._speech_jobs_completed += 1
                     self._speech_last_completed_at = completed_at
                     self._speech_last_error = None
-                    self._touch_locked(completed_at)
                 self._emit_runtime_event(
                     "speech_job_completed",
                     level="minimal",
                     job_id=job_id,
+                    mode=mode,
                     total_job_duration_ms=_duration_ms(self._current_job_started_at, completed_at),
                 )
             finally:
@@ -855,32 +974,56 @@ class TTSRuntime:
                     self._speech_current_job_id = None
                     self._speech_current_chunk_index = None
                     self._speech_current_chunk_count = None
+                    self._speech_current_mode = None
                     self._current_job_started_at = None
                     self._current_chunk_started_at = None
                 self._speech_queue.task_done()
 
     def _status_payload_locked(self) -> dict[str, Any]:
         dependency_status = _runtime_dependency_status()
+        voice_design_state = self._model_state(VOICE_DESIGN_MODEL_KIND)
+        clone_state = self._model_state(CLONE_MODEL_KIND)
+        overall_ready = (
+            _runtime_dependencies_ready()
+            and self._last_error is None
+            and self._all_enabled_models_loaded_locked()
+        )
         return {
-            "ready": (
-                _runtime_dependencies_ready()
-                and self._model is not None
-                and self._last_error is None
-            ),
-            "model_loaded": self._model is not None,
+            "ready": overall_ready,
+            "model_loaded": voice_design_state["model"] is not None,
             "device_preference": self.device_preference,
-            "device": self._resolved_device,
-            "model_id": self.model_id,
+            "device": voice_design_state["resolved_device"],
+            "model_id": self.voice_design_model_id,
             "torch_dtype": self.torch_dtype_name,
-            "cpu_fallback_active": self._cpu_fallback_active,
+            "cpu_fallback_active": voice_design_state["cpu_fallback_active"],
             "playback_preroll_seconds": self.playback_preroll_seconds,
             "playback_preroll_chunks": self.playback_preroll_chunks,
             "playback_waveform_queue_maxsize": self.playback_waveform_queue_maxsize,
             "output_stream_latency": self.output_stream_latency,
             "log_level": self.log_level,
-            "last_used_at": _timestamp_value(self._last_used_at),
-            "last_loaded_at": _timestamp_value(self._last_loaded_at),
+            "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
+            "last_loaded_at": _timestamp_value(voice_design_state["last_loaded_at"]),
             "last_error": self._last_error,
+            "voice_design_model_enabled": voice_design_state["enabled"],
+            "voice_design_model_loaded": voice_design_state["model"] is not None,
+            "voice_design_model_id": voice_design_state["model_id"],
+            "voice_design_device": voice_design_state["resolved_device"],
+            "voice_design_last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
+            "voice_design_last_loaded_at": _timestamp_value(voice_design_state["last_loaded_at"]),
+            "voice_design_last_error": voice_design_state["last_error"],
+            "voice_design_cpu_fallback_active": voice_design_state["cpu_fallback_active"],
+            "clone_model_enabled": clone_state["enabled"],
+            "clone_model_loaded": clone_state["model"] is not None,
+            "clone_model_id": clone_state["model_id"],
+            "clone_device": clone_state["resolved_device"],
+            "clone_last_used_at": _timestamp_value(clone_state["last_used_at"]),
+            "clone_last_loaded_at": _timestamp_value(clone_state["last_loaded_at"]),
+            "clone_last_error": clone_state["last_error"],
+            "clone_cpu_fallback_active": clone_state["cpu_fallback_active"],
+            "clone_in_progress": (
+                self._speech_in_progress
+                and self._speech_current_mode == CLONE_MODEL_KIND
+            ),
             "current_job_started_at": _timestamp_value(self._current_job_started_at),
             "current_chunk_started_at": _timestamp_value(self._current_chunk_started_at),
             "current_phase_started_at": _timestamp_value(self._current_phase_started_at),
@@ -898,6 +1041,7 @@ class TTSRuntime:
             "speech_current_job_id": self._speech_current_job_id,
             "speech_current_chunk_index": self._speech_current_chunk_index,
             "speech_current_chunk_count": self._speech_current_chunk_count,
+            "speech_current_mode": self._speech_current_mode,
             "speech_queue_depth": self._speech_queue.qsize(),
             "speech_queue_maxsize": self.speech_queue_maxsize,
             "speech_jobs_queued": self._speech_jobs_queued,
@@ -909,14 +1053,6 @@ class TTSRuntime:
             "speech_last_event_at": _timestamp_value(self._speech_last_event_at),
             "speech_last_event": self._speech_last_event,
         }
-
-    def _touch_locked(self, value: dt.datetime | None = None) -> None:
-        self._last_used_at = value or _utc_now()
-
-    def _set_speech_phase_locked(self, phase: str) -> None:
-        if self._speech_phase != phase or self._current_phase_started_at is None:
-            self._current_phase_started_at = _utc_now()
-        self._speech_phase = phase
 
     def _emit_runtime_event(self, event: str, *, level: str, **details: Any) -> None:
         if LOG_LEVEL_PRIORITY[level] > LOG_LEVEL_PRIORITY[self.log_level]:
@@ -933,6 +1069,77 @@ class TTSRuntime:
 
         _ORIGINAL_PRINT(json.dumps(payload, sort_keys=True), file=sys.stderr)
 
+    def _enqueue_speech_job(
+        self,
+        *,
+        mode: str,
+        chunks: list[str],
+        language: str,
+        voice_description: str | None = None,
+        reference_audio: tuple[np.ndarray, int] | None = None,
+        reference_audio_path: str | None = None,
+        reference_text: str | None = None,
+    ) -> dict[str, Any]:
+        self.start_speech_worker()
+
+        with self._lock:
+            slot = self._model_state(mode)
+            if self._shutdown_requested.is_set():
+                raise RuntimeError("runtime is shutting down and cannot accept speech jobs")
+            if not slot["enabled"]:
+                raise RuntimeError(f"{mode} model is disabled and cannot accept speech jobs")
+
+            job_id = self._speech_jobs_queued + 1
+            job: dict[str, Any] = {
+                "job_id": job_id,
+                "mode": mode,
+                "chunks": chunks,
+                "language": language,
+            }
+            if voice_description is not None:
+                job["voice_description"] = voice_description
+            if reference_audio is not None:
+                job["reference_audio"] = reference_audio
+            if reference_audio_path is not None:
+                job["reference_audio_path"] = reference_audio_path
+            if reference_text is not None:
+                job["reference_text"] = reference_text
+
+            try:
+                self._speech_queue.put_nowait(job)
+            except queue.Full as exc:
+                self._speech_last_error = "speech queue is full"
+                self._last_error = self._speech_last_error
+                raise RuntimeError("speech queue is full") from exc
+
+            enqueued_at = _utc_now()
+            self._speech_jobs_queued = job_id
+            self._speech_last_enqueued_at = enqueued_at
+            self._speech_last_error = None
+            self._emit_runtime_event(
+                "speech_job_queued",
+                level="minimal",
+                job_id=job_id,
+                mode=mode,
+                chunk_count=len(chunks),
+                chunk_char_count=sum(len(chunk) for chunk in chunks),
+                language=language,
+                queue_depth=self._speech_queue.qsize(),
+                reference_text_included=reference_text is not None,
+            )
+            return {
+                "result": "success",
+                "queued": True,
+                "job_id": job_id,
+                "chunked": len(chunks) > 1,
+                "chunk_count": len(chunks),
+                "language": language,
+                "enqueued_at": enqueued_at.isoformat(),
+                "playback_mode": "in-process-queue",
+                "mode": mode,
+                **self._speech_status_payload_locked(),
+            }
+
     def _normalize_chunks(self, chunks: list[str]) -> list[str]:
         normalized_chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
         if not normalized_chunks:
@@ -942,7 +1149,6 @@ class TTSRuntime:
     def _resolve_torch_dtype(self, torch_module: Any) -> Any | None:
         if self.torch_dtype_name is None:
             return None
-
         if self.torch_dtype_name == "float16":
             return torch_module.float16
         if self.torch_dtype_name == "bfloat16":
@@ -951,11 +1157,12 @@ class TTSRuntime:
             return torch_module.float32
         raise RuntimeError("unsupported torch dtype configuration")
 
-    def _load_model_kwargs(self, torch_module: Any) -> dict[str, Any]:
+    def _load_model_kwargs(self, model_kind: str, torch_module: Any) -> dict[str, Any]:
         load_kwargs: dict[str, Any] = {}
         torch_dtype = self._resolve_torch_dtype(torch_module)
+        slot = self._model_state(model_kind)
 
-        if self._cpu_fallback_active and self.device_preference == "auto":
+        if slot["cpu_fallback_active"] and self.device_preference == "auto":
             load_kwargs["device_map"] = "cpu"
             load_kwargs["torch_dtype"] = torch_dtype or torch_module.float32
             return load_kwargs
@@ -965,59 +1172,85 @@ class TTSRuntime:
             load_kwargs["torch_dtype"] = torch_dtype
         return load_kwargs
 
-    def _reload_model_with_cpu_fallback(self) -> None:
+    def _reload_model_with_cpu_fallback(self, model_kind: str) -> None:
         with self._lock:
             if self.device_preference != "auto":
                 raise RuntimeError(
                     "CPU fallback is only supported when SPEAK_TO_USER_DEVICE=auto"
                 )
-            previous_model = self._model
-            previous_device = self._resolved_device
-            self._model = None
-            self._resolved_device = None
-            self._cpu_fallback_active = True
-        self._emit_runtime_event("model_cpu_fallback_activated", level="minimal")
+            slot = self._model_state(model_kind)
+            previous_model = slot["model"]
+            previous_device = slot["resolved_device"]
+            slot["model"] = None
+            slot["resolved_device"] = None
+            slot["cpu_fallback_active"] = True
+        self._emit_runtime_event(
+            "model_cpu_fallback_activated",
+            level="minimal",
+            model_kind=model_kind,
+        )
 
         self._release_model_resources(previous_model, resolved_device=previous_device)
         gc.collect()
 
-        loaded_model = self._load_model_impl()
+        loaded_model = self._load_model_impl(model_kind)
 
         with self._lock:
+            slot = self._model_state(model_kind)
             if self._shutdown_requested.is_set():
-                self._release_model_resources(loaded_model, resolved_device=self._resolved_device)
-                self._resolved_device = None
+                self._release_model_resources(loaded_model, resolved_device=slot["resolved_device"])
+                slot["resolved_device"] = None
                 raise RuntimeError("model reload aborted during shutdown")
 
-            self._model = loaded_model
+            slot["model"] = loaded_model
+            slot["last_error"] = None
+            slot["last_loaded_at"] = _utc_now()
+            self._touch_model_locked(model_kind, slot["last_loaded_at"])
             self._last_error = None
-            self._last_loaded_at = _utc_now()
-            self._touch_locked(self._last_loaded_at)
 
     def _synthesize_audio_chunk(
         self,
         *,
+        mode: str,
         text: str,
-        voice_description: str,
         language: str,
+        voice_description: str | None = None,
+        reference_audio: tuple[np.ndarray, int] | None = None,
+        reference_text: str | None = None,
     ) -> dict[str, Any]:
         with self._lock:
-            model_missing = self._model is None
+            model_missing = self._model_state(mode)["model"] is None
 
         if model_missing:
-            self.load_model()
+            self.load_model(model_kind=mode)
 
         with self._lock:
-            model = self._model
+            slot = self._model_state(mode)
+            model = slot["model"]
 
         assert model is not None
 
         def generate(active_model: Any) -> tuple[list[Any], int]:
-            wavs, sample_rate = active_model.generate_voice_design(
-                text=text,
-                language=language,
-                instruct=voice_description,
-            )
+            if mode == VOICE_DESIGN_MODEL_KIND:
+                wavs, sample_rate = active_model.generate_voice_design(
+                    text=text,
+                    language=language,
+                    instruct=voice_description,
+                    non_streaming_mode=True,
+                )
+                return cast(list[Any], wavs), int(sample_rate)
+
+            assert reference_audio is not None
+            generate_kwargs: dict[str, Any] = {
+                "text": text,
+                "language": language,
+                "ref_audio": reference_audio,
+                "x_vector_only_mode": reference_text is None,
+                "non_streaming_mode": True,
+            }
+            if reference_text is not None:
+                generate_kwargs["ref_text"] = reference_text
+            wavs, sample_rate = active_model.generate_voice_clone(**generate_kwargs)
             return cast(list[Any], wavs), int(sample_rate)
 
         try:
@@ -1028,22 +1261,25 @@ class TTSRuntime:
                     "speech_chunk_synthesis_retrying_with_cpu_fallback",
                     level="minimal",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                     error=str(exc),
                 )
                 try:
-                    self._reload_model_with_cpu_fallback()
+                    self._reload_model_with_cpu_fallback(mode)
                     with self._lock:
-                        reloaded_model = self._model
+                        reloaded_model = self._model_state(mode)["model"]
                     if reloaded_model is None:
                         raise RuntimeError("CPU fallback reload completed without a loaded model")
                     wavs, sample_rate = generate(reloaded_model)
                 except Exception as retry_exc:
                     with self._lock:
                         self._last_error = f"synthesis failed after CPU fallback retry: {retry_exc}"
+                        self._model_state(mode)["last_error"] = self._last_error
                     self._emit_runtime_event(
                         "speech_chunk_synthesis_retry_failed",
                         level="minimal",
                         job_id=self._speech_current_job_id,
+                        mode=mode,
                         error=str(retry_exc),
                     )
                     raise RuntimeError(
@@ -1052,10 +1288,12 @@ class TTSRuntime:
             else:
                 with self._lock:
                     self._last_error = str(exc)
+                    self._model_state(mode)["last_error"] = str(exc)
                 self._emit_runtime_event(
                     "speech_chunk_synthesis_failed",
                     level="minimal",
                     job_id=self._speech_current_job_id,
+                    mode=mode,
                     error=str(exc),
                 )
                 raise
@@ -1065,26 +1303,31 @@ class TTSRuntime:
             raise RuntimeError("model returned no waveform for synthesized chunk")
 
         with self._lock:
+            slot = self._model_state(mode)
             now = _utc_now()
+            slot["last_error"] = None
             self._last_error = None
-            self._touch_locked(now)
+            self._touch_model_locked(mode, now)
             return {
                 "waveform": waveforms[0],
                 "sample_rate": sample_rate,
-                "model_id": self.model_id,
-                "device": self._resolved_device,
+                "model_id": slot["model_id"],
+                "device": slot["resolved_device"],
                 "language": language,
             }
 
-    def _load_model_impl(self) -> Any:
+    def _load_model_impl(self, model_kind: str) -> Any:
         with _suppress_default_stdout_prints_for_current_thread():
             import torch
             from qwen_tts import Qwen3TTSModel  # type: ignore[import-untyped]
 
-            load_kwargs = self._load_model_kwargs(torch)
+            load_kwargs = self._load_model_kwargs(model_kind, torch)
             resolved_device = str(load_kwargs["device_map"])
-            self._resolved_device = resolved_device
-            return Qwen3TTSModel.from_pretrained(self.model_id, **load_kwargs)
+            self._model_state(model_kind)["resolved_device"] = resolved_device
+            return Qwen3TTSModel.from_pretrained(
+                self._model_state(model_kind)["model_id"],
+                **load_kwargs,
+            )
 
     def _resolve_device(self, torch_module: Any) -> str:
         if self.device_preference == "cpu":
@@ -1098,11 +1341,51 @@ class TTSRuntime:
             return "mps"
         return "cpu"
 
-    def _unload_locked(self) -> None:
-        model = self._model
-        resolved_device = self._resolved_device
-        self._model = None
-        self._resolved_device = None
+    def _new_model_slot(self, *, model_id: str, enabled: bool) -> dict[str, Any]:
+        return {
+            "enabled": enabled,
+            "model_id": model_id,
+            "model": None,
+            "resolved_device": None,
+            "last_error": None,
+            "last_used_at": None,
+            "last_loaded_at": None,
+            "cpu_fallback_active": False,
+        }
+
+    def _enabled_model_kinds(self) -> list[str]:
+        with self._lock:
+            return [
+                model_kind
+                for model_kind, slot in self._model_slots.items()
+                if cast(bool, slot["enabled"])
+            ]
+
+    def _all_enabled_models_loaded_locked(self) -> bool:
+        enabled_slots = [
+            slot for slot in self._model_slots.values() if cast(bool, slot["enabled"])
+        ]
+        if not enabled_slots:
+            return False
+        return all(slot["model"] is not None for slot in enabled_slots)
+
+    def _model_state(self, model_kind: str) -> dict[str, Any]:
+        return self._model_slots[model_kind]
+
+    def _touch_model_locked(self, model_kind: str, value: dt.datetime | None = None) -> None:
+        self._model_state(model_kind)["last_used_at"] = value or _utc_now()
+
+    def _set_speech_phase_locked(self, phase: str) -> None:
+        if self._speech_phase != phase or self._current_phase_started_at is None:
+            self._current_phase_started_at = _utc_now()
+        self._speech_phase = phase
+
+    def _unload_model_locked(self, model_kind: str) -> None:
+        slot = self._model_state(model_kind)
+        model = slot["model"]
+        resolved_device = slot["resolved_device"]
+        slot["model"] = None
+        slot["resolved_device"] = None
         self._release_model_resources(model, resolved_device=resolved_device)
 
     def _release_model_resources(self, model: Any | None, *, resolved_device: str | None) -> None:
@@ -1150,6 +1433,28 @@ class TTSRuntime:
         if waveform.ndim == 2:
             return int(waveform.shape[1])
         raise ValueError("waveform must be mono or multi-channel frame data")
+
+    def _decode_reference_audio_file(self, reference_audio_path: str) -> tuple[np.ndarray, int]:
+        expanded_path = Path(reference_audio_path).expanduser()
+        if not expanded_path.is_file():
+            raise ValueError(f"reference audio file does not exist: {expanded_path}")
+
+        try:
+            import soundfile as sf  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise RuntimeError(
+                "soundfile is unavailable for clone reference audio decoding"
+            ) from exc
+
+        try:
+            waveform, sample_rate = sf.read(expanded_path, dtype="float32")
+        except Exception as exc:
+            raise ValueError(f"failed to read reference audio file: {expanded_path}") from exc
+
+        waveform_array = np.asarray(waveform, dtype=np.float32)
+        if waveform_array.size == 0:
+            raise ValueError(f"reference audio file is empty: {expanded_path}")
+        return waveform_array, int(sample_rate)
 
     def _open_output_stream(
         self,

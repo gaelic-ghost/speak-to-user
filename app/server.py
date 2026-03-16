@@ -11,7 +11,12 @@ from fastmcp.dependencies import CurrentContext
 from fastmcp.server.lifespan import lifespan
 
 from app.runtime import TTSRuntime
-from app.tools import health_payload, speak_text as speak_text_tool, tts_status as tts_status_tool
+from app.tools import (
+    health_payload,
+    speak_text as speak_text_tool,
+    speak_text_as_clone as speak_text_as_clone_tool,
+    tts_status as tts_status_tool,
+)
 
 
 # MARK: Server Configuration
@@ -111,6 +116,24 @@ def speak_text(
         ctx,
         text=text,
         voice_description=voice_description,
+        language=language,
+    )
+
+
+@mcp.tool
+def speak_text_as_clone(
+    text: str,
+    reference_audio_path: str,
+    reference_text: str | None = None,
+    language: str = "en",
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Queue one full text job for local playback using the clone voice model."""
+    return speak_text_as_clone_tool(
+        ctx,
+        text=text,
+        reference_audio_path=reference_audio_path,
+        reference_text=reference_text,
         language=language,
     )
 

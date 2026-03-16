@@ -1909,6 +1909,7 @@ dependencies = [
     { name = "fastmcp" },
     { name = "qwen-tts" },
     { name = "sounddevice" },
+    { name = "soundfile" },
     { name = "torch" },
     { name = "transformers" },
 ]
@@ -1925,6 +1926,7 @@ requires-dist = [
     { name = "fastmcp", specifier = ">=3.1.0" },
     { name = "qwen-tts" },
     { name = "sounddevice", specifier = ">=0.5.5" },
+    { name = "soundfile", specifier = ">=0.13.1" },
     { name = "torch", specifier = ">=2.10.0" },
     { name = "transformers", specifier = "==4.57.3" },
 ]

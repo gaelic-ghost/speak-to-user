@@ -2,15 +2,19 @@
 
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server with one job: take text jobs and speak them through the host machine.
 
-It uses [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign), loads the model when the server starts, keeps it resident for the life of the server process, and exposes one playback path: `speak_text`.
+It uses a resident voice-design model for normal TTS and can also keep a separate clone model resident for reference-audio voice cloning:
+
+- [`Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign)
+- [`Qwen/Qwen3-TTS-12Hz-0.6B-Base`](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-0.6B-Base)
 
 The intended deployment mode is one long-lived local Streamable HTTP MCP service so multiple Codex clients can share the same resident TTS model instead of launching separate stdio subprocesses.
 
 ## Tools
 
 - `health`: simple smoke-test response.
-- `tts_status`: reports whether the resident model is ready and shows queue status plus the current speech phase (`idle`, `synthesizing`, `opening_output`, or `playing`).
-- `speak_text`: enqueues one full text job and always chunks text sentence-by-sentence before playback, with word fallback only for overlong single sentences.
+- `tts_status`: reports queue status, observability events, and separate status for the voice-design and clone models.
+- `speak_text`: enqueues one full text job for the voice-design model.
+- `speak_text_as_clone`: enqueues one full text job for the clone model using a local reference audio file and optional reference text.
 
 There is no manual load tool, no unload tool, no idle auto-unload, no detached helper process, and no file-generation path.
 
@@ -35,7 +39,7 @@ uv run python app/server.py
 
 By default, the entrypoint serves MCP over HTTP at `http://127.0.0.1:8765/mcp`.
 
-Server startup blocks until the model is loaded. After that, `speak_text` pushes one full text job into one in-process FIFO queue. Every request is chunked sentence-by-sentence inside that job, the worker synthesizes ahead into a bounded waveform queue, opens playback only after a larger preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback.
+Server startup blocks until all enabled models are loaded. After that, both `speak_text` and `speak_text_as_clone` push one full text job into one in-process FIFO queue. Every request is chunked before playback, the worker synthesizes ahead into a bounded waveform queue, opens playback only after preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback, plus which synthesis mode is active.
 
 For the dev checkout, prefer a different port so it does not collide with the stable service:
 
@@ -43,10 +47,32 @@ For the dev checkout, prefer a different port so it does not collide with the st
 SPEAK_TO_USER_PORT=8766 uv run python app/server.py
 ```
 
+## Clone Inputs
+
+`speak_text_as_clone` accepts:
+
+- `text`
+- `reference_audio_path`
+- optional `reference_text`
+- optional `language`
+
+Clone inference uses the installed `qwen_tts` clone API in two modes:
+
+- without `reference_text`: `x_vector_only_mode=True`
+- with `reference_text`: `x_vector_only_mode=False`
+
+The reference audio must be a readable local file. WAV or FLAC is the safest choice.
+
 ## Configuration
 
-- `SPEAK_TO_USER_MODEL_ID`
+- `SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL`
+  Default: `true`
+- `SPEAK_TO_USER_ENABLE_CLONE_MODEL`
+  Default: `true`
+- `SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID`
   Default: `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
+- `SPEAK_TO_USER_CLONE_MODEL_ID`
+  Default: `Qwen/Qwen3-TTS-12Hz-0.6B-Base`
 - `SPEAK_TO_USER_DEVICE`
   Allowed values: `auto`, `mps`, `cpu`
   Default: `auto`

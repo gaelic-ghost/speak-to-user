@@ -49,3 +49,28 @@ def speak_text(
         voice_description=voice_description,
         language=language,
     )
+
+
+def speak_text_as_clone(
+    ctx: Context,
+    *,
+    text: str,
+    reference_audio_path: str,
+    reference_text: str | None = None,
+    language: str = "en",
+) -> dict[str, object]:
+    runtime = _runtime_from_context(ctx)
+    normalized_text = text.strip()
+    if not normalized_text:
+        raise ValueError("text must not be empty")
+
+    normalized_reference_audio_path = reference_audio_path.strip()
+    if not normalized_reference_audio_path:
+        raise ValueError("reference_audio_path must not be empty")
+
+    return runtime.speak_text_as_clone(
+        chunks=chunk_text_for_tts(normalized_text),
+        reference_audio_path=normalized_reference_audio_path,
+        reference_text=reference_text,
+        language=language,
+    )

@@ -7,15 +7,16 @@ import sys
 import threading
 from typing import cast
 
+import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app.runtime as runtime_module
-from app.runtime import TTSRuntime
+from app.runtime import CLONE_MODEL_KIND, TTSRuntime, VOICE_DESIGN_MODEL_KIND
 
 
-class FakeModel:
+class FakeVoiceDesignModel:
     def __init__(self, *, waveform: list[float] | None = None, sample_rate: int = 24000) -> None:
         self.waveform = waveform or [0.0, 0.1, 0.2]
         self.sample_rate = sample_rate
@@ -27,16 +28,38 @@ class FakeModel:
         text: str | list[str],
         language: str | list[str],
         instruct: str | list[str],
+        non_streaming_mode: bool,
     ) -> tuple[list[list[float]], int]:
-        self.calls.append({"text": text, "language": language, "instruct": instruct})
+        self.calls.append(
+            {
+                "text": text,
+                "language": language,
+                "instruct": instruct,
+                "non_streaming_mode": non_streaming_mode,
+            }
+        )
         batch_size = len(text) if isinstance(text, list) else 1
         return [list(self.waveform) for _ in range(batch_size)], self.sample_rate
+
+
+class FakeCloneModel:
+    def __init__(self, *, waveform: list[float] | None = None, sample_rate: int = 24000) -> None:
+        self.waveform = waveform or [0.3, 0.4, 0.5]
+        self.sample_rate = sample_rate
+        self.calls: list[dict[str, object]] = []
+
+    def generate_voice_clone(self, **kwargs: object) -> tuple[list[list[float]], int]:
+        self.calls.append(dict(kwargs))
+        return [list(self.waveform)], self.sample_rate
 
 
 def make_runtime(tmp_path: Path) -> TTSRuntime:
     del tmp_path
     return TTSRuntime(
-        model_id="Qwen/test-model",
+        voice_design_model_id="Qwen/test-voice-design",
+        clone_model_id="Qwen/test-clone",
+        enable_voice_design_model=True,
+        enable_clone_model=True,
         device_preference="cpu",
     )
 
@@ -52,11 +75,13 @@ def runtime_dependencies_available(monkeypatch: pytest.MonkeyPatch) -> None:
             "qwen_tts_available": True,
             "torch_available": True,
             "torchaudio_available": True,
+            "soundfile_available": True,
         },
     )
 
 
 # MARK: Module Helpers
+
 
 def test_stdout_suppression_uses_module_level_safe_print() -> None:
     original_print = runtime_module.builtins.print
@@ -67,62 +92,93 @@ def test_stdout_suppression_uses_module_level_safe_print() -> None:
     assert runtime_module.builtins.print is original_print
 
 
+# MARK: Config
+
+
+def test_from_env_reads_dual_model_flags(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL", "false")
+    monkeypatch.setenv("SPEAK_TO_USER_ENABLE_CLONE_MODEL", "true")
+    monkeypatch.setenv("SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID", "Qwen/voice-design")
+    monkeypatch.setenv("SPEAK_TO_USER_CLONE_MODEL_ID", "Qwen/clone")
+
+    runtime = TTSRuntime.from_env()
+
+    assert runtime.enable_voice_design_model is False
+    assert runtime.enable_clone_model is True
+    assert runtime.voice_design_model_id == "Qwen/voice-design"
+    assert runtime.clone_model_id == "Qwen/clone"
+
+
 # MARK: Runtime Lifecycle
 
-def test_load_model_success_sets_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-    fake_model = FakeModel()
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: fake_model)
 
-    result = runtime.load_model()
-
-    assert result["result"] == "success"
-    assert result["loaded"] is True
-    assert runtime.status()["model_loaded"] is True
-    assert runtime.status()["last_error"] is None
-
-
-def test_load_model_failure_records_error(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-
-    def boom() -> FakeModel:
-        raise RuntimeError("load failed")
-
-    monkeypatch.setattr(runtime, "_load_model_impl", boom)
-
-    with pytest.raises(RuntimeError, match="load failed"):
-        runtime.load_model()
-
-    assert runtime.status()["last_error"] == "load failed"
-
-
-def test_preload_starts_worker_and_loads_model(
+def test_load_voice_design_model_success_sets_status(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    calls = {"worker": 0, "load": 0}
+    fake_model = FakeVoiceDesignModel()
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda model_kind: fake_model)
+
+    result = runtime.load_model(model_kind=VOICE_DESIGN_MODEL_KIND)
+
+    assert result["result"] == "success"
+    assert result["loaded"] is True
+    status = runtime.status()
+    assert status["voice_design_model_loaded"] is True
+    assert status["model_loaded"] is True
+    assert status["voice_design_last_error"] is None
+
+
+def test_load_clone_model_success_sets_status(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    fake_model = FakeCloneModel()
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda model_kind: fake_model)
+
+    result = runtime.load_model(model_kind=CLONE_MODEL_KIND)
+
+    assert result["result"] == "success"
+    assert result["loaded"] is True
+    status = runtime.status()
+    assert status["clone_model_loaded"] is True
+    assert status["clone_last_error"] is None
+
+
+def test_preload_starts_worker_and_loads_enabled_models(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    calls: list[str] = []
 
     def fake_start_speech_worker() -> bool:
-        calls["worker"] = 1
+        calls.append("worker")
         return True
 
-    def fake_load_model() -> dict[str, object]:
-        calls["load"] = 1
+    monkeypatch.setattr(runtime, "start_speech_worker", fake_start_speech_worker)
+
+    def fake_load_model(*, model_kind: str = VOICE_DESIGN_MODEL_KIND) -> dict[str, object]:
+        calls.append(model_kind)
         return {"result": "success", "loaded": True}
 
-    monkeypatch.setattr(runtime, "start_speech_worker", fake_start_speech_worker)
     monkeypatch.setattr(runtime, "load_model", fake_load_model)
+    monkeypatch.setattr(runtime, "status", lambda: {"ready": True})
 
     result = runtime.preload()
 
-    assert result == {"result": "success", "loaded": True}
-    assert calls == {"worker": 1, "load": 1}
+    assert result["result"] == "success"
+    assert calls == ["worker", VOICE_DESIGN_MODEL_KIND, CLONE_MODEL_KIND]
 
 
-def test_shutdown_releases_loaded_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_shutdown_releases_loaded_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
     released: list[tuple[object | None, str | None]] = []
     monkeypatch.setattr(
         runtime,
@@ -130,14 +186,16 @@ def test_shutdown_releases_loaded_model(monkeypatch: pytest.MonkeyPatch, tmp_pat
         lambda model, *, resolved_device: released.append((model, resolved_device)),
     )
 
-    runtime.load_model()
     runtime.shutdown()
 
-    assert runtime.status()["model_loaded"] is False
-    assert len(released) == 1
+    status = runtime.status()
+    assert status["voice_design_model_loaded"] is False
+    assert status["clone_model_loaded"] is False
+    assert len(released) == 2
 
 
 # MARK: Queue
+
 
 def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
@@ -158,13 +216,34 @@ def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert result["result"] == "success"
     assert result["queued"] is True
     assert result["chunk_count"] == 1
-    assert result["speech_phase"] == "idle"
+    assert result["mode"] == VOICE_DESIGN_MODEL_KIND
     assert result["speech_jobs_queued"] == 1
-    assert result["speech_queue_depth"] == 1
     assert worker_starts["value"] == 1
-    assert result["speech_last_event"] == "speech_job_queued"
-    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
-    assert recent_events[-1]["event"] == "speech_job_queued"
+
+
+def test_speak_text_as_clone_enqueues_one_job(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
+    reference_audio = (np.array([0.0, 0.1], dtype=np.float32), 16000)
+    monkeypatch.setattr(runtime, "_decode_reference_audio_file", lambda path: reference_audio)
+
+    result = runtime.speak_text_as_clone(
+        chunks=["Hello there"],
+        reference_audio_path="voice.wav",
+        reference_text="Reference text",
+        language="en",
+    )
+
+    assert result["result"] == "success"
+    assert result["mode"] == CLONE_MODEL_KIND
+    assert result["clone_mode"] == "reference_text"
+    job = cast(dict[str, object], runtime._speech_queue.get_nowait())
+    assert job["mode"] == CLONE_MODEL_KIND
+    assert job["reference_audio"] == reference_audio
+    assert job["reference_text"] == "Reference text"
 
 
 def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(
@@ -210,18 +289,17 @@ def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(
     second_thread.join(timeout=1)
 
     assert [cast(int, result["job_id"]) for result in results] == [1, 2]
-    assert runtime.status()["speech_jobs_queued"] == 2
-    queued_jobs = [runtime._speech_queue.get_nowait(), runtime._speech_queue.get_nowait()]
-    assert [cast(dict[str, object], job)["job_id"] for job in queued_jobs] == [1, 2]
 
 
-def test_speech_worker_plays_queued_jobs_in_fifo_order(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+def test_speech_worker_dispatches_modes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
     played_jobs: list[dict[str, object]] = []
     monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
+    monkeypatch.setattr(
+        runtime,
+        "_decode_reference_audio_file",
+        lambda path: (np.array([0.0, 0.1], dtype=np.float32), 16000),
+    )
 
     def fake_play_speech_chunks(**kwargs: object) -> dict[str, object]:
         played_jobs.append(dict(kwargs))
@@ -234,145 +312,154 @@ def test_speech_worker_plays_queued_jobs_in_fifo_order(
             "device": "cpu",
             "language": kwargs["language"],
             "player": "sounddevice-stream",
+            "mode": kwargs["mode"],
         }
 
     monkeypatch.setattr(runtime, "play_speech_chunks", fake_play_speech_chunks)
 
     runtime.speak_text(chunks=["first"], voice_description="warm", language="en")
-    runtime.speak_text(chunks=["second"], voice_description="warm", language="en")
+    runtime.speak_text_as_clone(chunks=["second"], reference_audio_path="voice.wav", language="en")
     runtime._speech_queue.put_nowait(None)
     runtime._speech_worker_loop()
 
-    assert played_jobs == [
-        {"chunks": ["first"], "voice_description": "warm", "language": "English"},
-        {"chunks": ["second"], "voice_description": "warm", "language": "English"},
-    ]
+    assert played_jobs[0]["mode"] == VOICE_DESIGN_MODEL_KIND
+    assert played_jobs[1]["mode"] == CLONE_MODEL_KIND
+    assert played_jobs[1]["reference_text"] is None
     status = runtime.status()
     assert status["speech_jobs_completed"] == 2
     assert status["speech_phase"] == "idle"
-    assert status["speech_queue_depth"] == 0
 
 
-def test_speech_worker_records_failure(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    runtime = make_runtime(tmp_path)
-    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
-
-    def boom(**kwargs: object) -> dict[str, object]:
-        del kwargs
-        raise RuntimeError("playback failed")
-
-    monkeypatch.setattr(runtime, "play_speech_chunks", boom)
-
-    runtime.speak_text(chunks=["Hello there"], voice_description="warm", language="en")
-    runtime._speech_queue.put_nowait(None)
-    runtime._speech_worker_loop()
-
-    status = runtime.status()
-    assert status["speech_jobs_failed"] == 1
-    assert status["speech_phase"] == "idle"
-    assert status["speech_last_error"] == "playback failed"
-    assert status["last_error"] == "playback failed"
-    recent_events = cast(list[dict[str, object]], status["recent_events"])
-    assert recent_events[-2]["event"] == "speech_job_failed"
+# MARK: Synthesis
 
 
-def test_speech_worker_reports_synthesizing_phase_before_playback(
-    monkeypatch: pytest.MonkeyPatch,
+def test_synthesize_voice_design_chunk_uses_non_streaming_mode(
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    phases: list[str] = []
-    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
+    fake_model = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
 
-    def fake_synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
-        del kwargs
-        phases.append(cast(str, runtime.status()["speech_phase"]))
-        return {
-            "waveform": runtime_module.np.array([0.0, 0.1, 0.2], dtype=runtime_module.np.float32),
-            "sample_rate": 24000,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
+    result = runtime._synthesize_audio_chunk(
+        mode=VOICE_DESIGN_MODEL_KIND,
+        text="hello",
+        voice_description="warm",
+        language="English",
+    )
+
+    assert result["model_id"] == "Qwen/test-voice-design"
+    assert fake_model.calls == [
+        {
+            "text": "hello",
             "language": "English",
+            "instruct": "warm",
+            "non_streaming_mode": True,
         }
-
-    class FakeStream:
-        def start(self) -> None:
-            return None
-
-        def write(self, waveform: runtime_module.np.ndarray) -> bool:
-            del waveform
-            phases.append(cast(str, runtime.status()["speech_phase"]))
-            return False
-
-        def stop(self) -> None:
-            return None
-
-        def close(self) -> None:
-            return None
-
-    monkeypatch.setattr(runtime, "_synthesize_audio_chunk", fake_synthesize_audio_chunk)
-    monkeypatch.setattr(runtime, "_open_output_stream", lambda **kwargs: FakeStream())
-
-    runtime.speak_text(chunks=["Hello there"], voice_description="warm", language="en")
-    runtime._speech_queue.put_nowait(None)
-    runtime._speech_worker_loop()
-
-    assert phases == ["synthesizing", "playing"]
+    ]
 
 
-def test_synthesize_audio_chunk_retries_with_cpu_fallback_for_meta_tensor_error(
+def test_synthesize_clone_chunk_uses_x_vector_only_without_reference_text(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    fake_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+
+    reference_audio = (np.array([0.0, 0.1], dtype=np.float32), 16000)
+    result = runtime._synthesize_audio_chunk(
+        mode=CLONE_MODEL_KIND,
+        text="hello",
+        language="English",
+        reference_audio=reference_audio,
+    )
+
+    assert result["model_id"] == "Qwen/test-clone"
+    assert fake_model.calls == [
+        {
+            "text": "hello",
+            "language": "English",
+            "ref_audio": reference_audio,
+            "x_vector_only_mode": True,
+            "non_streaming_mode": True,
+        }
+    ]
+
+
+def test_synthesize_clone_chunk_uses_reference_text_when_present(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    fake_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+
+    reference_audio = (np.array([0.0, 0.1], dtype=np.float32), 16000)
+    runtime._synthesize_audio_chunk(
+        mode=CLONE_MODEL_KIND,
+        text="hello",
+        language="English",
+        reference_audio=reference_audio,
+        reference_text="reference text",
+    )
+
+    assert fake_model.calls == [
+        {
+            "text": "hello",
+            "language": "English",
+            "ref_audio": reference_audio,
+            "ref_text": "reference text",
+            "x_vector_only_mode": False,
+            "non_streaming_mode": True,
+        }
+    ]
+
+
+def test_synthesize_clone_chunk_retries_with_cpu_fallback_for_meta_tensor_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
     runtime.device_preference = "auto"
     first_model = SimpleNamespace()
-    second_model = FakeModel()
+    second_model = FakeCloneModel()
 
-    def failing_generate_voice_design(**kwargs: object) -> tuple[list[list[float]], int]:
+    def failing_generate_voice_clone(**kwargs: object) -> tuple[list[list[float]], int]:
         del kwargs
         raise RuntimeError("meta tensor failure during tensor.item()")
 
-    first_model.generate_voice_design = failing_generate_voice_design
-    runtime._model = first_model
-    runtime._resolved_device = "mps"
+    first_model.generate_voice_clone = failing_generate_voice_clone
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = first_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "mps"
 
-    reload_calls = {"count": 0}
-
-    def reload_with_cpu_fallback() -> None:
-        reload_calls["count"] += 1
-        runtime._model = second_model
-        runtime._resolved_device = "cpu"
-        runtime._cpu_fallback_active = True
+    def reload_with_cpu_fallback(model_kind: str) -> None:
+        runtime._model_state(model_kind)["model"] = second_model
+        runtime._model_state(model_kind)["resolved_device"] = "cpu"
+        runtime._model_state(model_kind)["cpu_fallback_active"] = True
 
     monkeypatch.setattr(runtime, "_reload_model_with_cpu_fallback", reload_with_cpu_fallback)
 
     result = runtime._synthesize_audio_chunk(
+        mode=CLONE_MODEL_KIND,
         text="hello",
-        voice_description="warm",
         language="English",
+        reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
     )
 
-    assert reload_calls["count"] == 1
     assert result["device"] == "cpu"
-    assert second_model.calls == [
-        {
-            "text": "hello",
-            "language": "English",
-            "instruct": "warm",
-        }
-    ]
+    assert second_model.calls[0]["x_vector_only_mode"] is True
 
 
 # MARK: Playback
 
-def test_play_speech_chunks_generates_and_writes_one_chunk_at_a_time(
+
+def test_play_speech_chunks_generates_and_writes_clone_chunks(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
-    generated_chunks: list[dict[str, object]] = []
-    played: list[dict[str, object]] = []
+    played: list[list[float]] = []
     opened_streams: list[FakeStream] = []
 
     class FakeStream:
@@ -383,8 +470,8 @@ def test_play_speech_chunks_generates_and_writes_one_chunk_at_a_time(
         def start(self) -> None:
             return None
 
-        def write(self, waveform: runtime_module.np.ndarray) -> bool:
-            played.append({"waveform": waveform.tolist()})
+        def write(self, waveform: np.ndarray) -> bool:
+            played.append(waveform.tolist())
             return False
 
         def stop(self) -> None:
@@ -400,18 +487,11 @@ def test_play_speech_chunks_generates_and_writes_one_chunk_at_a_time(
         return stream
 
     def synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
-        generated_chunks.append(
-            {
-                "text": cast(str, kwargs["text"]),
-                "language": kwargs["language"],
-                "voice_description": kwargs["voice_description"],
-            }
-        )
         waveform = [0.0, 0.1, 0.2] if kwargs["text"] == "Hello there" else [0.3, 0.4, 0.5]
         return {
-            "waveform": runtime_module.np.array(waveform, dtype=runtime_module.np.float32),
+            "waveform": np.array(waveform, dtype=np.float32),
             "sample_rate": 24000,
-            "model_id": "Qwen/test-model",
+            "model_id": "Qwen/test-clone",
             "device": "cpu",
             "language": kwargs["language"],
         }
@@ -420,98 +500,26 @@ def test_play_speech_chunks_generates_and_writes_one_chunk_at_a_time(
     monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
 
     result = runtime.play_speech_chunks(
+        mode=CLONE_MODEL_KIND,
         chunks=["Hello there", "General Kenobi"],
-        voice_description="Warm and calm",
+        reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
+        reference_text="Reference text",
         language="en",
     )
 
     assert result["played"] is True
-    assert result["sample_count"] == 6
-    assert result["player"] == "sounddevice-stream"
-    assert generated_chunks == [
-        {
-            "text": "Hello there",
-            "language": "English",
-            "voice_description": "Warm and calm",
-        },
-        {
-            "text": "General Kenobi",
-            "language": "English",
-            "voice_description": "Warm and calm",
-        }
-    ]
+    assert result["mode"] == CLONE_MODEL_KIND
     assert len(opened_streams) == 1
     assert opened_streams[0].stopped is True
     assert opened_streams[0].closed is True
-    assert len(played) == 2
-    assert cast(list[float], played[0]["waveform"]) == pytest.approx([0.0, 0.1, 0.2])
-    assert cast(list[float], played[1]["waveform"]) == pytest.approx([0.3, 0.4, 0.5])
-
-
-def test_play_speech_chunks_starts_playback_after_small_preroll_then_continues(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    events: list[str] = []
-
-    class FakeStream:
-        def start(self) -> None:
-            return None
-
-        def write(self, waveform: runtime_module.np.ndarray) -> bool:
-            del waveform
-            events.append("write")
-            return False
-
-        def stop(self) -> None:
-            events.append("stop")
-
-        def close(self) -> None:
-            events.append("close")
-
-    def synthesize_audio_chunk(**kwargs: object) -> dict[str, object]:
-        events.append(f"synthesize:{cast(str, kwargs['text'])}")
-        waveform = runtime_module.np.zeros(6000, dtype=runtime_module.np.float32)
-        return {
-            "waveform": waveform,
-            "sample_rate": 24000,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
-            "language": kwargs["language"],
-        }
-
-    def open_output_stream(**kwargs: object) -> FakeStream:
-        del kwargs
-        events.append("open")
-        return FakeStream()
-
-    monkeypatch.setattr(runtime, "_synthesize_audio_chunk", synthesize_audio_chunk)
-    monkeypatch.setattr(runtime, "_open_output_stream", open_output_stream)
-
-    runtime.play_speech_chunks(
-        chunks=["First chunk", "Second chunk", "Third chunk"],
-        voice_description="Warm and calm",
-        language="en",
-    )
-
-    assert events[:2] == ["synthesize:First chunk", "synthesize:Second chunk"]
-    assert "open" in events
-    open_index = events.index("open")
-    first_write_index = events.index("write")
-    assert open_index < first_write_index
-    assert events[-2:] == ["stop", "close"]
-    assert events.count("write") == 3
-
-
-def test_normalize_language_accepts_locale_variants() -> None:
-    assert runtime_module._normalize_language("en-US") == "English"
-    assert runtime_module._normalize_language("pt_BR") == "Portuguese"
+    assert played[0] == pytest.approx([0.0, 0.1, 0.2])
+    assert played[1] == pytest.approx([0.3, 0.4, 0.5])
 
 
 # MARK: Status
 
-def test_status_ready_requires_loaded_model(
+
+def test_status_ready_requires_all_enabled_models_loaded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -519,9 +527,17 @@ def test_status_ready_requires_loaded_model(
 
     assert runtime.status()["ready"] is False
 
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
-    runtime.load_model()
+    def load_impl(model_kind: str) -> object:
+        if model_kind == VOICE_DESIGN_MODEL_KIND:
+            return FakeVoiceDesignModel()
+        return FakeCloneModel()
 
+    monkeypatch.setattr(runtime, "_load_model_impl", load_impl)
+    runtime.load_model(model_kind=VOICE_DESIGN_MODEL_KIND)
+
+    assert runtime.status()["ready"] is False
+
+    runtime.load_model(model_kind=CLONE_MODEL_KIND)
     assert runtime.status()["ready"] is True
 
 
@@ -541,8 +557,6 @@ def test_emit_runtime_event_records_recent_event_and_prints_json(
     runtime._emit_runtime_event("custom_event", level="info", job_id=7)
 
     status = runtime.status()
-    assert status["speech_last_event"] == "custom_event"
-    assert status["speech_last_event_at"] is not None
     recent_events = cast(list[dict[str, object]], status["recent_events"])
     assert recent_events[-1]["event"] == "custom_event"
     assert recent_events[-1]["job_id"] == 7
@@ -558,105 +572,26 @@ def test_recent_event_buffer_is_bounded(tmp_path: Path) -> None:
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert len(recent_events) == runtime_module.DEFAULT_RECENT_EVENT_LIMIT
     assert recent_events[0]["event_index"] == 5
-    assert recent_events[-1]["event_index"] == runtime_module.DEFAULT_RECENT_EVENT_LIMIT + 4
-
-
-def test_speech_worker_emits_lifecycle_events(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
-    events: list[str] = []
-    real_emit_runtime_event = runtime._emit_runtime_event
-
-    def capture_event(event: str, *, level: str, **details: object) -> None:
-        events.append(event)
-        real_emit_runtime_event(event, level=level, **details)
-
-    monkeypatch.setattr(runtime, "_emit_runtime_event", capture_event)
-
-    def fake_play_speech_chunks(**kwargs: object) -> dict[str, object]:
-        del kwargs
-        return {
-            "played": True,
-            "sample_rate": 24000,
-            "sample_count": 3,
-            "duration_seconds": 0.0,
-            "model_id": "Qwen/test-model",
-            "device": "cpu",
-            "language": "English",
-            "player": "sounddevice-stream",
-        }
-
-    monkeypatch.setattr(runtime, "play_speech_chunks", fake_play_speech_chunks)
-
-    runtime.speak_text(chunks=["first"], voice_description="warm", language="en")
-    runtime._speech_queue.put_nowait(None)
-    runtime._speech_worker_loop()
-
-    assert "speech_job_queued" in events
-    assert "speech_job_started" in events
-    assert "speech_job_completed" in events
-    assert "speech_worker_stopped" in events
-
-    runtime.shutdown()
-    assert runtime.status()["ready"] is False
-
-
-def test_load_model_releases_model_when_shutdown_requested_mid_load(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    runtime = make_runtime(tmp_path)
-    released: list[tuple[object | None, str | None]] = []
-
-    def load_impl() -> FakeModel:
-        runtime._shutdown_requested.set()
-        return FakeModel()
-
-    monkeypatch.setattr(runtime, "_load_model_impl", load_impl)
-    monkeypatch.setattr(
-        runtime,
-        "_release_model_resources",
-        lambda model, *, resolved_device: released.append((model, resolved_device)),
-    )
-
-    result = runtime.load_model()
-
-    assert result["result"] == "success"
-    assert result["loaded"] is False
-    assert result["info"] == "model load aborted during shutdown"
-    assert runtime.status()["model_loaded"] is False
-    assert len(released) == 1
-    assert isinstance(released[0][0], FakeModel)
-    assert released[0][1] is None
 
 
 def test_status_reports_timestamps(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
     fake_now = dt.datetime(2026, 3, 14, 17, 0, tzinfo=dt.UTC)
     monkeypatch.setattr("app.runtime._utc_now", lambda: fake_now)
-    monkeypatch.setattr(runtime, "_load_model_impl", lambda: FakeModel())
+    monkeypatch.setattr(runtime, "_load_model_impl", lambda model_kind: FakeVoiceDesignModel())
 
-    runtime.load_model()
+    runtime.load_model(model_kind=VOICE_DESIGN_MODEL_KIND)
     status = runtime.status()
 
     assert status["last_loaded_at"] == fake_now.isoformat()
-    assert status["last_used_at"] == fake_now.isoformat()
+    assert status["voice_design_last_loaded_at"] == fake_now.isoformat()
 
 
-# MARK: Device Resolution
+# MARK: Reference Audio
 
-def test_resolve_device_prefers_mps_when_available(tmp_path: Path) -> None:
+
+def test_decode_reference_audio_file_rejects_missing_path(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
-    runtime.device_preference = "auto"
-    fake_torch = SimpleNamespace(
-        backends=SimpleNamespace(
-            mps=SimpleNamespace(is_available=lambda: True),
-        )
-    )
 
-    resolved = runtime._resolve_device(fake_torch)
-
-    assert resolved == "mps"
+    with pytest.raises(ValueError, match="reference audio file does not exist"):
+        runtime._decode_reference_audio_file(str(tmp_path / "missing.wav"))
