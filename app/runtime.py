@@ -11,6 +11,9 @@ import os
 from pathlib import Path
 import queue
 import shutil
+import shlex
+import struct
+import subprocess
 import sys
 import threading
 from typing import Any, cast
@@ -33,6 +36,9 @@ DEFAULT_PLAYBACK_PREROLL_SECONDS = 3.0
 DEFAULT_PLAYBACK_PREROLL_CHUNKS = 2
 DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 16
 DEFAULT_PLAYBACK_UNDERFLOW_RETRIES = 2
+DEFAULT_PLAYBACK_BACKEND = "sounddevice"
+DEFAULT_WAVBUFFER_QUEUE_DEPTH = 8
+DEFAULT_WAVBUFFER_PREROLL_MODE = "seconds"
 DEFAULT_OUTPUT_STREAM_LATENCY = "high"
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
@@ -221,6 +227,34 @@ def _normalize_log_level(raw: str | None) -> str:
     return value
 
 
+def _normalize_playback_backend(raw: str | None) -> str:
+    value = (raw or DEFAULT_PLAYBACK_BACKEND).strip().lower()
+    if value not in {"sounddevice", "wavbuffer"}:
+        raise ValueError("SPEAK_TO_USER_PLAYBACK_BACKEND must be one of: sounddevice, wavbuffer")
+    return value
+
+
+def _normalize_wavbuffer_preroll_mode(raw: str | None) -> str:
+    value = (raw or DEFAULT_WAVBUFFER_PREROLL_MODE).strip().lower()
+    if value not in {"auto", "seconds", "buffers"}:
+        raise ValueError(
+            "SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE must be one of: auto, seconds, buffers"
+        )
+    return value
+
+
+def _default_wavbuffer_binary_path() -> str:
+    workspace_dir = Path(__file__).resolve().parents[2]
+    return str(workspace_dir / "swiftly-play" / ".build" / "release" / "wavbuffer")
+
+
+def _normalize_wavbuffer_binary_path(raw: str | None) -> str:
+    value = (raw or _default_wavbuffer_binary_path()).strip()
+    if not value:
+        raise ValueError("SPEAK_TO_USER_WAVBUFFER_BINARY_PATH must not be empty")
+    return str(Path(value).expanduser())
+
+
 def _normalize_language(value: str) -> str:
     normalized = value.strip()
     if not normalized:
@@ -327,6 +361,10 @@ class TTSRuntime:
         playback_preroll_chunks: int = DEFAULT_PLAYBACK_PREROLL_CHUNKS,
         playback_waveform_queue_maxsize: int = DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
         playback_underflow_retries: int = DEFAULT_PLAYBACK_UNDERFLOW_RETRIES,
+        playback_backend: str = DEFAULT_PLAYBACK_BACKEND,
+        wavbuffer_binary_path: str | None = None,
+        wavbuffer_queue_depth: int = DEFAULT_WAVBUFFER_QUEUE_DEPTH,
+        wavbuffer_preroll_mode: str = DEFAULT_WAVBUFFER_PREROLL_MODE,
         output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
         log_level: str = DEFAULT_LOG_LEVEL,
     ) -> None:
@@ -341,6 +379,13 @@ class TTSRuntime:
         self.playback_preroll_chunks = playback_preroll_chunks
         self.playback_waveform_queue_maxsize = playback_waveform_queue_maxsize
         self.playback_underflow_retries = playback_underflow_retries
+        self.playback_backend = playback_backend
+        if wavbuffer_binary_path is not None:
+            self.wavbuffer_binary_path = wavbuffer_binary_path
+        else:
+            self.wavbuffer_binary_path = _default_wavbuffer_binary_path()
+        self.wavbuffer_queue_depth = wavbuffer_queue_depth
+        self.wavbuffer_preroll_mode = wavbuffer_preroll_mode
         self.output_stream_latency = output_stream_latency
         self.log_level = log_level
 
@@ -427,6 +472,20 @@ class TTSRuntime:
                 os.getenv("SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES"),
                 env_var="SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES",
                 default=DEFAULT_PLAYBACK_UNDERFLOW_RETRIES,
+            ),
+            playback_backend=_normalize_playback_backend(
+                os.getenv("SPEAK_TO_USER_PLAYBACK_BACKEND")
+            ),
+            wavbuffer_binary_path=_normalize_wavbuffer_binary_path(
+                os.getenv("SPEAK_TO_USER_WAVBUFFER_BINARY_PATH")
+            ),
+            wavbuffer_queue_depth=_normalize_positive_int(
+                os.getenv("SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH"),
+                env_var="SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH",
+                default=DEFAULT_WAVBUFFER_QUEUE_DEPTH,
+            ),
+            wavbuffer_preroll_mode=_normalize_wavbuffer_preroll_mode(
+                os.getenv("SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE")
             ),
             output_stream_latency=_normalize_output_stream_latency(
                 os.getenv("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY")
@@ -827,7 +886,143 @@ class TTSRuntime:
                     "reference_audio or voice_clone_prompt_items must be provided "
                     "for clone playback"
                 )
+        (
+            waveform_queue,
+            queue_sentinel,
+            producer_error,
+            synthesis_done,
+            producer_thread,
+        ) = self._start_waveform_producer(
+            mode=mode,
+            normalized_chunks=normalized_chunks,
+            normalized_language=normalized_language,
+            normalized_description=normalized_description,
+            reference_audio=reference_audio,
+            reference_text=reference_text,
+            voice_clone_prompt_items=voice_clone_prompt_items,
+        )
 
+        try:
+            if self.playback_backend == "wavbuffer":
+                return self._play_speech_chunks_with_wavbuffer(
+                    mode=mode,
+                    normalized_chunks=normalized_chunks,
+                    normalized_language=normalized_language,
+                    waveform_queue=waveform_queue,
+                    queue_sentinel=queue_sentinel,
+                    producer_error=producer_error,
+                )
+
+            return self._play_speech_chunks_with_sounddevice(
+                mode=mode,
+                normalized_chunks=normalized_chunks,
+                normalized_language=normalized_language,
+                waveform_queue=waveform_queue,
+                queue_sentinel=queue_sentinel,
+                producer_error=producer_error,
+                synthesis_done=synthesis_done,
+            )
+        finally:
+            producer_thread.join(timeout=1)
+
+    def _start_waveform_producer(
+        self,
+        *,
+        mode: str,
+        normalized_chunks: list[str],
+        normalized_language: str,
+        normalized_description: str | None,
+        reference_audio: tuple[np.ndarray, int] | None,
+        reference_text: str | None,
+        voice_clone_prompt_items: list[Any] | None,
+    ) -> tuple[
+        queue.Queue[dict[str, Any] | object],
+        object,
+        list[BaseException],
+        threading.Event,
+        threading.Thread,
+    ]:
+        producer_error: list[BaseException] = []
+        synthesis_done = threading.Event()
+        waveform_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(
+            maxsize=self.playback_waveform_queue_maxsize
+        )
+        queue_sentinel = object()
+
+        def synthesize_into_queue() -> None:
+            try:
+                for chunk_index, text_chunk in enumerate(normalized_chunks, start=1):
+                    synth_started_at = _utc_now()
+                    self._emit_runtime_event(
+                        "speech_chunk_synthesis_started",
+                        level="info",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        chunk_index=chunk_index,
+                        chunk_count=len(normalized_chunks),
+                        chunk_char_count=len(text_chunk),
+                    )
+                    chunk_result = self._synthesize_audio_chunk(
+                        mode=mode,
+                        text=text_chunk,
+                        voice_description=normalized_description,
+                        language=normalized_language,
+                        reference_audio=reference_audio,
+                        reference_text=reference_text,
+                        voice_clone_prompt_items=voice_clone_prompt_items,
+                    )
+                    waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
+                    self._emit_runtime_event(
+                        "speech_chunk_synthesis_completed",
+                        level="info",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        chunk_index=chunk_index,
+                        chunk_count=len(normalized_chunks),
+                        synth_duration_ms=_duration_ms(synth_started_at, _utc_now()),
+                        sample_count=int(waveform.shape[0]),
+                    )
+                    waveform_queue.put(
+                        {
+                            "waveform": waveform,
+                            "sample_rate": int(chunk_result["sample_rate"]),
+                            "model_id": str(chunk_result["model_id"]),
+                            "device": str(chunk_result["device"]),
+                            "language": str(chunk_result["language"]),
+                        }
+                    )
+            except BaseException as exc:
+                producer_error.append(exc)
+                self._emit_runtime_event(
+                    "speech_chunk_producer_failed",
+                    level="minimal",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    error=str(exc),
+                )
+            finally:
+                synthesis_done.set()
+                waveform_queue.put(queue_sentinel)
+
+        producer_thread = threading.Thread(
+            target=synthesize_into_queue,
+            name="speak-to-user-waveform-producer",
+            daemon=True,
+        )
+        producer_thread.start()
+        return waveform_queue, queue_sentinel, producer_error, synthesis_done, producer_thread
+
+    def _play_speech_chunks_with_sounddevice(
+        self,
+        *,
+        mode: str,
+        normalized_chunks: list[str],
+        normalized_language: str,
+        waveform_queue: queue.Queue[dict[str, Any] | object],
+        queue_sentinel: object,
+        producer_error: list[BaseException],
+        synthesis_done: threading.Event,
+    ) -> dict[str, Any]:
         total_sample_count = 0
         buffered_sample_count = 0
         buffered_waveforms: list[np.ndarray] = []
@@ -837,13 +1032,6 @@ class TTSRuntime:
         model_id: str | None = None
         device: str | None = None
         preroll_sample_target: int | None = None
-        producer_error: list[BaseException] = []
-        synthesis_done = threading.Event()
-        waveform_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(
-            maxsize=self.playback_waveform_queue_maxsize
-        )
-        queue_sentinel = object()
-
         stream_holder: list[sd.OutputStream | None] = [None]
 
         def close_output_stream(current_stream: sd.OutputStream) -> None:
@@ -912,6 +1100,7 @@ class TTSRuntime:
                     level="minimal",
                     job_id=self._speech_current_job_id,
                     mode=mode,
+                    player="sounddevice-stream",
                     chunk_index=chunk_index,
                     chunk_count=len(normalized_chunks),
                     retry_attempt=attempt + 1,
@@ -931,6 +1120,7 @@ class TTSRuntime:
                     level="minimal",
                     job_id=self._speech_current_job_id,
                     mode=mode,
+                    player="sounddevice-stream",
                     chunk_index=chunk_index,
                     chunk_count=len(normalized_chunks),
                     retry_attempt=attempt + 1,
@@ -938,68 +1128,6 @@ class TTSRuntime:
                     recovery_duration_ms=playback_recovery_duration_ms,
                 )
                 attempt += 1
-
-        def synthesize_into_queue() -> None:
-            try:
-                for chunk_index, text_chunk in enumerate(normalized_chunks, start=1):
-                    synth_started_at = _utc_now()
-                    self._emit_runtime_event(
-                        "speech_chunk_synthesis_started",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        chunk_char_count=len(text_chunk),
-                    )
-                    chunk_result = self._synthesize_audio_chunk(
-                        mode=mode,
-                        text=text_chunk,
-                        voice_description=normalized_description,
-                        language=normalized_language,
-                        reference_audio=reference_audio,
-                        reference_text=reference_text,
-                        voice_clone_prompt_items=voice_clone_prompt_items,
-                    )
-                    waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
-                    self._emit_runtime_event(
-                        "speech_chunk_synthesis_completed",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        synth_duration_ms=_duration_ms(synth_started_at, _utc_now()),
-                        sample_count=int(waveform.shape[0]),
-                    )
-                    waveform_queue.put(
-                        {
-                            "waveform": waveform,
-                            "sample_rate": int(chunk_result["sample_rate"]),
-                            "model_id": str(chunk_result["model_id"]),
-                            "device": str(chunk_result["device"]),
-                            "language": str(chunk_result["language"]),
-                        }
-                    )
-            except BaseException as exc:
-                producer_error.append(exc)
-                self._emit_runtime_event(
-                    "speech_chunk_producer_failed",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    error=str(exc),
-                )
-            finally:
-                synthesis_done.set()
-                waveform_queue.put(queue_sentinel)
-
-        producer_thread = threading.Thread(
-            target=synthesize_into_queue,
-            name="speak-to-user-waveform-producer",
-            daemon=True,
-        )
-        producer_thread.start()
 
         try:
             next_chunk_index = 1
@@ -1013,49 +1141,30 @@ class TTSRuntime:
                     break
 
                 chunk_result = cast(dict[str, Any], queue_item)
-                waveform = chunk_result["waveform"]
-
-                current_sample_rate = int(chunk_result["sample_rate"])
-                current_model_id = str(chunk_result["model_id"])
-                current_device = str(chunk_result["device"])
-                current_language = str(chunk_result["language"])
-
-                if sample_rate is None:
-                    sample_rate = current_sample_rate
-                    channel_count = self._waveform_channel_count(waveform)
-                    preroll_sample_target = max(
-                        1,
-                        int(sample_rate * self.playback_preroll_seconds),
-                    )
-                    model_id = current_model_id
-                    device = current_device
-                else:
-                    if current_sample_rate != sample_rate:
-                        raise RuntimeError(
-                            "streamed speech chunk sample rate changed during playback"
-                        )
-                    current_channel_count = self._waveform_channel_count(waveform)
-                    if channel_count is None or current_channel_count != channel_count:
-                        raise RuntimeError(
-                            "streamed speech chunk channel count changed during playback"
-                        )
-                    if model_id != current_model_id:
-                        raise RuntimeError("streamed speech chunk model id changed during playback")
-                    if device != current_device:
-                        raise RuntimeError("streamed speech chunk device changed during playback")
-                    if current_language != normalized_language:
-                        raise RuntimeError(
-                            "streamed speech chunk language changed during playback"
-                        )
+                waveform = cast(np.ndarray, chunk_result["waveform"])
+                (
+                    sample_rate,
+                    channel_count,
+                    model_id,
+                    device,
+                ) = self._validate_chunk_metadata(
+                    chunk_result=chunk_result,
+                    normalized_language=normalized_language,
+                    expected_sample_rate=sample_rate,
+                    expected_channel_count=channel_count,
+                    expected_model_id=model_id,
+                    expected_device=device,
+                )
 
                 if stream_holder[0] is None:
                     buffered_waveforms.append(waveform)
                     buffered_sample_count += int(waveform.shape[0])
                     buffered_chunk_count += 1
                     assert sample_rate is not None
-                    assert channel_count is not None
-                    assert preroll_sample_target is not None
-
+                    preroll_sample_target = max(
+                        1,
+                        int(sample_rate * self.playback_preroll_seconds),
+                    )
                     have_enough_preroll_audio = buffered_sample_count >= preroll_sample_target
                     have_enough_preroll_chunks = (
                         buffered_chunk_count >= min(
@@ -1093,6 +1202,7 @@ class TTSRuntime:
                             level="info",
                             job_id=self._speech_current_job_id,
                             mode=mode,
+                            player="sounddevice-stream",
                             chunk_index=next_chunk_index,
                             chunk_count=len(normalized_chunks),
                             sample_count=int(buffered_waveform.shape[0]),
@@ -1110,6 +1220,7 @@ class TTSRuntime:
                             level="info",
                             job_id=self._speech_current_job_id,
                             mode=mode,
+                            player="sounddevice-stream",
                             chunk_index=next_chunk_index,
                             chunk_count=len(normalized_chunks),
                             playback_duration_ms=_duration_ms(
@@ -1132,6 +1243,7 @@ class TTSRuntime:
                     level="info",
                     job_id=self._speech_current_job_id,
                     mode=mode,
+                    player="sounddevice-stream",
                     chunk_index=next_chunk_index,
                     chunk_count=len(normalized_chunks),
                     sample_count=int(waveform.shape[0]),
@@ -1149,6 +1261,7 @@ class TTSRuntime:
                     level="info",
                     job_id=self._speech_current_job_id,
                     mode=mode,
+                    player="sounddevice-stream",
                     chunk_index=next_chunk_index,
                     chunk_count=len(normalized_chunks),
                     playback_duration_ms=_duration_ms(
@@ -1179,9 +1292,428 @@ class TTSRuntime:
                 "mode": mode,
             }
         finally:
-            producer_thread.join(timeout=1)
             if stream_holder[0] is not None:
                 close_output_stream(stream_holder[0])
+
+    def _play_speech_chunks_with_wavbuffer(
+        self,
+        *,
+        mode: str,
+        normalized_chunks: list[str],
+        normalized_language: str,
+        waveform_queue: queue.Queue[dict[str, Any] | object],
+        queue_sentinel: object,
+        producer_error: list[BaseException],
+    ) -> dict[str, Any]:
+        total_sample_count = 0
+        sample_rate: int | None = None
+        channel_count: int | None = None
+        model_id: str | None = None
+        device: str | None = None
+        process: Any | None = None
+        process_state: dict[str, Any] | None = None
+        stderr_thread: threading.Thread | None = None
+        next_chunk_index = 1
+
+        def start_process() -> tuple[Any, dict[str, Any], threading.Thread]:
+            command = self._wavbuffer_command()
+            self._emit_runtime_event(
+                "speech_wavbuffer_process_starting",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                command=command,
+            )
+            child = self._spawn_wavbuffer_process(command)
+            state = {
+                "lines": [],
+                "parsed_events": [],
+                "retryable_failure": False,
+            }
+            reader_thread = threading.Thread(
+                target=self._read_wavbuffer_stderr,
+                args=(child, state, mode),
+                name="speak-to-user-wavbuffer-stderr",
+                daemon=True,
+            )
+            reader_thread.start()
+            self._emit_runtime_event(
+                "speech_wavbuffer_process_started",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                pid=getattr(child, "pid", None),
+            )
+            return child, state, reader_thread
+
+        def stop_process(*, close_stdin: bool) -> tuple[int | None, str, bool]:
+            nonlocal process, process_state, stderr_thread
+            if process is None:
+                return None, "wavbuffer process was not running", False
+
+            if close_stdin and getattr(process, "stdin", None) is not None:
+                with contextlib.suppress(BrokenPipeError, OSError):
+                    process.stdin.close()
+
+            returncode = process.wait()
+            if stderr_thread is not None:
+                stderr_thread.join(timeout=1)
+            error_detail = current_process_error()
+            retryable_failure = bool(process_state and process_state["retryable_failure"])
+            self._emit_runtime_event(
+                "speech_wavbuffer_process_exited",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                pid=getattr(process, "pid", None),
+                returncode=returncode,
+            )
+            process = None
+            process_state = None
+            stderr_thread = None
+            return returncode, error_detail, retryable_failure
+
+        def current_process_error() -> str:
+            assert process_state is not None
+            lines = cast(list[str], process_state["lines"])
+            if lines:
+                return lines[-1]
+            return "wavbuffer exited without stderr output"
+
+        def maybe_retry_current_chunk(
+            *,
+            chunk_index: int,
+            chunk_started_at: dt.datetime,
+            attempt: int,
+        ) -> None:
+            _, error_detail, retryable_failure = stop_process(close_stdin=False)
+            if retryable_failure:
+                self._emit_runtime_event(
+                    "speech_chunk_playback_underflow",
+                    level="minimal",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    retry_attempt=attempt + 1,
+                    max_retries=self.playback_underflow_retries,
+                )
+                if attempt >= self.playback_underflow_retries:
+                    raise RuntimeError(
+                        "audio output underflowed during streamed playback "
+                        f"after {attempt + 1} attempt(s)"
+                    )
+
+                playback_recovery_duration_ms = _duration_ms(chunk_started_at, _utc_now())
+                self._emit_runtime_event(
+                    "speech_chunk_playback_retrying",
+                    level="minimal",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    retry_attempt=attempt + 1,
+                    max_retries=self.playback_underflow_retries,
+                    recovery_duration_ms=playback_recovery_duration_ms,
+                )
+                return
+
+            raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
+
+        try:
+            while True:
+                with self._lock:
+                    self._set_speech_phase_locked("synthesizing")
+
+                queue_item = waveform_queue.get()
+                if queue_item is queue_sentinel:
+                    break
+
+                chunk_result = cast(dict[str, Any], queue_item)
+                waveform = cast(np.ndarray, chunk_result["waveform"])
+                (
+                    sample_rate,
+                    channel_count,
+                    model_id,
+                    device,
+                ) = self._validate_chunk_metadata(
+                    chunk_result=chunk_result,
+                    normalized_language=normalized_language,
+                    expected_sample_rate=sample_rate,
+                    expected_channel_count=channel_count,
+                    expected_model_id=model_id,
+                    expected_device=device,
+                )
+
+                wav_data = self._encode_waveform_as_wav_bytes(
+                    waveform=waveform,
+                    sample_rate=sample_rate,
+                )
+
+                with self._lock:
+                    self._set_speech_phase_locked("playing")
+                    self._speech_current_chunk_index = next_chunk_index
+                    self._speech_current_chunk_count = len(normalized_chunks)
+                    self._current_chunk_started_at = _utc_now()
+                self._emit_runtime_event(
+                    "speech_chunk_playback_started",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=next_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    sample_count=int(waveform.shape[0]),
+                )
+                assert self._current_chunk_started_at is not None
+                attempt = 0
+                while True:
+                    if process is None:
+                        with self._lock:
+                            self._set_speech_phase_locked("opening_output")
+                        process, process_state, stderr_thread = start_process()
+
+                    assert process is not None
+                    assert process_state is not None
+                    try:
+                        assert process.stdin is not None
+                        process.stdin.write(wav_data)
+                        process.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        maybe_retry_current_chunk(
+                            chunk_index=next_chunk_index,
+                            chunk_started_at=self._current_chunk_started_at,
+                            attempt=attempt,
+                        )
+                        attempt += 1
+                        continue
+
+                    if process.poll() is not None:
+                        maybe_retry_current_chunk(
+                            chunk_index=next_chunk_index,
+                            chunk_started_at=self._current_chunk_started_at,
+                            attempt=attempt,
+                        )
+                        attempt += 1
+                        continue
+
+                    break
+
+                total_sample_count += int(waveform.shape[0])
+                self._emit_runtime_event(
+                    "speech_chunk_playback_completed",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=next_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    playback_duration_ms=_duration_ms(self._current_chunk_started_at, _utc_now()),
+                )
+                next_chunk_index += 1
+
+            if producer_error:
+                raise RuntimeError(str(producer_error[0])) from producer_error[0]
+
+            if process is None:
+                raise RuntimeError("no speech chunks were available for playback")
+
+            returncode, error_detail, _ = stop_process(close_stdin=True)
+            if returncode not in {0, None}:
+                raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
+
+            assert sample_rate is not None
+            assert model_id is not None
+            assert device is not None
+            return {
+                "played": True,
+                "sample_rate": sample_rate,
+                "sample_count": total_sample_count,
+                "duration_seconds": round(total_sample_count / sample_rate, 3),
+                "model_id": model_id,
+                "device": device,
+                "language": normalized_language,
+                "player": "wavbuffer-subprocess",
+                "mode": mode,
+            }
+        finally:
+            if process is not None:
+                stop_process(close_stdin=True)
+
+    def _validate_chunk_metadata(
+        self,
+        *,
+        chunk_result: dict[str, Any],
+        normalized_language: str,
+        expected_sample_rate: int | None,
+        expected_channel_count: int | None,
+        expected_model_id: str | None,
+        expected_device: str | None,
+    ) -> tuple[int, int, str, str]:
+        waveform = cast(np.ndarray, chunk_result["waveform"])
+        current_sample_rate = int(chunk_result["sample_rate"])
+        current_channel_count = self._waveform_channel_count(waveform)
+        current_model_id = str(chunk_result["model_id"])
+        current_device = str(chunk_result["device"])
+        current_language = str(chunk_result["language"])
+
+        if current_language != normalized_language:
+            raise RuntimeError("streamed speech chunk language changed during playback")
+        if expected_sample_rate is not None and current_sample_rate != expected_sample_rate:
+            raise RuntimeError("streamed speech chunk sample rate changed during playback")
+        if expected_channel_count is not None and current_channel_count != expected_channel_count:
+            raise RuntimeError("streamed speech chunk channel count changed during playback")
+        if expected_model_id is not None and current_model_id != expected_model_id:
+            raise RuntimeError("streamed speech chunk model id changed during playback")
+        if expected_device is not None and current_device != expected_device:
+            raise RuntimeError("streamed speech chunk device changed during playback")
+
+        return current_sample_rate, current_channel_count, current_model_id, current_device
+
+    def _encode_waveform_as_wav_bytes(
+        self,
+        *,
+        waveform: np.ndarray,
+        sample_rate: int,
+    ) -> bytes:
+        if waveform.ndim == 1:
+            channel_count = 1
+            pcm_data = np.ascontiguousarray(waveform.astype(np.float32)).tobytes()
+        elif waveform.ndim == 2:
+            channel_count = int(waveform.shape[1])
+            pcm_data = np.ascontiguousarray(waveform.astype(np.float32)).tobytes()
+        else:
+            raise ValueError("waveform must be mono or multi-channel frame data")
+
+        bits_per_sample = 32
+        bytes_per_sample = bits_per_sample // 8
+        byte_rate = sample_rate * channel_count * bytes_per_sample
+        block_align = channel_count * bytes_per_sample
+        data_length = len(pcm_data)
+        riff_size = 4 + (8 + 16) + (8 + data_length)
+
+        header = b"".join(
+            [
+                b"RIFF",
+                struct.pack("<I", riff_size),
+                b"WAVE",
+                b"fmt ",
+                struct.pack(
+                    "<IHHIIHH",
+                    16,
+                    3,
+                    channel_count,
+                    sample_rate,
+                    byte_rate,
+                    block_align,
+                    bits_per_sample,
+                ),
+                b"data",
+                struct.pack("<I", data_length),
+            ]
+        )
+        return header + pcm_data
+
+    def _wavbuffer_preroll_args(self) -> list[str]:
+        mode = self.wavbuffer_preroll_mode
+        if mode == "auto":
+            mode = "seconds"
+
+        if mode == "buffers":
+            return ["--preroll-buffers", str(self.playback_preroll_chunks)]
+        return ["--preroll-seconds", str(self.playback_preroll_seconds)]
+
+    def _wavbuffer_command(self) -> list[str]:
+        return [
+            self.wavbuffer_binary_path,
+            "--queue-depth",
+            str(self.wavbuffer_queue_depth),
+            *self._wavbuffer_preroll_args(),
+        ]
+
+    def _spawn_wavbuffer_process(self, command: list[str]) -> Any:
+        binary_path = Path(command[0]).expanduser()
+        if not binary_path.is_file():
+            raise RuntimeError(f"wavbuffer binary does not exist: {binary_path}")
+        if not os.access(binary_path, os.X_OK):
+            raise RuntimeError(f"wavbuffer binary is not executable: {binary_path}")
+
+        return subprocess.Popen(
+            [str(binary_path), *command[1:]],
+            stdin=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _read_wavbuffer_stderr(
+        self,
+        process: Any,
+        state: dict[str, Any],
+        mode: str,
+    ) -> None:
+        stderr = getattr(process, "stderr", None)
+        if stderr is None:
+            return
+
+        while True:
+            line = stderr.readline()
+            if not line:
+                break
+
+            decoded_line = line.decode("utf-8", errors="replace").strip()
+            if not decoded_line:
+                continue
+
+            lines = cast(list[str], state["lines"])
+            lines.append(decoded_line)
+            if len(lines) > 20:
+                del lines[0]
+
+            parsed_event = self._parse_wavbuffer_event_line(decoded_line)
+            if parsed_event is not None:
+                cast(list[dict[str, str]], state["parsed_events"]).append(parsed_event)
+                wavbuffer_event_name = parsed_event.get("event")
+                if (
+                    wavbuffer_event_name == "underrun"
+                    or parsed_event.get("reason") == "stream_starved"
+                ):
+                    state["retryable_failure"] = True
+                self._emit_runtime_event(
+                    "speech_wavbuffer_event_received",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    wavbuffer_event=wavbuffer_event_name,
+                    wavbuffer_fields=parsed_event,
+                    raw_line=decoded_line,
+                )
+            else:
+                self._emit_runtime_event(
+                    "speech_wavbuffer_stderr_received",
+                    level="debug",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    raw_line=decoded_line,
+                )
+
+    def _parse_wavbuffer_event_line(self, line: str) -> dict[str, str] | None:
+        normalized = line.strip()
+        if not normalized.startswith("wavbuffer "):
+            return None
+
+        payload = normalized.removeprefix("wavbuffer ").strip()
+        if not payload:
+            return None
+
+        result: dict[str, str] = {}
+        for token in shlex.split(payload):
+            if "=" not in token:
+                continue
+            key, value = token.split("=", 1)
+            result[key] = value
+
+        return result or None
 
     def _speech_worker_loop(self) -> None:
         while True:
@@ -1303,6 +1835,10 @@ class TTSRuntime:
             "playback_preroll_chunks": self.playback_preroll_chunks,
             "playback_waveform_queue_maxsize": self.playback_waveform_queue_maxsize,
             "playback_underflow_retries": self.playback_underflow_retries,
+            "playback_backend": self.playback_backend,
+            "wavbuffer_binary_path": self.wavbuffer_binary_path,
+            "wavbuffer_queue_depth": self.wavbuffer_queue_depth,
+            "wavbuffer_preroll_mode": self.wavbuffer_preroll_mode,
             "output_stream_latency": self.output_stream_latency,
             "log_level": self.log_level,
             "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),

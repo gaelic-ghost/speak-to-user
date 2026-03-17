@@ -51,7 +51,9 @@ uv run python app/server.py
 
 By default, the entrypoint serves MCP over HTTP at `http://127.0.0.1:8765/mcp`.
 
-Server startup blocks until all enabled models are loaded. After that, both `speak_text` and `speak_text_as_clone` push one full text job into one in-process FIFO queue. Every request is chunked before playback, the worker synthesizes ahead into a bounded waveform queue, opens playback only after preroll, and then keeps generating and writing later chunks in order while the same output stream stays open. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback, plus which synthesis mode is active.
+Server startup blocks until all enabled models are loaded. After that, both `speak_text` and `speak_text_as_clone` push one full text job into one in-process FIFO queue. Every request is chunked before playback, and the worker synthesizes ahead into a bounded waveform queue.
+
+With the default `sounddevice` backend, the runtime itself owns preroll and writes later chunks through one in-process output stream. With the optional `wavbuffer` backend, the runtime instead wraps each synthesized chunk into a complete WAV buffer and streams those buffers into a prebuilt native Swift playback binary, which owns preroll and underrun detection for that path. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback, plus which synthesis mode and playback backend are active.
 
 Because playback is intentionally global and serial, multiple MCP clients can stay connected at once, but only one speech job plays at a time.
 
@@ -151,6 +153,16 @@ Recommended profile workflow:
   Default: `16`
 - `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES`
   Default: `2`
+- `SPEAK_TO_USER_PLAYBACK_BACKEND`
+  Allowed values: `sounddevice`, `wavbuffer`
+  Default: `sounddevice`
+- `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH`
+  Default: `~/Workspace/swiftly-play/.build/release/wavbuffer`
+- `SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH`
+  Default: `8`
+- `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE`
+  Allowed values: `auto`, `seconds`, `buffers`
+  Default: `seconds`
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY`
   Allowed values: `low`, `high`, or a positive number
   Default: `high`
@@ -165,8 +177,11 @@ Operational notes:
 - enabling both resident models increases steady RAM usage
 - startup time increases when both models are enabled because preload waits for both
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
-- `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects output-stream buffering only; it does not reduce model inference time
-- `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback reopens the output stream and retries the current chunk after a stream underflow
+- `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time
+- `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback retries the current chunk after a playback underflow or `wavbuffer` starvation event
+- the `wavbuffer` backend expects a prebuilt binary path; do not point it at `swift run wavbuffer`
+- `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=auto` currently resolves to `seconds` so the runtime passes exactly one preroll flag to `wavbuffer`
+- when `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer`, native preroll and underrun reporting come from the Swift playback binary rather than the Python runtime
 - first-audio latency is usually dominated by model synthesis, especially on the 1.7B voice-design model
 
 ## LaunchAgents
@@ -189,6 +204,7 @@ When diagnosing clone quality or playback problems, check both:
 Operational warning:
 
 - SoundSource.app processing or routing can destabilize playback for this service. In local testing it could produce garbled or static-heavy output and even crash SoundSource itself. Prefer excluding `speak-to-user` from SoundSource processing and routing when possible.
+- If SoundSource interference is suspected, prefer testing with `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer` first so playback runs through the native Swift sink instead of the in-process Python audio stream.
 
 Install or refresh the LaunchAgents:
 
