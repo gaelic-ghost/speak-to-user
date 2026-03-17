@@ -85,7 +85,8 @@ The reference audio must be a readable local file. WAV or FLAC is the safest cho
 For the best results with the 0.6B clone model:
 
 - use a short, clean sample from one speaker only
-- prefer roughly 5 to 20 seconds of speech
+- the upstream Qwen docs describe the model as capable of rapid cloning from about a 3-second reference, so you do not need a long clip to get started
+- in practice, a few clean spoken seconds is usually better than a longer but noisier clip
 - avoid music, reverb, cross-talk, clipping, heavy background noise, and long silences
 - trim leading and trailing silence when possible
 - prefer WAV or FLAC over lossy formats
@@ -93,6 +94,11 @@ For the best results with the 0.6B clone model:
 - if you have an accurate transcript for the reference clip, include it as `reference_text`
 
 `reference_text` is worth using when it is genuinely accurate. It gives the model stronger conditioning than speaker-embedding-only mode. If the transcript is wrong, partial, or loosely paraphrased, omit it and let the service use `x_vector_only_mode=True`.
+
+The upstream Qwen clone examples also make two practical points that matter here:
+
+- the model itself accepts several `ref_audio` forms, but this server intentionally narrows that to a readable local file path for predictability
+- `x_vector_only_mode=True` is a supported fallback, but Qwen explicitly notes that cloning quality may be reduced when you skip `reference_text`
 
 For one-off requests, use `speak_text_as_clone`. For a voice you expect to reuse, create a named profile first and then use `speak_with_profile`.
 
@@ -125,6 +131,7 @@ Profile behavior:
 Recommended profile workflow:
 
 - use `generate_speech_profile` once with a clean reference clip
+- prefer a short, accurate reference clip and transcript over a longer clip with messy timing, noise, or paraphrased text
 - use `generate_speech_profile_from_voice_design` when you want the server to synthesize the seed clip for you before building the reusable clone prompt
 - provide `reference_text` only when it closely matches the spoken clip
 - use `list_speech_profiles` to confirm the saved profile metadata

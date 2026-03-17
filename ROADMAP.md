@@ -76,6 +76,7 @@ Tickets:
 - [ ] Add a better user-facing and agent-facing way to inspect and adjust settings and configuration.
 - [ ] Publish an agent skill for this server and include example `AGENTS.md` guidance for adopters.
 - [ ] Clarify which knobs are operational, which are quality-related, and which should stay internal defaults.
+- [ ] Improve automated test coverage with formal coverage reporting and a few higher-signal integration tests around model/profile workflows.
 
 Exit criteria:
 
