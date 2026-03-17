@@ -127,6 +127,7 @@ Scope:
 
 Tickets:
 
+- [ ] Distribute the service as a Python package with a self-contained `wavbuffer` payload, including a more formal wheel/package-data path for the bundled native binary.
 - [ ] Package the service as a macOS menu bar app.
 - [ ] Add a supported way to make the service LAN-accessible.
 - [ ] Document the security and operational tradeoffs of exposing the service beyond localhost.
