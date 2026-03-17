@@ -196,6 +196,8 @@ They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
 At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, handoff completion, underflow recovery, completion, and failure. It also emits `speech_memory_snapshot` events around chunk synthesis, preroll satisfaction, output opening, and playback start so you can correlate memory swings with the playback pipeline in the LaunchAgent stderr log. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
+The checked-in LaunchAgent templates currently pin the service to the native `wavbuffer` backend with `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0`. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
+
 When diagnosing clone quality or playback problems, check both:
 
 - `tts_status` for live queue, model, and recent-event state
