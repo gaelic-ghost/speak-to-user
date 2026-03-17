@@ -197,6 +197,32 @@ launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
 launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
 ```
 
+Start the installed LaunchAgents:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+```
+
+Stop the installed LaunchAgents:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+```
+
+Manage each service individually:
+
+```bash
+# Stable / prod
+launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+
+# Dev
+launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+```
+
 Logs:
 
 - `~/Library/Logs/speak-to-user.stable.stdout.log`
