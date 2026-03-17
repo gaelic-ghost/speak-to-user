@@ -60,7 +60,7 @@ while [ "${ATTEMPT}" -lt 60 ]; do
         exit 1
     fi
 
-    if SPEAK_TO_USER_E2E_BASE_URL="${E2E_BASE_URL}" uv run python - <<'PY'
+    if SPEAK_TO_USER_E2E_BASE_URL="${E2E_BASE_URL}" uv run python - <<'PY' >/dev/null 2>&1
 import asyncio
 import os
 

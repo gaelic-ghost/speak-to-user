@@ -25,9 +25,17 @@ def _e2e_base_url() -> str:
 
 def _tool_payload(result: Any) -> dict[str, Any]:
     payload = getattr(result, "structuredContent", None)
-    if not isinstance(payload, dict):
-        raise AssertionError(f"expected structured tool payload, got {payload!r}")
-    return cast(dict[str, Any], payload)
+    if isinstance(payload, dict):
+        return cast(dict[str, Any], payload)
+
+    for content in getattr(result, "content", []):
+        text = getattr(content, "text", None)
+        if isinstance(text, str):
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                return cast(dict[str, Any], parsed)
+
+    raise AssertionError(f"expected structured tool payload, got {payload!r}")
 
 
 @pytest.fixture
