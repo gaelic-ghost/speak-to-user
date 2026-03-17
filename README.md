@@ -333,6 +333,7 @@ sh scripts/run_e2e_tests.sh
 ```
 
 The e2e suite starts a dedicated HTTP server on a non-live port with `SPEAK_TO_USER_PLAYBACK_BACKEND=null`, then exercises the model-generating MCP routes over HTTP.
+It now uses [scripts/wait_for_service_ready.sh](scripts/wait_for_service_ready.sh) to poll `tts_status` until `ready == true` without filling the terminal with connection-traceback noise.
 
 Memory-safety guidance for e2e:
 
@@ -358,3 +359,8 @@ If you want to run the optional e2e tests manually against an already-started de
 ```bash
 SPEAK_TO_USER_E2E_BASE_URL=http://127.0.0.1:8876/mcp uv run pytest -m e2e -q -o addopts='-q --strict-markers'
 ```
+
+Automation:
+
+- [`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs the fast default checks, plist linting, and shell syntax checks on push and pull request.
+- [`.github/workflows/manual-model-e2e.yml`](.github/workflows/manual-model-e2e.yml) is an opt-in GitHub Actions workflow that validates the optional e2e harness shape without pretending hosted runners can execute the local model stack.

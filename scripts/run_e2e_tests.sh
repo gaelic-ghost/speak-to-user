@@ -51,37 +51,16 @@ echo "This suite is intentionally sequential. Do not run another model-heavy tes
 SERVER_PID=$!
 
 READY=0
-ATTEMPT=0
-while [ "${ATTEMPT}" -lt 60 ]; do
-    if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
-        echo "The dedicated e2e server exited before it became ready."
-        echo "stderr log:"
-        cat "${SERVER_STDERR}" || true
-        exit 1
-    fi
+if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
+    echo "The dedicated e2e server exited before it became ready."
+    echo "stderr log:"
+    cat "${SERVER_STDERR}" || true
+    exit 1
+fi
 
-    if SPEAK_TO_USER_E2E_BASE_URL="${E2E_BASE_URL}" uv run python - <<'PY' >/dev/null 2>&1
-import asyncio
-import os
-
-from fastmcp import Client
-
-
-async def main() -> None:
-    async with Client(os.environ["SPEAK_TO_USER_E2E_BASE_URL"], timeout=30) as client:
-        await client.call_tool("health", timeout=30)
-
-
-asyncio.run(main())
-PY
-    then
-        READY=1
-        break
-    fi
-
-    ATTEMPT=$((ATTEMPT + 1))
-    sleep 2
-done
+if sh "${ROOT_DIR}/scripts/wait_for_service_ready.sh" 120 "${E2E_BASE_URL}"; then
+    READY=1
+fi
 
 if [ "${READY}" -ne 1 ]; then
     echo "Timed out waiting for the dedicated e2e server at ${E2E_BASE_URL}"

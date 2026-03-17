@@ -1,0 +1,35 @@
+name: Manual Model E2E Harness
+
+on:
+  workflow_dispatch:
+
+jobs:
+  preflight:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Validate optional e2e harness shape
+        run: |
+          sh -n scripts/run_e2e_tests.sh
+          sh -n scripts/wait_for_service_ready.sh
+          uv run pytest --collect-only tests/test_e2e_model_routes.py -m e2e -o addopts='--strict-markers'
+
+      - name: Explain local execution requirement
+        run: |
+          echo "This workflow validates the optional sequential e2e harness only."
+          echo "The real model-generating e2e suite is intended for a local or self-hosted machine"
+          echo "where the speak-to-user models and launchctl-managed service environment actually exist."

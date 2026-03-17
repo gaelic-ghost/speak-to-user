@@ -60,9 +60,41 @@ def test_model_generating_routes_over_http(reference_audio_path: Path) -> None:
 
         async with Client(base_url, timeout=600) as client:
             try:
+                prompts = await client.list_prompts()
+                prompt_names = {prompt.name for prompt in prompts}
+                assert "choose_speak_to_user_workflow" in prompt_names
+                assert "guide_speech_profile_workflow" in prompt_names
+
+                prompt_result = await client.get_prompt("choose_speak_to_user_workflow")
+                prompt_text = "\n".join(
+                    getattr(message.content, "text", "")
+                    for message in prompt_result.messages
+                )
+                assert "speak_text" in prompt_text
+                assert "tts_status" in prompt_text
+
+                usage_resource = await client.read_resource("guide://speak-to-user/usage")
+                usage_text = "\n".join(
+                    content.text
+                    for content in usage_resource
+                    if hasattr(content, "text")
+                )
+                assert "speak_text_as_clone" in usage_text
+                assert "playback is global and serial" in usage_text
+
                 status_payload = _tool_payload(await client.call_tool("tts_status"))
                 assert status_payload["ready"] is True
                 assert status_payload["playback_backend"] == "null"
+
+                status_resource = await client.read_resource("state://speak-to-user/status")
+                status_resource_text = "\n".join(
+                    content.text
+                    for content in status_resource
+                    if hasattr(content, "text")
+                )
+                status_resource_payload = json.loads(status_resource_text)
+                assert status_resource_payload["ready"] is True
+                assert status_resource_payload["playback_backend"] == "null"
 
                 speak_text_payload = _tool_payload(
                     await client.call_tool(

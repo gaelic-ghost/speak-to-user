@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Sync dependencies
+        run: uv sync --all-groups
+
+      - name: Run pytest
+        run: uv run pytest
+
+      - name: Run Ruff
+        run: uv run ruff check .
+
+      - name: Run mypy
+        run: uv run mypy .
+
+      - name: Lint LaunchAgent plists
+        run: plutil -lint launchd/com.galew.speak-to-user.stable.plist launchd/com.galew.speak-to-user.dev.plist
+
+      - name: Check shell script syntax
+        run: |
+          sh -n scripts/run_e2e_tests.sh
+          sh -n scripts/wait_for_service_ready.sh
