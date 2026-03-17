@@ -305,6 +305,45 @@ def _duration_ms(start: dt.datetime | None, end: dt.datetime | None) -> int | No
     return max(0, int((end - start).total_seconds() * 1000))
 
 
+def _current_process_memory_snapshot() -> dict[str, Any]:
+    snapshot: dict[str, Any] = {}
+
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(os.getpid())],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        rss_kib = int(result.stdout.strip())
+        snapshot["process_rss_kib"] = rss_kib
+        snapshot["process_rss_bytes"] = rss_kib * 1024
+        snapshot["process_rss_mib"] = round((rss_kib * 1024) / (1024 * 1024), 2)
+    except (subprocess.SubprocessError, ValueError):
+        snapshot["process_rss_kib"] = None
+        snapshot["process_rss_bytes"] = None
+        snapshot["process_rss_mib"] = None
+
+    try:
+        import torch
+
+        if hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
+            snapshot["torch_mps_current_allocated_bytes"] = int(
+                torch.mps.current_allocated_memory()
+            )
+        if hasattr(torch, "mps") and hasattr(torch.mps, "driver_allocated_memory"):
+            snapshot["torch_mps_driver_allocated_bytes"] = int(
+                torch.mps.driver_allocated_memory()
+            )
+    except Exception:
+        snapshot.setdefault("torch_mps_current_allocated_bytes", None)
+        snapshot.setdefault("torch_mps_driver_allocated_bytes", None)
+
+    snapshot.setdefault("torch_mps_current_allocated_bytes", None)
+    snapshot.setdefault("torch_mps_driver_allocated_bytes", None)
+    return snapshot
+
+
 def safe_print(*args: Any, **kwargs: Any) -> None:
     file = kwargs.get("file")
     thread_id = threading.get_ident()
@@ -962,6 +1001,14 @@ class TTSRuntime:
                         chunk_count=len(normalized_chunks),
                         chunk_char_count=len(text_chunk),
                     )
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_chunk_synthesis_started",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        chunk_index=chunk_index,
+                        chunk_count=len(normalized_chunks),
+                    )
                     chunk_result = self._synthesize_audio_chunk(
                         mode=mode,
                         text=text_chunk,
@@ -981,6 +1028,14 @@ class TTSRuntime:
                         chunk_count=len(normalized_chunks),
                         synth_duration_ms=_duration_ms(synth_started_at, _utc_now()),
                         sample_count=int(waveform.shape[0]),
+                    )
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_chunk_synthesis_completed",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        chunk_index=chunk_index,
+                        chunk_count=len(normalized_chunks),
                     )
                     waveform_queue.put(
                         {
@@ -1059,6 +1114,16 @@ class TTSRuntime:
             self._emit_runtime_event(
                 "speech_output_stream_opening",
                 level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                sample_rate=sample_rate,
+                channel_count=channel_count,
+                buffered_chunk_count=buffered_chunk_count,
+                buffered_sample_count=buffered_sample_count,
+            )
+            self._emit_runtime_memory_snapshot(
+                level="info",
+                snapshot_event="speech_output_stream_opening",
                 job_id=self._speech_current_job_id,
                 mode=mode,
                 sample_rate=sample_rate,
@@ -1188,6 +1253,15 @@ class TTSRuntime:
                         )
                         continue
 
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_preroll_satisfied",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        buffered_chunk_count=buffered_chunk_count,
+                        buffered_sample_count=buffered_sample_count,
+                        preroll_sample_target=preroll_sample_target,
+                    )
                     stream_holder[0] = open_output_stream_for_playback()
                     playback_started_at = _utc_now()
 
@@ -1207,6 +1281,16 @@ class TTSRuntime:
                             chunk_count=len(normalized_chunks),
                             sample_count=int(buffered_waveform.shape[0]),
                         )
+                        if next_chunk_index == 1:
+                            self._emit_runtime_memory_snapshot(
+                                level="info",
+                                snapshot_event="speech_chunk_playback_started",
+                                job_id=self._speech_current_job_id,
+                                mode=mode,
+                                player="sounddevice-stream",
+                                chunk_index=next_chunk_index,
+                                chunk_count=len(normalized_chunks),
+                            )
                         assert self._current_chunk_started_at is not None
                         stream_holder[0] = write_chunk_with_recovery(
                             stream_holder[0],
@@ -1248,6 +1332,16 @@ class TTSRuntime:
                     chunk_count=len(normalized_chunks),
                     sample_count=int(waveform.shape[0]),
                 )
+                if next_chunk_index == 1:
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_chunk_playback_started",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        player="sounddevice-stream",
+                        chunk_index=next_chunk_index,
+                        chunk_count=len(normalized_chunks),
+                    )
                 assert self._current_chunk_started_at is not None
                 stream_holder[0] = write_chunk_with_recovery(
                     stream_holder[0],
@@ -1320,6 +1414,13 @@ class TTSRuntime:
             self._emit_runtime_event(
                 "speech_wavbuffer_process_starting",
                 level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                command=command,
+            )
+            self._emit_runtime_memory_snapshot(
+                level="info",
+                snapshot_event="speech_wavbuffer_process_starting",
                 job_id=self._speech_current_job_id,
                 mode=mode,
                 command=command,
@@ -1467,6 +1568,16 @@ class TTSRuntime:
                     chunk_count=len(normalized_chunks),
                     sample_count=int(waveform.shape[0]),
                 )
+                if next_chunk_index == 1:
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_chunk_playback_started",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        player="wavbuffer-subprocess",
+                        chunk_index=next_chunk_index,
+                        chunk_count=len(normalized_chunks),
+                    )
                 assert self._current_chunk_started_at is not None
                 attempt = 0
                 while True:
@@ -1911,6 +2022,22 @@ class TTSRuntime:
             self._recent_events.append(dict(payload))
 
         _ORIGINAL_PRINT(json.dumps(payload, sort_keys=True), file=sys.stderr)
+
+    def _emit_runtime_memory_snapshot(
+        self,
+        *,
+        level: str,
+        snapshot_event: str,
+        **details: Any,
+    ) -> None:
+        snapshot = _current_process_memory_snapshot()
+        self._emit_runtime_event(
+            "speech_memory_snapshot",
+            level=level,
+            snapshot_event=snapshot_event,
+            **details,
+            **snapshot,
+        )
 
     def _enqueue_speech_job(
         self,

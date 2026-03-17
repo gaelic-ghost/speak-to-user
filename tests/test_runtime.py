@@ -1145,6 +1145,53 @@ def test_emit_runtime_event_records_recent_event_and_prints_json(
     assert '"event": "custom_event"' in printed[-1]
 
 
+def test_current_process_memory_snapshot_reads_rss_and_mps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_torch = SimpleNamespace(
+        mps=SimpleNamespace(
+            current_allocated_memory=lambda: 1024,
+            driver_allocated_memory=lambda: 2048,
+        )
+    )
+    monkeypatch.setattr(
+        runtime_module.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(stdout="512\n"),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    snapshot = runtime_module._current_process_memory_snapshot()
+
+    assert snapshot["process_rss_kib"] == 512
+    assert snapshot["process_rss_bytes"] == 512 * 1024
+    assert snapshot["torch_mps_current_allocated_bytes"] == 1024
+    assert snapshot["torch_mps_driver_allocated_bytes"] == 2048
+
+
+def test_emit_runtime_memory_snapshot_records_snapshot_event(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    monkeypatch.setattr(
+        runtime_module,
+        "_current_process_memory_snapshot",
+        lambda: {"process_rss_bytes": 4096, "process_rss_mib": 0.0},
+    )
+
+    runtime._emit_runtime_memory_snapshot(
+        level="info",
+        snapshot_event="speech_chunk_synthesis_started",
+        chunk_index=1,
+    )
+
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert recent_events[-1]["event"] == "speech_memory_snapshot"
+    assert recent_events[-1]["snapshot_event"] == "speech_chunk_synthesis_started"
+    assert recent_events[-1]["process_rss_bytes"] == 4096
+
+
 def test_recent_event_buffer_is_bounded(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
 
