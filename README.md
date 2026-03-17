@@ -24,6 +24,7 @@ The two models solve different problems. Voice design is the default spoken-repl
 - `speak_text`: enqueues one full text job for the voice-design model.
 - `speak_text_as_clone`: enqueues one full text job for the clone model using a local reference audio file and optional reference text.
 - `generate_speech_profile`: stores a named reusable clone prompt artifact in the server's persistent state store.
+- `generate_speech_profile_from_voice_design`: synthesizes a seed clip with the 1.7B voice-design model, then turns that clip into a reusable clone profile with the 0.6B clone model.
 - `list_speech_profiles`: lists saved speech profiles and their metadata.
 - `delete_speech_profile`: deletes a saved speech profile by name.
 - `speak_with_profile`: enqueues one full text job using a previously saved speech profile.
@@ -103,6 +104,11 @@ Profiles are reusable named clone prompts backed by the FastMCP server's persist
   - `name`
   - `reference_audio_path`
   - optional `reference_text`
+- `generate_speech_profile_from_voice_design` takes:
+  - `name`
+  - `text`
+  - `voice_description`
+  - optional `language`
 - `speak_with_profile` takes:
   - `name`
   - `text`
@@ -113,11 +119,13 @@ Profile behavior:
 - profiles are bound to the active clone model ID at creation time
 - profile names must be unique; duplicate creation fails
 - profiles store a precomputed Qwen clone prompt artifact rather than the original file path alone
+- voice-designed profiles also persist their seed text and voice description alongside the saved prompt artifact
 - `speak_with_profile` fails if the current clone model ID does not match the saved profile
 
 Recommended profile workflow:
 
 - use `generate_speech_profile` once with a clean reference clip
+- use `generate_speech_profile_from_voice_design` when you want the server to synthesize the seed clip for you before building the reusable clone prompt
 - provide `reference_text` only when it closely matches the spoken clip
 - use `list_speech_profiles` to confirm the saved profile metadata
 - use `speak_with_profile` for repeat playback instead of resupplying the same reference audio every time

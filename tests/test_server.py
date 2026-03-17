@@ -66,6 +66,7 @@ class StubRuntime:
         }
         self.queued_jobs: list[dict[str, object]] = []
         self.generated_profiles: list[dict[str, object]] = []
+        self.generated_voice_designed_profiles: list[dict[str, object]] = []
         self.deleted_profiles: list[str] = []
 
     def status(self) -> dict[str, object]:
@@ -164,6 +165,24 @@ class StubRuntime:
             "created_at": "2026-03-14T00:00:00+00:00",
             "updated_at": "2026-03-14T00:00:00+00:00",
             "reference_text_included": kwargs.get("reference_text") is not None,
+        }
+
+    async def generate_speech_profile_from_voice_design(
+        self,
+        **kwargs: object,
+    ) -> dict[str, object]:
+        self.generated_voice_designed_profiles.append(dict(kwargs))
+        return {
+            "result": "success",
+            "name": kwargs["name"],
+            "clone_model_id": "Qwen/test-clone",
+            "clone_mode": "reference_text",
+            "created_at": "2026-03-14T00:00:00+00:00",
+            "updated_at": "2026-03-14T00:00:00+00:00",
+            "reference_text_included": True,
+            "profile_source": "voice_design",
+            "seed_text_stored": True,
+            "voice_description_stored": True,
         }
 
     async def list_speech_profiles(self, **kwargs: object) -> dict[str, object]:
@@ -401,6 +420,20 @@ def test_generate_speech_profile_is_plain_tool() -> None:
     asyncio.run(run())
 
 
+def test_generate_speech_profile_from_voice_design_is_plain_tool() -> None:
+    async def run() -> None:
+        tool = await server.mcp.get_tool("generate_speech_profile_from_voice_design")
+        assert tool is not None
+        assert tool.task_config is not None
+        assert tool.task_config.mode == "forbidden"
+        properties = cast(dict[str, object], tool.parameters["properties"])
+        assert "name" in properties
+        assert "text" in properties
+        assert "voice_description" in properties
+
+    asyncio.run(run())
+
+
 def test_speak_with_profile_is_plain_tool() -> None:
     async def run() -> None:
         tool = await server.mcp.get_tool("speak_with_profile")
@@ -480,6 +513,33 @@ def test_generate_speech_profile_uses_runtime() -> None:
             "name": "demo",
             "reference_audio_path": "voice.wav",
             "reference_text": "reference text",
+        }
+    ]
+
+
+def test_generate_speech_profile_from_voice_design_uses_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(
+        server.generate_speech_profile_from_voice_design(
+            "demo",
+            "hello there",
+            "warm and bright",
+            "en",
+            ctx=cast(Context, ctx),
+        )
+    )
+
+    assert result["result"] == "success"
+    assert result["profile_source"] == "voice_design"
+    assert runtime.generated_voice_designed_profiles == [
+        {
+            "state_store": ctx.fastmcp._state_store,
+            "name": "demo",
+            "text": "hello there",
+            "voice_description": "warm and bright",
+            "language": "en",
         }
     ]
 

@@ -92,6 +92,31 @@ async def generate_speech_profile(
     )
 
 
+async def generate_speech_profile_from_voice_design(
+    ctx: Context,
+    *,
+    name: str,
+    text: str,
+    voice_description: str,
+    language: str = "en",
+) -> dict[str, object]:
+    runtime = _runtime_from_context(ctx)
+    normalized_text = text.strip()
+    if not normalized_text:
+        raise ValueError("text must not be empty")
+    normalized_voice_description = voice_description.strip()
+    if not normalized_voice_description:
+        raise ValueError("voice_description must not be empty")
+
+    return await runtime.generate_speech_profile_from_voice_design(
+        state_store=ctx.fastmcp._state_store,
+        name=name,
+        text=normalized_text,
+        voice_description=normalized_voice_description,
+        language=language,
+    )
+
+
 async def list_speech_profiles(ctx: Context) -> dict[str, object]:
     runtime = _runtime_from_context(ctx)
     return await runtime.list_speech_profiles(

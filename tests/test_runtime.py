@@ -354,6 +354,9 @@ def test_generate_speech_profile_persists_prompt(
     profile_payload = cast(dict[str, object], stored_profile.value)
     assert profile_payload["clone_model_id"] == "Qwen/test-clone"
     assert profile_payload["clone_mode"] == "reference_text"
+    assert profile_payload["profile_source"] is None
+    assert profile_payload["seed_text"] is None
+    assert profile_payload["voice_description"] is None
 
 
 def test_generate_speech_profile_rejects_duplicate_name(
@@ -387,6 +390,101 @@ def test_generate_speech_profile_rejects_duplicate_name(
                 reference_audio_path="voice.wav",
             )
         )
+
+
+def test_generate_speech_profile_from_voice_design_persists_seed_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    fake_clone_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_clone_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+    temp_wav_path = tmp_path / "generated.wav"
+    temp_wav_path.write_bytes(b"stub")
+
+    monkeypatch.setattr(
+        runtime,
+        "_synthesize_voice_design_reference_audio",
+        lambda **kwargs: (np.array([0.0, 0.1, 0.2], dtype=np.float32), 24000),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_write_temp_reference_audio_file",
+        lambda **kwargs: str(temp_wav_path),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_decode_reference_audio_file",
+        lambda path: (np.array([0.0, 0.1, 0.2], dtype=np.float32), 24000),
+    )
+
+    result = asyncio.run(
+        runtime.generate_speech_profile_from_voice_design(
+            state_store=state_store,
+            name="demo",
+            text="hello there",
+            voice_description="warm and bright",
+            language="en",
+        )
+    )
+
+    assert result["result"] == "success"
+    assert result["profile_source"] == "voice_design"
+    assert result["seed_text_stored"] is True
+    assert result["voice_description_stored"] is True
+    stored_profile = asyncio.run(
+        state_store.get(
+            "profile:demo",
+            collection=runtime_module.SPEECH_PROFILE_COLLECTION,
+        )
+    )
+    assert stored_profile is not None
+    profile_payload = cast(dict[str, object], stored_profile.value)
+    assert profile_payload["seed_text"] == "hello there"
+    assert profile_payload["voice_description"] == "warm and bright"
+    assert profile_payload["profile_source"] == "voice_design"
+    assert not temp_wav_path.exists()
+
+
+def test_generate_speech_profile_from_voice_design_deletes_temp_wav_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    temp_wav_path = tmp_path / "generated.wav"
+    temp_wav_path.write_bytes(b"stub")
+
+    monkeypatch.setattr(
+        runtime,
+        "_synthesize_voice_design_reference_audio",
+        lambda **kwargs: (np.array([0.0, 0.1, 0.2], dtype=np.float32), 24000),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_write_temp_reference_audio_file",
+        lambda **kwargs: str(temp_wav_path),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_decode_reference_audio_file",
+        lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="decode failed"):
+        asyncio.run(
+            runtime.generate_speech_profile_from_voice_design(
+                state_store=state_store,
+                name="demo",
+                text="hello there",
+                voice_description="warm and bright",
+                language="en",
+            )
+        )
+
+    assert not temp_wav_path.exists()
 
 
 def test_list_and_delete_speech_profiles(tmp_path: Path) -> None:

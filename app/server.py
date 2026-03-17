@@ -14,6 +14,7 @@ from app.runtime import TTSRuntime
 from app.tools import (
     delete_speech_profile as delete_speech_profile_tool,
     generate_speech_profile as generate_speech_profile_tool,
+    generate_speech_profile_from_voice_design as generate_speech_profile_from_voice_design_tool,
     health_payload,
     list_speech_profiles as list_speech_profiles_tool,
     speak_text as speak_text_tool,
@@ -115,6 +116,24 @@ async def generate_speech_profile(
         name=name,
         reference_audio_path=reference_audio_path,
         reference_text=reference_text,
+    )
+
+
+@mcp.tool
+async def generate_speech_profile_from_voice_design(
+    name: str,
+    text: str,
+    voice_description: str,
+    language: str = "en",
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Create a named reusable speech profile by synthesizing a voice-designed seed clip."""
+    return await generate_speech_profile_from_voice_design_tool(
+        ctx,
+        name=name,
+        text=text,
+        voice_description=voice_description,
+        language=language,
     )
 
 

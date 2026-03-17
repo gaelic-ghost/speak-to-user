@@ -15,6 +15,7 @@ import shlex
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 from typing import Any, cast
 
@@ -23,6 +24,7 @@ import sounddevice as sd  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
 from fastmcp.server.server import StateValue
+from app.text_chunking import chunk_text_for_tts
 
 # MARK: Constants
 
@@ -98,6 +100,9 @@ class StoredSpeechProfile(BaseModel):
     created_at: str
     updated_at: str
     prompt_items: list[StoredSpeechProfilePromptItem]
+    profile_source: str | None = None
+    seed_text: str | None = None
+    voice_description: str | None = None
 
 
 class StoredSpeechProfileIndex(BaseModel):
@@ -758,47 +763,84 @@ class TTSRuntime:
             raise RuntimeError(message)
 
         reference_audio = self._decode_reference_audio_file(reference_audio_path)
-        prompt_items = self._create_voice_clone_prompt_items(
+        return await self._create_and_store_speech_profile(
+            state_store=state_store,
+            name=normalized_name,
             reference_audio=reference_audio,
             reference_text=normalized_reference_text,
         )
-        now = _utc_now()
-        profile = StoredSpeechProfile(
-            name=normalized_name,
-            clone_model_id=self.clone_model_id,
-            clone_mode=(
-                "reference_text" if normalized_reference_text is not None else "x_vector_only"
-            ),
-            created_at=now.isoformat(),
-            updated_at=now.isoformat(),
-            prompt_items=[
-                self._serialize_voice_clone_prompt_item(prompt_item)
-                for prompt_item in prompt_items
-            ],
-        )
 
-        names = await self._load_speech_profile_names(state_store)
-        names.append(normalized_name)
-        names = sorted(set(names))
-        await self._save_speech_profile(
+    async def generate_speech_profile_from_voice_design(
+        self,
+        *,
+        state_store: Any,
+        name: str,
+        text: str,
+        voice_description: str,
+        language: str = "en",
+    ) -> dict[str, Any]:
+        normalized_name = self._normalize_profile_name(name)
+        normalized_text = text.strip()
+        if not normalized_text:
+            raise ValueError("text must not be empty")
+        normalized_voice_description = voice_description.strip()
+        if not normalized_voice_description:
+            raise ValueError("voice_description must not be empty")
+        normalized_language = _normalize_language(language)
+
+        existing_profile = await self._load_speech_profile(
             state_store=state_store,
-            profile=profile,
+            name=normalized_name,
         )
-        await self._save_speech_profile_names(state_store, names)
+        if existing_profile is not None:
+            message = f"speech profile `{normalized_name}` already exists"
+            self._speech_profile_last_error = message
+            raise RuntimeError(message)
 
-        self._speech_profile_count = len(names)
-        self._speech_profile_last_error = None
         self._emit_runtime_event(
-            "speech_profile_created",
+            "voice_designed_speech_profile_generation_started",
             level="minimal",
             profile_name=normalized_name,
-            clone_model_id=self.clone_model_id,
-            clone_mode=profile.clone_mode,
+            language=normalized_language,
         )
-        return {
-            "result": "success",
-            **self._speech_profile_metadata(profile),
-        }
+        reference_audio = self._synthesize_voice_design_reference_audio(
+            chunks=chunk_text_for_tts(normalized_text),
+            voice_description=normalized_voice_description,
+            language=normalized_language,
+        )
+        temp_reference_audio_path = self._write_temp_reference_audio_file(
+            waveform=reference_audio[0],
+            sample_rate=reference_audio[1],
+        )
+        self._emit_runtime_event(
+            "voice_designed_speech_profile_temp_wav_written",
+            level="minimal",
+            profile_name=normalized_name,
+            temp_reference_audio_path=temp_reference_audio_path,
+        )
+        try:
+            result = await self._create_and_store_speech_profile(
+                state_store=state_store,
+                name=normalized_name,
+                reference_audio=self._decode_reference_audio_file(temp_reference_audio_path),
+                reference_text=normalized_text,
+                profile_source="voice_design",
+                seed_text=normalized_text,
+                voice_description=normalized_voice_description,
+            )
+        finally:
+            Path(temp_reference_audio_path).unlink(missing_ok=True)
+            self._emit_runtime_event(
+                "voice_designed_speech_profile_temp_wav_deleted",
+                level="minimal",
+                profile_name=normalized_name,
+                temp_reference_audio_path=temp_reference_audio_path,
+            )
+
+        result["profile_source"] = "voice_design"
+        result["seed_text_stored"] = True
+        result["voice_description_stored"] = True
+        return result
 
     async def list_speech_profiles(self, *, state_store: Any) -> dict[str, Any]:
         names = await self._load_speech_profile_names(state_store)
@@ -2437,6 +2479,67 @@ class TTSRuntime:
             raise ValueError(f"reference audio file is empty: {expanded_path}")
         return waveform_array, int(sample_rate)
 
+    def _synthesize_voice_design_reference_audio(
+        self,
+        *,
+        chunks: list[str],
+        voice_description: str,
+        language: str,
+    ) -> tuple[np.ndarray, int]:
+        waveforms: list[np.ndarray] = []
+        expected_sample_rate: int | None = None
+
+        for chunk in self._normalize_chunks(chunks):
+            chunk_result = self._synthesize_audio_chunk(
+                mode=VOICE_DESIGN_MODEL_KIND,
+                text=chunk,
+                language=language,
+                voice_description=voice_description,
+            )
+            waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
+            sample_rate = int(chunk_result["sample_rate"])
+            if expected_sample_rate is None:
+                expected_sample_rate = sample_rate
+            elif expected_sample_rate != sample_rate:
+                raise RuntimeError("voice-designed reference audio sample rate changed")
+            waveforms.append(waveform)
+
+        if not waveforms or expected_sample_rate is None:
+            raise RuntimeError("voice-design synthesis returned no audio")
+
+        if all(waveform.ndim == 1 for waveform in waveforms):
+            combined_waveform = np.concatenate(waveforms, axis=0)
+        elif all(waveform.ndim == 2 for waveform in waveforms):
+            combined_waveform = np.concatenate(waveforms, axis=0)
+        else:
+            raise RuntimeError("voice-designed reference audio channel layout changed")
+
+        self._emit_runtime_event(
+            "voice_designed_speech_profile_synthesis_completed",
+            level="minimal",
+            sample_count=int(combined_waveform.shape[0]),
+            sample_rate=expected_sample_rate,
+        )
+        return np.ascontiguousarray(combined_waveform, dtype=np.float32), expected_sample_rate
+
+    def _write_temp_reference_audio_file(
+        self,
+        *,
+        waveform: np.ndarray,
+        sample_rate: int,
+    ) -> str:
+        try:
+            import soundfile as sf  # type: ignore[import-untyped]
+        except ImportError as exc:
+            raise RuntimeError(
+                "soundfile is unavailable for temporary reference audio writing"
+            ) from exc
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            temp_path = temp_file.name
+        sf.write(temp_path, waveform, sample_rate, subtype="FLOAT")
+        return temp_path
+
     def _normalize_profile_name(self, name: str) -> str:
         normalized = name.strip()
         if not normalized:
@@ -2494,6 +2597,59 @@ class TTSRuntime:
             "created_at": profile.created_at,
             "updated_at": profile.updated_at,
             "reference_text_included": profile.clone_mode == "reference_text",
+            "profile_source": profile.profile_source,
+        }
+
+    async def _create_and_store_speech_profile(
+        self,
+        *,
+        state_store: Any,
+        name: str,
+        reference_audio: tuple[np.ndarray, int],
+        reference_text: str | None = None,
+        profile_source: str | None = None,
+        seed_text: str | None = None,
+        voice_description: str | None = None,
+    ) -> dict[str, Any]:
+        prompt_items = self._create_voice_clone_prompt_items(
+            reference_audio=reference_audio,
+            reference_text=reference_text,
+        )
+        now = _utc_now()
+        profile = StoredSpeechProfile(
+            name=name,
+            clone_model_id=self.clone_model_id,
+            clone_mode="reference_text" if reference_text is not None else "x_vector_only",
+            created_at=now.isoformat(),
+            updated_at=now.isoformat(),
+            prompt_items=[
+                self._serialize_voice_clone_prompt_item(prompt_item)
+                for prompt_item in prompt_items
+            ],
+            profile_source=profile_source,
+            seed_text=seed_text,
+            voice_description=voice_description,
+        )
+
+        names = await self._load_speech_profile_names(state_store)
+        names.append(name)
+        names = sorted(set(names))
+        await self._save_speech_profile(state_store=state_store, profile=profile)
+        await self._save_speech_profile_names(state_store, names)
+
+        self._speech_profile_count = len(names)
+        self._speech_profile_last_error = None
+        self._emit_runtime_event(
+            "speech_profile_created",
+            level="minimal",
+            profile_name=name,
+            clone_model_id=self.clone_model_id,
+            clone_mode=profile.clone_mode,
+            profile_source=profile.profile_source,
+        )
+        return {
+            "result": "success",
+            **self._speech_profile_metadata(profile),
         }
 
     def _serialize_voice_clone_prompt_item(self, prompt_item: Any) -> StoredSpeechProfilePromptItem:
