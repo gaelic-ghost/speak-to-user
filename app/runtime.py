@@ -1300,7 +1300,7 @@ class TTSRuntime:
                         )
                         total_sample_count += int(buffered_waveform.shape[0])
                         self._emit_runtime_event(
-                            "speech_chunk_playback_completed",
+                            "speech_chunk_playback_handoff_completed",
                             level="info",
                             job_id=self._speech_current_job_id,
                             mode=mode,
@@ -1351,7 +1351,7 @@ class TTSRuntime:
                 )
                 total_sample_count += int(waveform.shape[0])
                 self._emit_runtime_event(
-                    "speech_chunk_playback_completed",
+                    "speech_chunk_playback_handoff_completed",
                     level="info",
                     job_id=self._speech_current_job_id,
                     mode=mode,
@@ -1614,7 +1614,7 @@ class TTSRuntime:
 
                 total_sample_count += int(waveform.shape[0])
                 self._emit_runtime_event(
-                    "speech_chunk_playback_completed",
+                    "speech_chunk_playback_handoff_completed",
                     level="info",
                     job_id=self._speech_current_job_id,
                     mode=mode,

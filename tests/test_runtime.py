@@ -856,6 +856,10 @@ def test_play_speech_chunks_recovers_from_output_underflow(
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert any(event["event"] == "speech_chunk_playback_underflow" for event in recent_events)
     assert any(event["event"] == "speech_chunk_playback_retrying" for event in recent_events)
+    assert any(
+        event["event"] == "speech_chunk_playback_handoff_completed"
+        for event in recent_events
+    )
 
 
 def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
@@ -962,6 +966,10 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert any(event["event"] == "speech_wavbuffer_event_received" for event in recent_events)
     assert any(event["event"] == "speech_chunk_playback_retrying" for event in recent_events)
+    assert any(
+        event["event"] == "speech_chunk_playback_handoff_completed"
+        for event in recent_events
+    )
 
 
 def test_play_speech_chunks_with_wavbuffer_fails_after_retry_budget_exhausted(
