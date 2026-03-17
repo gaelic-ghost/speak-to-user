@@ -6,7 +6,9 @@
     <string>com.galew.speak-to-user.dev</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/galew/Workspace/speak-to-user/scripts/run_service.sh</string>
+        <string>/bin/zsh</string>
+        <string>-lc</string>
+        <string>exec "$HOME/Workspace/speak-to-user/scripts/run_service.sh" &gt;&gt;"$HOME/Library/Logs/speak-to-user.dev.stdout.log" 2&gt;&gt;"$HOME/Library/Logs/speak-to-user.dev.stderr.log"</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -23,9 +25,5 @@
     <true/>
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/Users/galew/Library/Logs/speak-to-user.dev.stdout.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/galew/Library/Logs/speak-to-user.dev.stderr.log</string>
 </dict>
 </plist>

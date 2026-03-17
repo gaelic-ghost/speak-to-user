@@ -212,7 +212,7 @@ Operational notes:
 - `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback retries the current chunk after a playback underflow or `wavbuffer` starvation event
 - `SPEAK_TO_USER_PLAYBACK_BACKEND=null` is a test-only silent sink that still runs synthesis but skips real audio output
 - the `wavbuffer` backend expects a prebuilt binary path; do not point it at `swift run wavbuffer`
-- this repo includes a bundled `wavbuffer` binary for macOS arm64 at [app/vendor/wavbuffer/macos-arm64/wavbuffer](/Users/galew/Workspace/speak-to-user/app/vendor/wavbuffer/macos-arm64/wavbuffer)
+- this repo includes a bundled `wavbuffer` binary for macOS arm64 at `app/vendor/wavbuffer/macos-arm64/wavbuffer`
 - `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH` remains available as an override when you want to point at a fresh development build instead of the bundled binary
 - `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=auto` currently resolves to `seconds` so the runtime passes exactly one preroll flag to `wavbuffer`
 - when `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer`, native preroll and underrun reporting come from the Swift playback binary rather than the Python runtime
@@ -220,9 +220,10 @@ Operational notes:
 
 ## LaunchAgents
 
-This repo includes LaunchAgent plists in [launchd/com.galew.speak-to-user.stable.plist](/Users/galew/Workspace/speak-to-user/launchd/com.galew.speak-to-user.stable.plist) and [launchd/com.galew.speak-to-user.dev.plist](/Users/galew/Workspace/speak-to-user/launchd/com.galew.speak-to-user.dev.plist).
+This repo includes LaunchAgent plists in [launchd/com.galew.speak-to-user.stable.plist](launchd/com.galew.speak-to-user.stable.plist) and [launchd/com.galew.speak-to-user.dev.plist](launchd/com.galew.speak-to-user.dev.plist).
 
-They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/run_service.sh), which sets a Homebrew-friendly `PATH` so tools like `sox` resolve correctly under `launchd`.
+They call [scripts/run_service.sh](scripts/run_service.sh), which sets a Homebrew-friendly `PATH` so tools like `sox` resolve correctly under `launchd`.
+The checked-in plists use `$HOME` for the user-specific path prefix, but they still assume the default repo locations of `~/Workspace/speak-to-gale` for stable and `~/Workspace/speak-to-user` for dev. If you keep the repo somewhere else, edit the shell command in the plist before installing it.
 
 - Stable service: `http://127.0.0.1:8765/mcp`
 - Dev service: `http://127.0.0.1:8766/mcp`
@@ -235,7 +236,7 @@ The checked-in LaunchAgent templates currently pin the service to the native `wa
 To refresh the bundled `wavbuffer` binary from the sibling Swift repo after rebuilding it there:
 
 ```bash
-cp ~/Workspace/swiftly-play/.build/release/wavbuffer app/vendor/wavbuffer/macos-arm64/wavbuffer
+cp "$HOME/Workspace/swiftly-play/.build/release/wavbuffer" app/vendor/wavbuffer/macos-arm64/wavbuffer
 chmod +x app/vendor/wavbuffer/macos-arm64/wavbuffer
 ```
 
@@ -254,36 +255,36 @@ Install or refresh the LaunchAgents:
 ```bash
 cp launchd/com.galew.speak-to-user.stable.plist ~/Library/LaunchAgents/
 cp launchd/com.galew.speak-to-user.dev.plist ~/Library/LaunchAgents/
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist 2>/dev/null || true
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist 2>/dev/null || true
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist 2>/dev/null || true
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist 2>/dev/null || true
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
 ```
 
 Start the installed LaunchAgents:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
 ```
 
 Stop the installed LaunchAgents:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
 ```
 
 Manage each service individually:
 
 ```bash
 # Stable / prod
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
 
 # Dev
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.dev.plist
 ```
 
 Logs:
@@ -307,9 +308,9 @@ url = "http://127.0.0.1:8766/mcp"
 
 ## Development
 
-- [app/server.py](/Users/galew/Workspace/speak-to-user/app/server.py)
-- [app/tools.py](/Users/galew/Workspace/speak-to-user/app/tools.py)
-- [app/runtime.py](/Users/galew/Workspace/speak-to-user/app/runtime.py)
+- [app/server.py](app/server.py)
+- [app/tools.py](app/tools.py)
+- [app/runtime.py](app/runtime.py)
 
 Default checks:
 
@@ -343,13 +344,13 @@ Memory-safety guidance for e2e:
 Stop the installed stable service before e2e:
 
 ```bash
-launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
 ```
 
 Restart it after e2e:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
 ```
 
 If you want to run the optional e2e tests manually against an already-started dedicated server, point pytest at that server URL:

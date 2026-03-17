@@ -31,9 +31,9 @@ fi
 if launchctl print "gui/$(id -u)/com.galew.speak-to-user.stable" >/dev/null 2>&1; then
     echo "The live stable service appears to be running."
     echo "Stop it before running the model e2e suite to save unified memory:"
-    echo "  launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist"
+    echo "  launchctl bootout gui/\$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist"
     echo "Restart it after the suite finishes with:"
-    echo "  launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist"
+    echo "  launchctl bootstrap gui/\$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist"
     exit 1
 fi
 
