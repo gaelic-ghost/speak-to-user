@@ -186,6 +186,10 @@ When diagnosing clone quality or playback problems, check both:
 - `tts_status` for live queue, model, and recent-event state
 - the LaunchAgent stderr log for the full structured event stream across requests and reconnects
 
+Operational warning:
+
+- SoundSource.app processing or routing can destabilize playback for this service. In local testing it could produce garbled or static-heavy output and even crash SoundSource itself. Prefer excluding `speak-to-user` from SoundSource processing and routing when possible.
+
 Install or refresh the LaunchAgents:
 
 ```bash
