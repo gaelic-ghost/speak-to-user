@@ -244,8 +244,8 @@ def _normalize_wavbuffer_preroll_mode(raw: str | None) -> str:
 
 
 def _default_wavbuffer_binary_path() -> str:
-    workspace_dir = Path(__file__).resolve().parents[2]
-    return str(workspace_dir / "swiftly-play" / ".build" / "release" / "wavbuffer")
+    package_dir = Path(__file__).resolve().parent
+    return str(package_dir / "vendor" / "wavbuffer" / "macos-arm64" / "wavbuffer")
 
 
 def _normalize_wavbuffer_binary_path(raw: str | None) -> str:

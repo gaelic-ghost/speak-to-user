@@ -157,7 +157,7 @@ Recommended profile workflow:
   Allowed values: `sounddevice`, `wavbuffer`
   Default: `sounddevice`
 - `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH`
-  Default: `~/Workspace/swiftly-play/.build/release/wavbuffer`
+  Default: `app/vendor/wavbuffer/macos-arm64/wavbuffer` inside this repo
 - `SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH`
   Default: `8`
 - `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE`
@@ -180,6 +180,8 @@ Operational notes:
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time
 - `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback retries the current chunk after a playback underflow or `wavbuffer` starvation event
 - the `wavbuffer` backend expects a prebuilt binary path; do not point it at `swift run wavbuffer`
+- this repo includes a bundled `wavbuffer` binary for macOS arm64 at [app/vendor/wavbuffer/macos-arm64/wavbuffer](/Users/galew/Workspace/speak-to-user/app/vendor/wavbuffer/macos-arm64/wavbuffer)
+- `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH` remains available as an override when you want to point at a fresh development build instead of the bundled binary
 - `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=auto` currently resolves to `seconds` so the runtime passes exactly one preroll flag to `wavbuffer`
 - when `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer`, native preroll and underrun reporting come from the Swift playback binary rather than the Python runtime
 - first-audio latency is usually dominated by model synthesis, especially on the 1.7B voice-design model
@@ -196,7 +198,14 @@ They call [scripts/run_service.sh](/Users/galew/Workspace/speak-to-user/scripts/
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
 At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, handoff completion, underflow recovery, completion, and failure. It also emits `speech_memory_snapshot` events around chunk synthesis, preroll satisfaction, output opening, and playback start so you can correlate memory swings with the playback pipeline in the LaunchAgent stderr log. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
-The checked-in LaunchAgent templates currently pin the service to the native `wavbuffer` backend with `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0`. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
+The checked-in LaunchAgent templates currently pin the service to the native `wavbuffer` backend with `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0`. They now rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
+
+To refresh the bundled `wavbuffer` binary from the sibling Swift repo after rebuilding it there:
+
+```bash
+cp ~/Workspace/swiftly-play/.build/release/wavbuffer app/vendor/wavbuffer/macos-arm64/wavbuffer
+chmod +x app/vendor/wavbuffer/macos-arm64/wavbuffer
+```
 
 When diagnosing clone quality or playback problems, check both:
 

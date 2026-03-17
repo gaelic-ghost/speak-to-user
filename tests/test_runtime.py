@@ -165,6 +165,23 @@ def test_from_env_reads_wavbuffer_settings(monkeypatch: pytest.MonkeyPatch) -> N
     assert runtime.wavbuffer_preroll_mode == "buffers"
 
 
+def test_from_env_defaults_wavbuffer_binary_to_bundled_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SPEAK_TO_USER_WAVBUFFER_BINARY_PATH", raising=False)
+
+    runtime = TTSRuntime.from_env()
+
+    expected_path = (
+        Path(runtime_module.__file__).resolve().parent
+        / "vendor"
+        / "wavbuffer"
+        / "macos-arm64"
+        / "wavbuffer"
+    )
+    assert runtime.wavbuffer_binary_path == str(expected_path)
+
+
 # MARK: Runtime Lifecycle
 
 

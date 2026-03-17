@@ -18,8 +18,6 @@
         <string>wavbuffer</string>
         <key>SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS</key>
         <string>5.0</string>
-        <key>SPEAK_TO_USER_WAVBUFFER_BINARY_PATH</key>
-        <string>/Users/galew/Workspace/swiftly-play/.build/release/wavbuffer</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
