@@ -234,8 +234,11 @@ def _normalize_log_level(raw: str | None) -> str:
 
 def _normalize_playback_backend(raw: str | None) -> str:
     value = (raw or DEFAULT_PLAYBACK_BACKEND).strip().lower()
-    if value not in {"sounddevice", "wavbuffer"}:
-        raise ValueError("SPEAK_TO_USER_PLAYBACK_BACKEND must be one of: sounddevice, wavbuffer")
+    if value not in {"sounddevice", "wavbuffer", "null"}:
+        raise ValueError(
+            "SPEAK_TO_USER_PLAYBACK_BACKEND must be one of: "
+            "sounddevice, wavbuffer, null"
+        )
     return value
 
 
@@ -997,6 +1000,15 @@ class TTSRuntime:
                     queue_sentinel=queue_sentinel,
                     producer_error=producer_error,
                 )
+            if self.playback_backend == "null":
+                return self._play_speech_chunks_with_null(
+                    mode=mode,
+                    normalized_chunks=normalized_chunks,
+                    normalized_language=normalized_language,
+                    waveform_queue=waveform_queue,
+                    queue_sentinel=queue_sentinel,
+                    producer_error=producer_error,
+                )
 
             return self._play_speech_chunks_with_sounddevice(
                 mode=mode,
@@ -1698,6 +1710,110 @@ class TTSRuntime:
         finally:
             if process is not None:
                 stop_process(close_stdin=True)
+
+    def _play_speech_chunks_with_null(
+        self,
+        *,
+        mode: str,
+        normalized_chunks: list[str],
+        normalized_language: str,
+        waveform_queue: queue.Queue[dict[str, Any] | object],
+        queue_sentinel: object,
+        producer_error: list[BaseException],
+    ) -> dict[str, Any]:
+        total_sample_count = 0
+        sample_rate: int | None = None
+        channel_count: int | None = None
+        model_id: str | None = None
+        device: str | None = None
+        next_chunk_index = 1
+        playback_started_at: dt.datetime | None = None
+
+        while True:
+            with self._lock:
+                self._set_speech_phase_locked("synthesizing")
+
+            queue_item = waveform_queue.get()
+            if queue_item is queue_sentinel:
+                break
+
+            chunk_result = cast(dict[str, Any], queue_item)
+            waveform = cast(np.ndarray, chunk_result["waveform"])
+            (
+                sample_rate,
+                channel_count,
+                model_id,
+                device,
+            ) = self._validate_chunk_metadata(
+                chunk_result=chunk_result,
+                normalized_language=normalized_language,
+                expected_sample_rate=sample_rate,
+                expected_channel_count=channel_count,
+                expected_model_id=model_id,
+                expected_device=device,
+            )
+
+            with self._lock:
+                self._set_speech_phase_locked("playing")
+                self._speech_current_chunk_index = next_chunk_index
+                self._speech_current_chunk_count = len(normalized_chunks)
+                self._current_chunk_started_at = _utc_now()
+            self._emit_runtime_event(
+                "speech_chunk_playback_started",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                player="null-sink",
+                chunk_index=next_chunk_index,
+                chunk_count=len(normalized_chunks),
+                sample_count=int(waveform.shape[0]),
+            )
+            if next_chunk_index == 1:
+                playback_started_at = self._current_chunk_started_at
+                self._emit_runtime_memory_snapshot(
+                    level="info",
+                    snapshot_event="speech_chunk_playback_started",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="null-sink",
+                    chunk_index=next_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                )
+
+            total_sample_count += int(waveform.shape[0])
+            self._emit_runtime_event(
+                "speech_chunk_playback_handoff_completed",
+                level="info",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                player="null-sink",
+                chunk_index=next_chunk_index,
+                chunk_count=len(normalized_chunks),
+                playback_duration_ms=_duration_ms(
+                    self._current_chunk_started_at or playback_started_at,
+                    _utc_now(),
+                ),
+            )
+            next_chunk_index += 1
+
+        if producer_error:
+            raise RuntimeError(str(producer_error[0])) from producer_error[0]
+
+        if sample_rate is None or model_id is None or device is None:
+            raise RuntimeError("no speech chunks were available for playback")
+
+        return {
+            "played": True,
+            "sample_rate": sample_rate,
+            "sample_count": total_sample_count,
+            "duration_seconds": round(total_sample_count / sample_rate, 3),
+            "model_id": model_id,
+            "device": device,
+            "language": normalized_language,
+            "player": "null-sink",
+            "mode": mode,
+            "channel_count": channel_count,
+        }
 
     def _validate_chunk_metadata(
         self,

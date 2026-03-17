@@ -185,7 +185,7 @@ Recommended profile workflow:
 - `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES`
   Default: `2`
 - `SPEAK_TO_USER_PLAYBACK_BACKEND`
-  Allowed values: `sounddevice`, `wavbuffer`
+  Allowed values: `sounddevice`, `wavbuffer`, `null`
   Default: `sounddevice`
 - `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH`
   Default: `app/vendor/wavbuffer/macos-arm64/wavbuffer` inside this repo
@@ -210,6 +210,7 @@ Operational notes:
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time
 - `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback retries the current chunk after a playback underflow or `wavbuffer` starvation event
+- `SPEAK_TO_USER_PLAYBACK_BACKEND=null` is a test-only silent sink that still runs synthesis but skips real audio output
 - the `wavbuffer` backend expects a prebuilt binary path; do not point it at `swift run wavbuffer`
 - this repo includes a bundled `wavbuffer` binary for macOS arm64 at [app/vendor/wavbuffer/macos-arm64/wavbuffer](/Users/galew/Workspace/speak-to-user/app/vendor/wavbuffer/macos-arm64/wavbuffer)
 - `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH` remains available as an override when you want to point at a fresh development build instead of the bundled binary
@@ -310,10 +311,49 @@ url = "http://127.0.0.1:8766/mcp"
 - [app/tools.py](/Users/galew/Workspace/speak-to-user/app/tools.py)
 - [app/runtime.py](/Users/galew/Workspace/speak-to-user/app/runtime.py)
 
-Checks:
+Default checks:
 
 ```bash
 uv run pytest
 uv run ruff check .
 uv run mypy .
+```
+
+Coverage:
+
+```bash
+uv run pytest --cov=app --cov-report=term-missing
+```
+
+Optional sequential e2e suite:
+
+```bash
+sh scripts/run_e2e_tests.sh
+```
+
+The e2e suite starts a dedicated HTTP server on a non-live port with `SPEAK_TO_USER_PLAYBACK_BACKEND=null`, then exercises the model-generating MCP routes over HTTP.
+
+Memory-safety guidance for e2e:
+
+- stop the live stable service first so the e2e server can use that memory budget
+- do not run the e2e suite in parallel
+- do not run multiple e2e invocations at the same time
+- do not run the e2e suite alongside another model-heavy test or dev session
+
+Stop the installed stable service before e2e:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+```
+
+Restart it after e2e:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
+```
+
+If you want to run the optional e2e tests manually against an already-started dedicated server, point pytest at that server URL:
+
+```bash
+SPEAK_TO_USER_E2E_BASE_URL=http://127.0.0.1:8876/mcp uv run pytest -m e2e -q -o addopts='-q --strict-markers'
 ```

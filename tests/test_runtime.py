@@ -165,6 +165,14 @@ def test_from_env_reads_wavbuffer_settings(monkeypatch: pytest.MonkeyPatch) -> N
     assert runtime.wavbuffer_preroll_mode == "buffers"
 
 
+def test_from_env_reads_null_playback_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEAK_TO_USER_PLAYBACK_BACKEND", "null")
+
+    runtime = TTSRuntime.from_env()
+
+    assert runtime.playback_backend == "null"
+
+
 def test_from_env_defaults_wavbuffer_binary_to_bundled_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1222,6 +1230,31 @@ def test_play_speech_chunks_with_wavbuffer_fails_after_retry_budget_exhausted(
             reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
             language="en",
         )
+
+
+def test_play_speech_chunks_with_null_backend_discards_audio(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.playback_backend = "null"
+    fake_model = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
+
+    result = runtime.play_speech_chunks(
+        mode=VOICE_DESIGN_MODEL_KIND,
+        chunks=["hello"],
+        voice_description="warm",
+        language="en",
+    )
+
+    assert result["played"] is True
+    assert result["player"] == "null-sink"
+    assert result["sample_rate"] == 24000
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert any(
+        event["event"] == "speech_chunk_playback_handoff_completed"
+        and event.get("player") == "null-sink"
+        for event in recent_events
+    )
 
 
 def test_play_speech_chunks_fails_after_exhausting_underflow_retries(

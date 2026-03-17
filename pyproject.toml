@@ -18,6 +18,7 @@ dependencies = [
 dev = [
     "mypy>=1.19.1",
     "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
     "ruff>=0.15.6",
 ]
 
@@ -29,8 +30,12 @@ target-version = "py312"
 select = ["E", "F", "UP", "B"]
 
 [tool.pytest.ini_options]
-addopts = "-q"
+addopts = "-q --strict-markers -m \"not e2e\""
 testpaths = ["tests"]
+markers = [
+    "e2e: optional HTTP end-to-end tests that load the real models",
+    "serial: tests that must run alone because of memory-heavy model usage",
+]
 
 [tool.mypy]
 python_version = "3.12"
