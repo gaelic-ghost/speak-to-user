@@ -24,7 +24,6 @@ import sounddevice as sd  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
 from fastmcp.server.server import StateValue
-from app.text_chunking import chunk_text_for_tts
 
 # MARK: Constants
 
@@ -44,6 +43,7 @@ DEFAULT_WAVBUFFER_PREROLL_MODE = "seconds"
 DEFAULT_OUTPUT_STREAM_LATENCY = "high"
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
+VOICE_DESIGN_PROFILE_SEED_MAX_CHARS = 240
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_RECENT_EVENT_LIMIT = 100
 SPEECH_PROFILE_COLLECTION = "speak_to_user_profiles"
@@ -783,6 +783,10 @@ class TTSRuntime:
         normalized_text = text.strip()
         if not normalized_text:
             raise ValueError("text must not be empty")
+        if len(normalized_text) > VOICE_DESIGN_PROFILE_SEED_MAX_CHARS:
+            raise ValueError(
+                "text must be 240 characters or fewer for voice-designed profile seeds"
+            )
         normalized_voice_description = voice_description.strip()
         if not normalized_voice_description:
             raise ValueError("voice_description must not be empty")
@@ -804,7 +808,7 @@ class TTSRuntime:
             language=normalized_language,
         )
         reference_audio = self._synthesize_voice_design_reference_audio(
-            chunks=chunk_text_for_tts(normalized_text),
+            chunks=[normalized_text],
             voice_description=normalized_voice_description,
             language=normalized_language,
         )

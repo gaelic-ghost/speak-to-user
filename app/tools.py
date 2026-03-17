@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime
+import json
 from typing import cast
 
 from fastmcp import Context
@@ -10,6 +11,25 @@ from app.text_chunking import chunk_text_for_tts
 
 
 # MARK: General Helpers
+
+USAGE_GUIDE_TEXT = """speak-to-user usage guide
+
+Use speak_text for normal narrated replies.
+Use speak_text_as_clone for one-off cloning from a real local reference clip.
+Use generate_speech_profile for a reusable profile from real reference audio.
+Use generate_speech_profile_from_voice_design for a reusable profile
+from a short synthetic seed clip.
+Use speak_with_profile for repeated playback once a saved profile exists.
+
+Agent defaults:
+- prefer language=\"en\" unless the caller needs another language
+- check tts_status before assuming speech is broken
+- remember playback is global and serial across clients
+- prefer accurate reference_text when cloning from real audio
+- prefer short seed text for generate_speech_profile_from_voice_design
+  because it is not a long narration path
+"""
+
 
 def health_payload() -> dict[str, str]:
     return {
@@ -23,6 +43,46 @@ def _runtime_from_context(ctx: Context) -> TTSRuntime:
     if runtime is None:
         raise RuntimeError("TTS runtime is unavailable in lifespan context")
     return cast(TTSRuntime, runtime)
+
+
+def choose_speak_to_user_workflow_prompt() -> str:
+    return (
+        "Choose the smallest speak-to-user workflow that fits the job. "
+        "Use speak_text for ordinary narration, "
+        "speak_text_as_clone for one-off real-audio cloning, "
+        "generate_speech_profile for reusable profiles from real reference audio, "
+        "generate_speech_profile_from_voice_design for reusable profiles "
+        "from a short synthetic seed, "
+        "and speak_with_profile once a profile already exists. "
+        "Check tts_status first if readiness or "
+        "busy state is unclear."
+    )
+
+
+def guide_speech_profile_workflow_prompt() -> str:
+    return (
+        "For speech profiles, prefer real reference audio plus accurate "
+        "reference_text when available. "
+        "Use generate_speech_profile_from_voice_design only when you need "
+        "the server to synthesize a short seed clip for profile creation. "
+        "Keep seed text short and focused, then use speak_with_profile for "
+        "longer playback after the profile exists. Recreate weak profiles "
+        "from better source material instead "
+        "of reusing poor seeds."
+    )
+
+
+def usage_guide_resource() -> str:
+    return USAGE_GUIDE_TEXT
+
+
+def status_resource(ctx: Context) -> str:
+    return json.dumps(tts_status(ctx), indent=2, sort_keys=True)
+
+
+async def speech_profiles_resource(ctx: Context) -> str:
+    profiles = await list_speech_profiles(ctx)
+    return json.dumps(profiles, indent=2, sort_keys=True)
 
 
 # MARK: Tool Adapters

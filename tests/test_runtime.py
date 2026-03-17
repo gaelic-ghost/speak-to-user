@@ -448,6 +448,71 @@ def test_generate_speech_profile_from_voice_design_persists_seed_metadata(
     assert not temp_wav_path.exists()
 
 
+def test_generate_speech_profile_from_voice_design_passes_one_short_seed_chunk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    fake_clone_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_clone_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+    captured_chunks: list[str] = []
+    temp_wav_path = tmp_path / "generated.wav"
+    temp_wav_path.write_bytes(b"stub")
+
+    def fake_synthesize(**kwargs: object) -> tuple[np.ndarray, int]:
+        captured_chunks.extend(cast(list[str], kwargs["chunks"]))
+        return np.array([0.0, 0.1, 0.2], dtype=np.float32), 24000
+
+    monkeypatch.setattr(runtime, "_synthesize_voice_design_reference_audio", fake_synthesize)
+    monkeypatch.setattr(
+        runtime,
+        "_write_temp_reference_audio_file",
+        lambda **kwargs: str(temp_wav_path),
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_decode_reference_audio_file",
+        lambda path: (np.array([0.0, 0.1, 0.2], dtype=np.float32), 24000),
+    )
+
+    text = "First sentence. Second sentence. Third sentence."
+    asyncio.run(
+        runtime.generate_speech_profile_from_voice_design(
+            state_store=state_store,
+            name="demo",
+            text=text,
+            voice_description="warm and bright",
+            language="en",
+        )
+    )
+
+    assert captured_chunks == [text]
+
+
+def test_generate_speech_profile_from_voice_design_rejects_overlong_seed_text(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    overlong_text = "a" * (runtime_module.VOICE_DESIGN_PROFILE_SEED_MAX_CHARS + 1)
+
+    with pytest.raises(
+        ValueError,
+        match="text must be 240 characters or fewer for voice-designed profile seeds",
+    ):
+        asyncio.run(
+            runtime.generate_speech_profile_from_voice_design(
+                state_store=state_store,
+                name="demo",
+                text=overlong_text,
+                voice_description="warm and bright",
+                language="en",
+            )
+        )
+
+
 def test_generate_speech_profile_from_voice_design_deletes_temp_wav_on_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

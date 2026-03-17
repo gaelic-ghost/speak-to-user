@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 from pathlib import Path
 import sys
 from typing import cast
@@ -197,6 +198,7 @@ class StubRuntime:
                     "created_at": "2026-03-14T00:00:00+00:00",
                     "updated_at": "2026-03-14T00:00:00+00:00",
                     "reference_text_included": False,
+                    "profile_source": None,
                 }
             ],
             "profile_count": 1,
@@ -434,6 +436,48 @@ def test_generate_speech_profile_from_voice_design_is_plain_tool() -> None:
     asyncio.run(run())
 
 
+def test_prompts_are_registered() -> None:
+    async def run() -> None:
+        prompts = await server.mcp.list_prompts()
+        prompt_names = {prompt.name for prompt in prompts}
+        assert "choose_speak_to_user_workflow" in prompt_names
+        assert "guide_speech_profile_workflow" in prompt_names
+
+    asyncio.run(run())
+
+
+def test_resources_are_registered() -> None:
+    async def run() -> None:
+        resources = await server.mcp.list_resources()
+        resource_uris = {str(resource.uri) for resource in resources}
+        assert "guide://speak-to-user/usage" in resource_uris
+        assert "state://speak-to-user/status" in resource_uris
+        assert "state://speak-to-user/profiles" in resource_uris
+
+    asyncio.run(run())
+
+
+def test_choose_speak_to_user_workflow_prompt_renders_expected_guidance() -> None:
+    async def run() -> None:
+        result = await server.mcp.render_prompt("choose_speak_to_user_workflow")
+        text = getattr(result.messages[0].content, "text", "")
+        assert "speak_text" in text
+        assert "speak_text_as_clone" in text
+        assert "speak_with_profile" in text
+        assert "tts_status" in text
+
+    asyncio.run(run())
+
+
+def test_usage_guide_resource_reads_expected_content() -> None:
+    async def run() -> None:
+        result = await server.mcp.read_resource("guide://speak-to-user/usage")
+        assert "generate_speech_profile_from_voice_design" in result.contents[0].content
+        assert "playback is global and serial" in result.contents[0].content
+
+    asyncio.run(run())
+
+
 def test_speak_with_profile_is_plain_tool() -> None:
     async def run() -> None:
         tool = await server.mcp.get_tool("speak_with_profile")
@@ -552,6 +596,29 @@ def test_list_speech_profiles_uses_runtime() -> None:
 
     assert result["result"] == "success"
     assert result["profile_count"] == 1
+
+
+def test_status_resource_uses_runtime_status() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = server.status_resource(ctx=cast(Context, ctx))
+
+    payload = json.loads(result)
+    assert payload["ready"] is True
+    assert payload["clone_model_id"] == "Qwen/test-clone"
+
+
+def test_speech_profiles_resource_uses_runtime_profile_summary() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(server.speech_profiles_resource(ctx=cast(Context, ctx)))
+
+    payload = json.loads(result)
+    assert payload["result"] == "success"
+    assert payload["profile_count"] == 1
+    assert payload["profiles"][0]["name"] == "demo"
 
 
 def test_delete_speech_profile_uses_runtime() -> None:

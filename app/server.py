@@ -12,15 +12,20 @@ from fastmcp.server.lifespan import lifespan
 
 from app.runtime import TTSRuntime
 from app.tools import (
+    choose_speak_to_user_workflow_prompt as choose_speak_to_user_workflow_prompt_tool,
     delete_speech_profile as delete_speech_profile_tool,
     generate_speech_profile as generate_speech_profile_tool,
     generate_speech_profile_from_voice_design as generate_speech_profile_from_voice_design_tool,
+    guide_speech_profile_workflow_prompt as guide_speech_profile_workflow_prompt_tool,
     health_payload,
     list_speech_profiles as list_speech_profiles_tool,
     speak_text as speak_text_tool,
     speak_text_as_clone as speak_text_as_clone_tool,
+    speech_profiles_resource as speech_profiles_resource_tool,
     speak_with_profile as speak_with_profile_tool,
+    status_resource as status_resource_tool,
     tts_status as tts_status_tool,
+    usage_guide_resource as usage_guide_resource_tool,
 )
 
 
@@ -101,6 +106,36 @@ mcp = FastMCP(
 def health() -> dict[str, str]:
     """Return a lightweight health payload for smoke testing."""
     return health_payload()
+
+
+@mcp.prompt
+def choose_speak_to_user_workflow() -> str:
+    """Guide an agent toward the right speak-to-user tool for the job."""
+    return choose_speak_to_user_workflow_prompt_tool()
+
+
+@mcp.prompt
+def guide_speech_profile_workflow() -> str:
+    """Guide an agent through profile creation and reuse decisions."""
+    return guide_speech_profile_workflow_prompt_tool()
+
+
+@mcp.resource("guide://speak-to-user/usage")
+def usage_guide() -> str:
+    """Provide a compact usage guide for speak-to-user."""
+    return usage_guide_resource_tool()
+
+
+@mcp.resource("state://speak-to-user/status", mime_type="application/json")
+def status_resource(ctx: Context = current_context) -> str:
+    """Provide a read-only runtime status snapshot for agents."""
+    return status_resource_tool(ctx)
+
+
+@mcp.resource("state://speak-to-user/profiles", mime_type="application/json")
+async def speech_profiles_resource(ctx: Context = current_context) -> str:
+    """Provide a read-only saved-profile summary for agents."""
+    return await speech_profiles_resource_tool(ctx)
 
 
 @mcp.tool

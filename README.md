@@ -31,6 +31,20 @@ The two models solve different problems. Voice design is the default spoken-repl
 
 There is no manual load tool, no unload tool, no idle auto-unload, no detached helper process, and no file-generation path.
 
+## Prompts and Resources
+
+The server also exposes a compact FastMCP guidance surface for agent clients.
+
+- Prompts:
+  - `choose_speak_to_user_workflow`
+  - `guide_speech_profile_workflow`
+- Resources:
+  - `guide://speak-to-user/usage`
+  - `state://speak-to-user/status`
+  - `state://speak-to-user/profiles`
+
+These are meant to help agents choose the right tool, inspect live server state, and understand saved-profile usage without reading the full README every time.
+
 ## Requirements
 
 - macOS
@@ -126,6 +140,7 @@ Profile behavior:
 - profile names must be unique; duplicate creation fails
 - profiles store a precomputed Qwen clone prompt artifact rather than the original file path alone
 - voice-designed profiles also persist their seed text and voice description alongside the saved prompt artifact
+- `generate_speech_profile_from_voice_design` is intentionally a short-seed workflow and rejects seed text longer than 240 characters
 - `speak_with_profile` fails if the current clone model ID does not match the saved profile
 
 Recommended profile workflow:
@@ -133,6 +148,7 @@ Recommended profile workflow:
 - use `generate_speech_profile` once with a clean reference clip
 - prefer a short, accurate reference clip and transcript over a longer clip with messy timing, noise, or paraphrased text
 - use `generate_speech_profile_from_voice_design` when you want the server to synthesize the seed clip for you before building the reusable clone prompt
+- keep `generate_speech_profile_from_voice_design` seed text short and focused; use `speak_with_profile` for longer playback once the profile exists
 - provide `reference_text` only when it closely matches the spoken clip
 - use `list_speech_profiles` to confirm the saved profile metadata
 - use `speak_with_profile` for repeat playback instead of resupplying the same reference audio every time
