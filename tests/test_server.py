@@ -417,6 +417,7 @@ def test_server_config_from_env_uses_http_defaults(monkeypatch: pytest.MonkeyPat
     monkeypatch.delenv("SPEAK_TO_USER_HOST", raising=False)
     monkeypatch.delenv("SPEAK_TO_USER_PORT", raising=False)
     monkeypatch.delenv("SPEAK_TO_USER_MCP_PATH", raising=False)
+    monkeypatch.delenv("SPEAK_TO_USER_STATE_DIR", raising=False)
 
     config = server.server_config_from_env()
 
@@ -424,6 +425,7 @@ def test_server_config_from_env_uses_http_defaults(monkeypatch: pytest.MonkeyPat
         host="127.0.0.1",
         port=8765,
         path="/mcp",
+        state_dir=server.DEFAULT_STATE_DIR.resolve(),
     )
 
 
@@ -431,6 +433,7 @@ def test_server_config_from_env_normalizes_path(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setenv("SPEAK_TO_USER_HOST", "127.0.0.1")
     monkeypatch.setenv("SPEAK_TO_USER_PORT", "8766")
     monkeypatch.setenv("SPEAK_TO_USER_MCP_PATH", "custom-mcp")
+    monkeypatch.setenv("SPEAK_TO_USER_STATE_DIR", "~/tmp/speak-to-user-state")
 
     config = server.server_config_from_env()
 
@@ -438,6 +441,18 @@ def test_server_config_from_env_normalizes_path(monkeypatch: pytest.MonkeyPatch)
         host="127.0.0.1",
         port=8766,
         path="/custom-mcp",
+        state_dir=(Path("~/tmp/speak-to-user-state").expanduser().resolve()),
+    )
+
+
+def test_state_store_from_env_uses_filetree_layout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEAK_TO_USER_STATE_DIR", "/tmp/speak-to-user-test-state")
+
+    state_store = server.state_store_from_env()
+
+    assert str(state_store._data_directory).endswith("/tmp/speak-to-user-test-state/data")
+    assert str(state_store._metadata_directory).endswith(
+        "/tmp/speak-to-user-test-state/metadata"
     )
 
 
@@ -457,7 +472,12 @@ def test_main_runs_http_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         server,
         "server_config_from_env",
-        lambda: server.ServerConfig(host="127.0.0.1", port=8766, path="/mcp"),
+        lambda: server.ServerConfig(
+            host="127.0.0.1",
+            port=8766,
+            path="/mcp",
+            state_dir=Path("/tmp/speak-to-user-state"),
+        ),
     )
     monkeypatch.setattr(server.mcp, "run", fake_run)
 

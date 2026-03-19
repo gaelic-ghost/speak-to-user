@@ -181,6 +181,8 @@ Recommended profile workflow:
   Default: `8765`
 - `SPEAK_TO_USER_MCP_PATH`
   Default: `/mcp`
+- `SPEAK_TO_USER_STATE_DIR`
+  Default: `~/Library/Application Support/speak-to-user/state`
 - `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS`
   Default: `3.0`
 - `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS`
@@ -215,6 +217,7 @@ Operational notes:
 - `load_model` and `unload_model` operate on concrete model ids reported by `tts_status`
 - `unload_model` refuses to evict a model while that model has queued or active jobs
 - `set_startup_model` accepts `none`, `all`, or one of the configured model ids and persists that choice in the FastMCP state store
+- `SPEAK_TO_USER_STATE_DIR` controls where the FastMCP file-backed state store keeps persisted startup settings and saved speech profiles
 - if a speech or profile tool needs a model that is not loaded, the client should load it and retry; clients with FastMCP elicitation support can accept an in-band load prompt instead
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time
@@ -341,8 +344,8 @@ Optional sequential e2e suite:
 sh scripts/run_e2e_tests.sh
 ```
 
-The e2e suite starts a dedicated HTTP server on a non-live port with `SPEAK_TO_USER_PLAYBACK_BACKEND=null`, then exercises the model-generating MCP routes over HTTP.
-It now uses [scripts/wait_for_service_ready.sh](scripts/wait_for_service_ready.sh) to poll `tts_status` until `ready == true` without filling the terminal with connection-traceback noise.
+The e2e suite manages its own dedicated HTTP server on a non-live port with `SPEAK_TO_USER_PLAYBACK_BACKEND=null`, then exercises the full HTTP control surface over real server starts and restarts.
+It covers prompts, resources, all public tools, high-signal failure paths, and restart persistence for the startup-model setting and persisted profiles.
 
 Memory-safety guidance for e2e:
 
@@ -363,10 +366,13 @@ Restart it after e2e:
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.galew.speak-to-user.stable.plist
 ```
 
-If you want to run the optional e2e tests manually against an already-started dedicated server, point pytest at that server URL:
+If you want to run the optional e2e tests directly without the wrapper script, provide the dedicated host, port, and path the managed test server should use:
 
 ```bash
-SPEAK_TO_USER_E2E_BASE_URL=http://127.0.0.1:8876/mcp uv run pytest -m e2e -q -o addopts='-q --strict-markers'
+SPEAK_TO_USER_E2E_HOST=127.0.0.1 \
+SPEAK_TO_USER_E2E_PORT=8876 \
+SPEAK_TO_USER_E2E_PATH=/mcp \
+uv run pytest -m e2e -q -o addopts='-q --strict-markers'
 ```
 
 Automation:

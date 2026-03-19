@@ -7,17 +7,9 @@ E2E_HOST="${SPEAK_TO_USER_E2E_HOST:-127.0.0.1}"
 E2E_PORT="${SPEAK_TO_USER_E2E_PORT:-8876}"
 E2E_PATH="${SPEAK_TO_USER_E2E_PATH:-/mcp}"
 E2E_BASE_URL="http://${E2E_HOST}:${E2E_PORT}${E2E_PATH}"
-LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/speak-to-user-e2e.XXXXXX")
-SERVER_STDOUT="${LOG_DIR}/server.stdout.log"
-SERVER_STDERR="${LOG_DIR}/server.stderr.log"
-SERVER_PID=""
 
 cleanup() {
-    if [ -n "${SERVER_PID}" ]; then
-        kill "${SERVER_PID}" >/dev/null 2>&1 || true
-        wait "${SERVER_PID}" 2>/dev/null || true
-    fi
-    rm -rf "${LOCK_DIR}" "${LOG_DIR}"
+    rm -rf "${LOCK_DIR}"
 }
 
 trap cleanup EXIT INT TERM
@@ -37,41 +29,11 @@ if launchctl print "gui/$(id -u)/com.galew.speak-to-user.stable" >/dev/null 2>&1
     exit 1
 fi
 
-echo "Starting a dedicated e2e server at ${E2E_BASE_URL}"
-echo "This suite is intentionally sequential. Do not run another model-heavy test job at the same time."
-
-(
-    cd "${ROOT_DIR}" && \
-        SPEAK_TO_USER_HOST="${E2E_HOST}" \
-        SPEAK_TO_USER_PORT="${E2E_PORT}" \
-        SPEAK_TO_USER_MCP_PATH="${E2E_PATH}" \
-        SPEAK_TO_USER_PLAYBACK_BACKEND="null" \
-        uv run python app/server.py >"${SERVER_STDOUT}" 2>"${SERVER_STDERR}"
-) &
-SERVER_PID=$!
-
-READY=0
-if ! kill -0 "${SERVER_PID}" >/dev/null 2>&1; then
-    echo "The dedicated e2e server exited before it became ready."
-    echo "stderr log:"
-    cat "${SERVER_STDERR}" || true
-    exit 1
-fi
-
-if sh "${ROOT_DIR}/scripts/wait_for_service_ready.sh" 120 "${E2E_BASE_URL}"; then
-    READY=1
-fi
-
-if [ "${READY}" -ne 1 ]; then
-    echo "Timed out waiting for the dedicated e2e server at ${E2E_BASE_URL}"
-    echo "stderr log:"
-    cat "${SERVER_STDERR}" || true
-    exit 1
-fi
-
 echo "Running uv run pytest -m e2e -q"
 (
     cd "${ROOT_DIR}" && \
-        SPEAK_TO_USER_E2E_BASE_URL="${E2E_BASE_URL}" \
+        SPEAK_TO_USER_E2E_HOST="${E2E_HOST}" \
+        SPEAK_TO_USER_E2E_PORT="${E2E_PORT}" \
+        SPEAK_TO_USER_E2E_PATH="${E2E_PATH}" \
         uv run pytest -m e2e -q -o addopts='-q --strict-markers'
 )

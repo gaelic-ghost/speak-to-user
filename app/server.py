@@ -9,6 +9,7 @@ if __package__ in {None, ""}:
 from fastmcp import Context, FastMCP
 from fastmcp.dependencies import CurrentContext
 from fastmcp.server.lifespan import lifespan
+from key_value.aio.stores.filetree.store import FileTreeStore
 
 from app.runtime import TTSRuntime
 from app.tools import (
@@ -37,6 +38,13 @@ from app.tools import (
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_HTTP_PATH = "/mcp"
+DEFAULT_STATE_DIR = (
+    Path.home()
+    / "Library"
+    / "Application Support"
+    / "speak-to-user"
+    / "state"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +52,7 @@ class ServerConfig:
     host: str
     port: int
     path: str
+    state_dir: Path
 
 
 def _normalize_http_host(value: str) -> str:
@@ -80,11 +89,27 @@ def _normalize_http_path(value: str) -> str:
     return normalized
 
 
+def _normalize_state_dir(value: str | None) -> Path:
+    raw = (value or str(DEFAULT_STATE_DIR)).strip()
+    if not raw:
+        raise ValueError("SPEAK_TO_USER_STATE_DIR must not be empty")
+    return Path(raw).expanduser().resolve()
+
+
+def state_store_from_env() -> FileTreeStore:
+    state_dir = _normalize_state_dir(os.getenv("SPEAK_TO_USER_STATE_DIR"))
+    return FileTreeStore(
+        data_directory=state_dir / "data",
+        metadata_directory=state_dir / "metadata",
+    )
+
+
 def server_config_from_env() -> ServerConfig:
     return ServerConfig(
         host=_normalize_http_host(os.getenv("SPEAK_TO_USER_HOST", DEFAULT_HTTP_HOST)),
         port=_normalize_http_port(os.getenv("SPEAK_TO_USER_PORT")),
         path=_normalize_http_path(os.getenv("SPEAK_TO_USER_MCP_PATH", DEFAULT_HTTP_PATH)),
+        state_dir=_normalize_state_dir(os.getenv("SPEAK_TO_USER_STATE_DIR")),
     )
 
 
@@ -102,6 +127,7 @@ current_context = CurrentContext()
 mcp = FastMCP(
     "speak-to-user",
     lifespan=app_lifespan,
+    session_state_store=state_store_from_env(),
 )
 
 
