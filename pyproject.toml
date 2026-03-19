@@ -1,6 +1,6 @@
 [project]
 name = "speak-to-user"
-version = "0.3.0"
+version = "0.4.0"
 description = "A localhost FastMCP server for coding agents to interact with users via text to speech."
 readme = "README.md"
 license = { file = "LICENSE" }
