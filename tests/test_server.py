@@ -479,9 +479,7 @@ def test_state_store_from_env_migrates_legacy_default_state(
     assert (new_default_dir / "data" / "profiles.json").read_text(encoding="utf-8") == (
         "profile-data"
     )
-    assert (
-        new_default_dir / "metadata" / "startup.json"
-    ).read_text(encoding="utf-8") == "startup-data"
+    assert not (new_default_dir / "metadata" / "startup.json").exists()
 
 
 def test_state_store_from_env_does_not_migrate_when_state_dir_is_explicit(
@@ -530,6 +528,47 @@ def test_state_store_from_env_prefers_existing_new_default_state(
     assert (new_default_dir / "data" / "profiles.json").read_text(encoding="utf-8") == (
         "new-state"
     )
+
+
+def test_state_store_from_env_rebuilds_stale_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    new_default_dir = tmp_path / "new-default"
+    legacy_default_dir = tmp_path / "legacy-default"
+    data_dir = new_default_dir / "data" / "speak_to_user_runtime"
+    metadata_dir = new_default_dir / "metadata"
+    data_dir.mkdir(parents=True)
+    metadata_dir.mkdir(parents=True)
+    (data_dir / "startup_model_option.json").write_text(
+        json.dumps({"version": 1, "value": {"value": "all"}}),
+        encoding="utf-8",
+    )
+    (metadata_dir / "speak_to_user_runtime-info.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "collection": "speak_to_user_runtime",
+                "directory": str(
+                    legacy_default_dir / "data" / "speak_to_user_runtime"
+                ),
+                "created_at": "2026-03-19T00:00:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("SPEAK_TO_USER_STATE_DIR", raising=False)
+    monkeypatch.setattr(server, "DEFAULT_STATE_DIR", new_default_dir)
+    monkeypatch.setattr(server, "LEGACY_DEFAULT_STATE_DIR", legacy_default_dir)
+
+    async def run() -> None:
+        state_store = server.state_store_from_env()
+        assert await state_store.get(
+            key="startup_model_option",
+            collection="speak_to_user_runtime",
+        ) == {"value": "all"}
+
+    asyncio.run(run())
 
 
 def test_server_config_from_env_rejects_invalid_port(monkeypatch: pytest.MonkeyPatch) -> None:

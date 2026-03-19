@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import shutil
@@ -118,14 +119,52 @@ def _state_dir_has_store_data(state_dir: Path) -> bool:
 
 
 def _copy_state_directory_contents(*, source_dir: Path, destination_dir: Path) -> None:
-    source_data_dir, source_metadata_dir = _state_store_subdirectories(source_dir)
-    destination_data_dir, destination_metadata_dir = _state_store_subdirectories(destination_dir)
+    source_data_dir, _ = _state_store_subdirectories(source_dir)
+    destination_data_dir, _ = _state_store_subdirectories(destination_dir)
     destination_dir.mkdir(parents=True, exist_ok=True)
 
     if source_data_dir.exists():
         shutil.copytree(source_data_dir, destination_data_dir, dirs_exist_ok=True)
-    if source_metadata_dir.exists():
-        shutil.copytree(source_metadata_dir, destination_metadata_dir, dirs_exist_ok=True)
+
+
+def _path_is_within_directory(*, path: Path, directory: Path) -> bool:
+    resolved_path = path.resolve()
+    resolved_directory = directory.resolve()
+    return resolved_path == resolved_directory or resolved_path.is_relative_to(resolved_directory)
+
+
+def _state_store_metadata_requires_rebuild(state_dir: Path) -> bool:
+    data_dir, metadata_dir = _state_store_subdirectories(state_dir)
+    if not metadata_dir.exists():
+        return False
+
+    for metadata_entry in metadata_dir.glob("*.json"):
+        try:
+            payload = json.loads(metadata_entry.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return True
+
+        entry_directory = payload.get("directory")
+        if not isinstance(entry_directory, str):
+            return True
+        if not _path_is_within_directory(
+            path=Path(entry_directory).expanduser(),
+            directory=data_dir,
+        ):
+            return True
+
+    return False
+
+
+def _rebuild_state_store_metadata(state_dir: Path) -> None:
+    _, metadata_dir = _state_store_subdirectories(state_dir)
+    if metadata_dir.exists():
+        shutil.rmtree(metadata_dir)
+
+
+def _prepare_runtime_state_dir(state_dir: Path) -> None:
+    if _state_store_metadata_requires_rebuild(state_dir):
+        _rebuild_state_store_metadata(state_dir)
 
 
 def _resolved_runtime_state_dir() -> Path:
@@ -148,6 +187,7 @@ def _resolved_runtime_state_dir() -> Path:
 
 def state_store_from_env() -> FileTreeStore:
     state_dir = _resolved_runtime_state_dir()
+    _prepare_runtime_state_dir(state_dir)
     data_directory, metadata_directory = _state_store_subdirectories(state_dir)
     return FileTreeStore(
         data_directory=data_directory,
