@@ -27,7 +27,12 @@ class StubRuntime:
             "last_used_at": None,
             "last_loaded_at": None,
             "last_error": None,
+            "startup_model_option": "all",
+            "startup_model_options": ["none", "all", "Qwen/test-voice-design", "Qwen/test-clone"],
+            "startup_model_ids": ["Qwen/test-voice-design", "Qwen/test-clone"],
+            "loaded_model_ids": ["Qwen/test-voice-design", "Qwen/test-clone"],
             "voice_design_model_enabled": True,
+            "voice_design_model_startup_enabled": True,
             "voice_design_model_loaded": True,
             "voice_design_model_id": "Qwen/test-voice-design",
             "voice_design_device": "cpu",
@@ -36,6 +41,7 @@ class StubRuntime:
             "voice_design_last_error": None,
             "voice_design_cpu_fallback_active": False,
             "clone_model_enabled": True,
+            "clone_model_startup_enabled": True,
             "clone_model_loaded": True,
             "clone_model_id": "Qwen/test-clone",
             "clone_device": "cpu",
@@ -69,9 +75,79 @@ class StubRuntime:
         self.generated_profiles: list[dict[str, object]] = []
         self.generated_voice_designed_profiles: list[dict[str, object]] = []
         self.deleted_profiles: list[str] = []
+        self.loaded_model_ids: list[str] = []
+        self.unloaded_model_ids: list[str] = []
+        self.startup_options: list[str] = []
 
     def status(self) -> dict[str, object]:
         return dict(self.status_payload)
+
+    def available_model_ids(self) -> list[str]:
+        return ["Qwen/test-voice-design", "Qwen/test-clone"]
+
+    def model_kind_for_id(self, model_id: str) -> str:
+        if model_id == "Qwen/test-voice-design":
+            return "voice_design"
+        if model_id == "Qwen/test-clone":
+            return "clone"
+        raise ValueError(f"unknown model_id {model_id}")
+
+    def missing_required_model_ids(self, *, model_kinds: list[str]) -> list[str]:
+        missing: list[str] = []
+        for model_kind in model_kinds:
+            if (
+                model_kind == "voice_design"
+                and not self.status_payload["voice_design_model_loaded"]
+            ):
+                missing.append("Qwen/test-voice-design")
+            if model_kind == "clone" and not self.status_payload["clone_model_loaded"]:
+                missing.append("Qwen/test-clone")
+        return missing
+
+    def required_models_not_loaded_message(self, *, model_kinds: list[str]) -> str:
+        missing_model_ids = self.missing_required_model_ids(model_kinds=model_kinds)
+        joined = ", ".join(missing_model_ids)
+        return f"required models are not loaded: {joined}"
+
+    def load_model(self, **kwargs: object) -> dict[str, object]:
+        model_id = cast(
+            str,
+            kwargs.get("model_id") or self.available_model_ids()[0],
+        )
+        model_kind = cast(str | None, kwargs.get("model_kind"))
+        if model_kind == "clone":
+            model_id = "Qwen/test-clone"
+        if model_kind == "voice_design":
+            model_id = "Qwen/test-voice-design"
+        self.loaded_model_ids.append(model_id)
+        if model_id == "Qwen/test-voice-design":
+            self.status_payload["voice_design_model_loaded"] = True
+        if model_id == "Qwen/test-clone":
+            self.status_payload["clone_model_loaded"] = True
+        return {"result": "success", "loaded": True, "model_id": model_id, **self.status()}
+
+    def unload_model(self, **kwargs: object) -> dict[str, object]:
+        model_id = cast(
+            str,
+            kwargs.get("model_id") or self.available_model_ids()[0],
+        )
+        model_kind = cast(str | None, kwargs.get("model_kind"))
+        if model_kind == "clone":
+            model_id = "Qwen/test-clone"
+        if model_kind == "voice_design":
+            model_id = "Qwen/test-voice-design"
+        self.unloaded_model_ids.append(model_id)
+        if model_id == "Qwen/test-voice-design":
+            self.status_payload["voice_design_model_loaded"] = False
+        if model_id == "Qwen/test-clone":
+            self.status_payload["clone_model_loaded"] = False
+        return {"result": "success", "unloaded": True, "model_id": model_id, **self.status()}
+
+    async def set_startup_model(self, **kwargs: object) -> dict[str, object]:
+        option = cast(str, kwargs["option"])
+        self.startup_options.append(option)
+        self.status_payload["startup_model_option"] = option
+        return {"result": "success", "startup_model_option": option, **self.status()}
 
     def speak_text(self, **kwargs: object) -> dict[str, object]:
         chunks = list(cast(list[str], kwargs.get("chunks", [])))
@@ -279,6 +355,16 @@ class StubContext:
         self.lifespan_context = {"runtime": runtime}
         self.fastmcp = StubFastMCP()
 
+    async def elicit(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("elicitation not expected in this test")
+
+
+class AcceptingContext(StubContext):
+    async def elicit(self, *args: object, **kwargs: object) -> object:
+        del args, kwargs
+        return type("Accepted", (), {"action": "accept", "data": "load"})()
+
 
 def test_tts_status_uses_lifespan_runtime() -> None:
     runtime = StubRuntime()
@@ -294,7 +380,8 @@ def test_app_lifespan_preloads_and_shuts_down(monkeypatch) -> None:
     events: list[str] = []
 
     class FakeRuntime:
-        def preload(self) -> dict[str, object]:
+        async def preload(self, *, state_store: object) -> dict[str, object]:
+            assert state_store is server.mcp._state_store
             events.append("preload")
             return {"result": "success", "loaded": True}
 
@@ -422,6 +509,24 @@ def test_generate_speech_profile_is_plain_tool() -> None:
     asyncio.run(run())
 
 
+def test_model_management_tools_are_registered() -> None:
+    async def run() -> None:
+        load_tool = await server.mcp.get_tool("load_model")
+        unload_tool = await server.mcp.get_tool("unload_model")
+        startup_tool = await server.mcp.get_tool("set_startup_model")
+        assert load_tool is not None
+        assert unload_tool is not None
+        assert startup_tool is not None
+        load_properties = cast(dict[str, object], load_tool.parameters["properties"])
+        unload_properties = cast(dict[str, object], unload_tool.parameters["properties"])
+        startup_properties = cast(dict[str, object], startup_tool.parameters["properties"])
+        assert load_properties.get("model_id") is not None
+        assert unload_properties.get("model_id") is not None
+        assert startup_properties.get("option") is not None
+
+    asyncio.run(run())
+
+
 def test_generate_speech_profile_from_voice_design_is_plain_tool() -> None:
     async def run() -> None:
         tool = await server.mcp.get_tool("generate_speech_profile_from_voice_design")
@@ -495,10 +600,12 @@ def test_speak_text_queues_audio() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
 
-    result = server.speak_text(
-        "hello",
-        "warm",
-        ctx=cast(Context, ctx),
+    result = asyncio.run(
+        server.speak_text(
+            "hello",
+            "warm",
+            ctx=cast(Context, ctx),
+        )
     )
 
     assert result["result"] == "success"
@@ -513,15 +620,34 @@ def test_speak_text_queues_audio() -> None:
     ]
 
 
+def test_speak_text_can_load_missing_model_via_elicitation() -> None:
+    runtime = StubRuntime()
+    runtime.status_payload["voice_design_model_loaded"] = False
+    ctx = AcceptingContext(runtime)
+
+    result = asyncio.run(
+        server.speak_text(
+            "hello",
+            "warm",
+            ctx=cast(Context, ctx),
+        )
+    )
+
+    assert result["result"] == "success"
+    assert runtime.loaded_model_ids == ["Qwen/test-voice-design"]
+
+
 def test_speak_text_as_clone_queues_audio() -> None:
     runtime = StubRuntime()
     ctx = StubContext(runtime)
 
-    result = server.speak_text_as_clone(
-        "hello",
-        "voice.wav",
-        "reference text",
-        ctx=cast(Context, ctx),
+    result = asyncio.run(
+        server.speak_text_as_clone(
+            "hello",
+            "voice.wav",
+            "reference text",
+            ctx=cast(Context, ctx),
+        )
     )
 
     assert result["result"] == "success"
@@ -656,3 +782,33 @@ def test_speak_with_profile_queues_audio() -> None:
         "chunks": ["hello"],
         "language": "en",
     }
+
+
+def test_load_model_delegates_to_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = server.load_model("Qwen/test-clone", ctx=cast(Context, ctx))
+
+    assert result["result"] == "success"
+    assert runtime.loaded_model_ids == ["Qwen/test-clone"]
+
+
+def test_unload_model_delegates_to_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = server.unload_model("Qwen/test-clone", ctx=cast(Context, ctx))
+
+    assert result["result"] == "success"
+    assert runtime.unloaded_model_ids == ["Qwen/test-clone"]
+
+
+def test_set_startup_model_delegates_to_runtime() -> None:
+    runtime = StubRuntime()
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(server.set_startup_model("none", ctx=cast(Context, ctx)))
+
+    assert result["result"] == "success"
+    assert runtime.startup_options == ["none"]

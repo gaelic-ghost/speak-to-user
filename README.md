@@ -21,6 +21,9 @@ The two models solve different problems. Voice design is the default spoken-repl
 
 - `health`: simple smoke-test response.
 - `tts_status`: reports queue status, observability events, and separate status for the voice-design and clone models.
+- `load_model`: loads one resident model by model id.
+- `unload_model`: unloads one resident model by model id.
+- `set_startup_model`: persists which model or models preload on server startup.
 - `speak_text`: enqueues one full text job for the voice-design model.
 - `speak_text_as_clone`: enqueues one full text job for the clone model using a local reference audio file and optional reference text.
 - `generate_speech_profile`: stores a named reusable clone prompt artifact in the server's persistent state store.
@@ -29,7 +32,7 @@ The two models solve different problems. Voice design is the default spoken-repl
 - `delete_speech_profile`: deletes a saved speech profile by name.
 - `speak_with_profile`: enqueues one full text job using a previously saved speech profile.
 
-There is no manual load tool, no unload tool, no idle auto-unload, no detached helper process, and no file-generation path.
+There is no idle auto-unload, no detached helper process, and no file-generation path.
 
 ## Prompts and Resources
 
@@ -66,7 +69,7 @@ uv run python app/server.py
 
 By default, the entrypoint serves MCP over HTTP at `http://127.0.0.1:8765/mcp`.
 
-Server startup blocks until all enabled models are loaded. After that, both `speak_text` and `speak_text_as_clone` push one full text job into one in-process FIFO queue. Every request is chunked before playback, and the worker synthesizes ahead into a bounded waveform queue.
+Server startup now blocks only until the configured startup model selection is loaded. That selection is persisted with FastMCP storage through `set_startup_model`, and it can be `none`, `all`, or one of the concrete model ids. After startup, speech tools require their model to already be loaded; when the connected client supports FastMCP elicitation, the server can ask whether it should load the missing model before retrying. Every request is still chunked before playback, and the worker synthesizes ahead into a bounded waveform queue.
 
 With the default `sounddevice` backend, the runtime itself owns preroll and writes later chunks through one in-process output stream. With the optional `wavbuffer` backend, the runtime instead wraps each synthesized chunk into a complete WAV buffer and streams those buffers into a prebuilt native Swift playback binary, which owns preroll and underrun detection for that path. During active work, `tts_status` exposes whether the runtime is still synthesizing audio or has reached device playback, plus which synthesis mode and playback backend are active.
 
@@ -158,8 +161,10 @@ Recommended profile workflow:
 
 - `SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL`
   Default: `true`
+  Used as the default startup preload preference when no persisted `set_startup_model` value exists yet.
 - `SPEAK_TO_USER_ENABLE_CLONE_MODEL`
   Default: `true`
+  Used as the default startup preload preference when no persisted `set_startup_model` value exists yet.
 - `SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID`
   Default: `Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign`
 - `SPEAK_TO_USER_CLONE_MODEL_ID`
@@ -206,7 +211,11 @@ Runtime language inputs accept either full language names understood by the mode
 Operational notes:
 
 - enabling both resident models increases steady RAM usage
-- startup time increases when both models are enabled because preload waits for both
+- startup time increases when the persisted startup option resolves to both models because preload waits for both
+- `load_model` and `unload_model` operate on concrete model ids reported by `tts_status`
+- `unload_model` refuses to evict a model while that model has queued or active jobs
+- `set_startup_model` accepts `none`, `all`, or one of the configured model ids and persists that choice in the FastMCP state store
+- if a speech or profile tool needs a model that is not loaded, the client should load it and retry; clients with FastMCP elicitation support can accept an in-band load prompt instead
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time
 - `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback retries the current chunk after a playback underflow or `wavbuffer` starvation event

@@ -18,13 +18,16 @@ from app.tools import (
     generate_speech_profile_from_voice_design as generate_speech_profile_from_voice_design_tool,
     guide_speech_profile_workflow_prompt as guide_speech_profile_workflow_prompt_tool,
     health_payload,
+    load_model as load_model_tool,
     list_speech_profiles as list_speech_profiles_tool,
     speak_text as speak_text_tool,
     speak_text_as_clone as speak_text_as_clone_tool,
     speech_profiles_resource as speech_profiles_resource_tool,
     speak_with_profile as speak_with_profile_tool,
     status_resource as status_resource_tool,
+    set_startup_model as set_startup_model_tool,
     tts_status as tts_status_tool,
+    unload_model as unload_model_tool,
     usage_guide_resource as usage_guide_resource_tool,
 )
 
@@ -88,7 +91,7 @@ def server_config_from_env() -> ServerConfig:
 @lifespan
 async def app_lifespan(_server: FastMCP):
     runtime = TTSRuntime.from_env()
-    runtime.preload()
+    await runtime.preload(state_store=_server._state_store)
     try:
         yield {"runtime": runtime}
     finally:
@@ -197,14 +200,50 @@ def tts_status(ctx: Context = current_context) -> dict[str, object]:
 
 
 @mcp.tool
-def speak_text(
+def load_model(
+    model_id: str,
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Load one resident voice model by model id."""
+    return load_model_tool(
+        ctx,
+        model_id=model_id,
+    )
+
+
+@mcp.tool
+def unload_model(
+    model_id: str,
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Unload one resident voice model by model id."""
+    return unload_model_tool(
+        ctx,
+        model_id=model_id,
+    )
+
+
+@mcp.tool
+async def set_startup_model(
+    option: str,
+    ctx: Context = current_context,
+) -> dict[str, object]:
+    """Persist which model or models preload on server startup."""
+    return await set_startup_model_tool(
+        ctx,
+        option=option,
+    )
+
+
+@mcp.tool
+async def speak_text(
     text: str,
     voice_description: str,
     language: str = "en",
     ctx: Context = current_context,
 ) -> dict[str, object]:
     """Queue one full text job for local audio playback on this machine."""
-    return speak_text_tool(
+    return await speak_text_tool(
         ctx,
         text=text,
         voice_description=voice_description,
@@ -213,7 +252,7 @@ def speak_text(
 
 
 @mcp.tool
-def speak_text_as_clone(
+async def speak_text_as_clone(
     text: str,
     reference_audio_path: str,
     reference_text: str | None = None,
@@ -221,7 +260,7 @@ def speak_text_as_clone(
     ctx: Context = current_context,
 ) -> dict[str, object]:
     """Queue one full text job for local playback using the clone voice model."""
-    return speak_text_as_clone_tool(
+    return await speak_text_as_clone_tool(
         ctx,
         text=text,
         reference_audio_path=reference_audio_path,

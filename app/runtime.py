@@ -48,6 +48,10 @@ DEFAULT_LOG_LEVEL = "info"
 DEFAULT_RECENT_EVENT_LIMIT = 100
 SPEECH_PROFILE_COLLECTION = "speak_to_user_profiles"
 SPEECH_PROFILE_INDEX_KEY = "index"
+RUNTIME_CONFIGURATION_COLLECTION = "speak_to_user_runtime"
+STARTUP_MODEL_OPTION_KEY = "startup_model_option"
+STARTUP_MODEL_OPTION_NONE = "none"
+STARTUP_MODEL_OPTION_ALL = "all"
 LOG_LEVEL_PRIORITY = {"minimal": 0, "info": 1, "debug": 2}
 LANGUAGE_ALIASES = {
     "auto": "Auto",
@@ -134,6 +138,22 @@ def _normalize_enabled_flag(
     if value in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"{env_var} must be one of: true, false, 1, 0, yes, no, on, off")
+
+
+def _default_startup_model_option(
+    *,
+    voice_design_model_id: str,
+    clone_model_id: str,
+    enable_voice_design_model: bool,
+    enable_clone_model: bool,
+) -> str:
+    if enable_voice_design_model and enable_clone_model:
+        return STARTUP_MODEL_OPTION_ALL
+    if enable_voice_design_model:
+        return voice_design_model_id
+    if enable_clone_model:
+        return clone_model_id
+    return STARTUP_MODEL_OPTION_NONE
 
 
 def _normalize_device(raw: str | None) -> str:
@@ -419,6 +439,13 @@ class TTSRuntime:
         self.clone_model_id = clone_model_id
         self.enable_voice_design_model = enable_voice_design_model
         self.enable_clone_model = enable_clone_model
+        self._default_startup_model_option = _default_startup_model_option(
+            voice_design_model_id=voice_design_model_id,
+            clone_model_id=clone_model_id,
+            enable_voice_design_model=enable_voice_design_model,
+            enable_clone_model=enable_clone_model,
+        )
+        self._startup_model_option = self._default_startup_model_option
         self.device_preference = device_preference
         self.torch_dtype_name = torch_dtype_name
         self.speech_queue_maxsize = speech_queue_maxsize
@@ -447,14 +474,18 @@ class TTSRuntime:
         self._model_slots: dict[str, dict[str, Any]] = {
             VOICE_DESIGN_MODEL_KIND: self._new_model_slot(
                 model_id=voice_design_model_id,
-                enabled=enable_voice_design_model,
+                startup_enabled=enable_voice_design_model,
             ),
             CLONE_MODEL_KIND: self._new_model_slot(
                 model_id=clone_model_id,
-                enabled=enable_clone_model,
+                startup_enabled=enable_clone_model,
             ),
         }
         self._last_error: str | None = None
+        self._queued_jobs_by_mode = {
+            VOICE_DESIGN_MODEL_KIND: 0,
+            CLONE_MODEL_KIND: 0,
+        }
 
         self._speech_in_progress = False
         self._speech_phase = DEFAULT_SPEECH_PHASE
@@ -540,24 +571,27 @@ class TTSRuntime:
             log_level=_normalize_log_level(os.getenv("SPEAK_TO_USER_LOG_LEVEL")),
         )
 
-    def preload(self) -> dict[str, Any]:
+    async def preload(self, *, state_store: Any) -> dict[str, Any]:
         self._emit_runtime_event("runtime_preload_started", level="minimal")
         self.start_speech_worker()
 
-        enabled_model_kinds = self._enabled_model_kinds()
-        for model_kind in enabled_model_kinds:
+        startup_model_option = await self._load_startup_model_option(state_store=state_store)
+        startup_model_kinds = self._startup_model_kinds_for_option(startup_model_option)
+        for model_kind in startup_model_kinds:
             self.load_model(model_kind=model_kind)
 
         result = {
             "result": "success",
-            "loaded": self._all_enabled_models_loaded_locked(),
-            "loaded_model_kinds": enabled_model_kinds,
+            "loaded": self._all_startup_models_loaded_locked(),
+            "loaded_model_kinds": startup_model_kinds,
+            "startup_model_option": startup_model_option,
             **self.status(),
         }
         self._emit_runtime_event(
             "runtime_preload_completed",
             level="minimal",
-            enabled_model_kinds=enabled_model_kinds,
+            startup_model_option=startup_model_option,
+            startup_model_kinds=startup_model_kinds,
         )
         return result
 
@@ -603,6 +637,50 @@ class TTSRuntime:
         with self._lock:
             return self._status_payload_locked()
 
+    def available_model_ids(self) -> list[str]:
+        return [self.voice_design_model_id, self.clone_model_id]
+
+    def available_startup_model_options(self) -> list[str]:
+        return [
+            STARTUP_MODEL_OPTION_NONE,
+            STARTUP_MODEL_OPTION_ALL,
+            *self.available_model_ids(),
+        ]
+
+    def model_kind_for_id(self, model_id: str) -> str:
+        normalized_model_id = model_id.strip()
+        if normalized_model_id == self.voice_design_model_id:
+            return VOICE_DESIGN_MODEL_KIND
+        if normalized_model_id == self.clone_model_id:
+            return CLONE_MODEL_KIND
+        raise ValueError(
+            "model_id must be one of: "
+            f"{', '.join(self.available_model_ids())}"
+        )
+
+    def missing_required_model_ids(self, *, model_kinds: list[str]) -> list[str]:
+        with self._lock:
+            return [
+                cast(str, self._model_state(model_kind)["model_id"])
+                for model_kind in model_kinds
+                if self._model_state(model_kind)["model"] is None
+            ]
+
+    def required_models_not_loaded_message(self, *, model_kinds: list[str]) -> str:
+        missing_model_ids = self.missing_required_model_ids(model_kinds=model_kinds)
+        if not missing_model_ids:
+            return ""
+        if len(missing_model_ids) == 1:
+            return (
+                f"required model `{missing_model_ids[0]}` is not loaded; "
+                "call load_model with that model_id and then retry"
+            )
+        joined_model_ids = ", ".join(f"`{model_id}`" for model_id in missing_model_ids)
+        return (
+            f"required models {joined_model_ids} are not loaded; "
+            "call load_model for each required model_id and then retry"
+        )
+
     def load_model(self, *, model_kind: str = VOICE_DESIGN_MODEL_KIND) -> dict[str, Any]:
         if not _runtime_dependencies_ready():
             dependency_status = _runtime_dependency_status()
@@ -627,8 +705,6 @@ class TTSRuntime:
             slot = self._model_state(model_kind)
             if self._shutdown_requested.is_set():
                 raise RuntimeError("runtime is shutting down")
-            if not slot["enabled"]:
-                raise RuntimeError(f"{model_kind} model is disabled")
             if slot["model"] is not None:
                 self._touch_model_locked(model_kind)
                 self._emit_runtime_event(
@@ -691,6 +767,74 @@ class TTSRuntime:
                 "info": f"{model_kind} model loaded",
                 **self._status_payload_locked(),
             }
+
+    def unload_model(self, *, model_kind: str = VOICE_DESIGN_MODEL_KIND) -> dict[str, Any]:
+        with self._lock:
+            slot = self._model_state(model_kind)
+            if self._speech_current_mode == model_kind:
+                raise RuntimeError(
+                    f"{model_kind} model is busy with an active speech job and cannot be unloaded"
+                )
+            if self._queued_jobs_by_mode[model_kind] > 0:
+                raise RuntimeError(
+                    f"{model_kind} model has queued speech jobs and cannot be unloaded"
+                )
+            if slot["model"] is None:
+                self._emit_runtime_event(
+                    "model_unload_skipped_already_unloaded",
+                    level="debug",
+                    model_kind=model_kind,
+                )
+                return {
+                    "result": "success",
+                    "unloaded": False,
+                    "info": f"{model_kind} model already unloaded",
+                    **self._status_payload_locked(),
+                }
+
+            model = slot["model"]
+            resolved_device = slot["resolved_device"]
+            slot["model"] = None
+            slot["resolved_device"] = None
+            slot["last_error"] = None
+            slot["cpu_fallback_active"] = False
+            self._last_error = None
+
+        self._release_model_resources(model, resolved_device=resolved_device)
+        gc.collect()
+        self._emit_runtime_event(
+            "model_unload_completed",
+            level="minimal",
+            model_kind=model_kind,
+        )
+        return {
+            "result": "success",
+            "unloaded": True,
+            "info": f"{model_kind} model unloaded",
+            **self.status(),
+        }
+
+    async def set_startup_model(self, *, state_store: Any, option: str) -> dict[str, Any]:
+        normalized_option = self._normalize_startup_model_option(option)
+        await state_store.put(
+            key=STARTUP_MODEL_OPTION_KEY,
+            collection=RUNTIME_CONFIGURATION_COLLECTION,
+            value=StateValue(value=normalized_option),
+        )
+        with self._lock:
+            self._set_startup_model_option_locked(normalized_option)
+            status_payload = self._status_payload_locked()
+        self._emit_runtime_event(
+            "startup_model_option_saved",
+            level="minimal",
+            startup_model_option=normalized_option,
+            startup_model_kinds=self._startup_model_kinds_for_option(normalized_option),
+        )
+        return {
+            "result": "success",
+            "startup_model_option": normalized_option,
+            **status_payload,
+        }
 
     def speak_text(
         self,
@@ -2002,6 +2146,8 @@ class TTSRuntime:
             language = str(job["language"])
 
             with self._lock:
+                if mode in self._queued_jobs_by_mode and self._queued_jobs_by_mode[mode] > 0:
+                    self._queued_jobs_by_mode[mode] -= 1
                 self._speech_in_progress = True
                 self._current_job_started_at = _utc_now()
                 self._set_speech_phase_locked("synthesizing")
@@ -2094,7 +2240,7 @@ class TTSRuntime:
         overall_ready = (
             _runtime_dependencies_ready()
             and self._last_error is None
-            and self._all_enabled_models_loaded_locked()
+            and self._all_startup_models_loaded_locked()
         )
         return {
             "ready": overall_ready,
@@ -2117,7 +2263,19 @@ class TTSRuntime:
             "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
             "last_loaded_at": _timestamp_value(voice_design_state["last_loaded_at"]),
             "last_error": self._last_error,
-            "voice_design_model_enabled": voice_design_state["enabled"],
+            "startup_model_option": self._startup_model_option,
+            "startup_model_options": self.available_startup_model_options(),
+            "startup_model_ids": [
+                self._model_state(model_kind)["model_id"]
+                for model_kind in self._startup_model_kinds_for_option(self._startup_model_option)
+            ],
+            "loaded_model_ids": [
+                slot["model_id"]
+                for slot in self._model_slots.values()
+                if slot["model"] is not None
+            ],
+            "voice_design_model_enabled": voice_design_state["startup_enabled"],
+            "voice_design_model_startup_enabled": voice_design_state["startup_enabled"],
             "voice_design_model_loaded": voice_design_state["model"] is not None,
             "voice_design_model_id": voice_design_state["model_id"],
             "voice_design_device": voice_design_state["resolved_device"],
@@ -2125,7 +2283,8 @@ class TTSRuntime:
             "voice_design_last_loaded_at": _timestamp_value(voice_design_state["last_loaded_at"]),
             "voice_design_last_error": voice_design_state["last_error"],
             "voice_design_cpu_fallback_active": voice_design_state["cpu_fallback_active"],
-            "clone_model_enabled": clone_state["enabled"],
+            "clone_model_enabled": clone_state["startup_enabled"],
+            "clone_model_startup_enabled": clone_state["startup_enabled"],
             "clone_model_loaded": clone_state["model"] is not None,
             "clone_model_id": clone_state["model_id"],
             "clone_device": clone_state["resolved_device"],
@@ -2220,8 +2379,8 @@ class TTSRuntime:
             slot = self._model_state(mode)
             if self._shutdown_requested.is_set():
                 raise RuntimeError("runtime is shutting down and cannot accept speech jobs")
-            if not slot["enabled"]:
-                raise RuntimeError(f"{mode} model is disabled and cannot accept speech jobs")
+            if slot["model"] is None:
+                raise RuntimeError(self.required_models_not_loaded_message(model_kinds=[mode]))
 
             job_id = self._speech_jobs_queued + 1
             job: dict[str, Any] = {
@@ -2252,6 +2411,7 @@ class TTSRuntime:
 
             enqueued_at = _utc_now()
             self._speech_jobs_queued = job_id
+            self._queued_jobs_by_mode[mode] += 1
             self._speech_last_enqueued_at = enqueued_at
             self._speech_last_error = None
             self._emit_runtime_event(
@@ -2362,7 +2522,7 @@ class TTSRuntime:
             model_missing = self._model_state(mode)["model"] is None
 
         if model_missing:
-            self.load_model(model_kind=mode)
+            raise RuntimeError(self.required_models_not_loaded_message(model_kinds=[mode]))
 
         with self._lock:
             slot = self._model_state(mode)
@@ -2484,9 +2644,9 @@ class TTSRuntime:
             return "mps"
         return "cpu"
 
-    def _new_model_slot(self, *, model_id: str, enabled: bool) -> dict[str, Any]:
+    def _new_model_slot(self, *, model_id: str, startup_enabled: bool) -> dict[str, Any]:
         return {
-            "enabled": enabled,
+            "startup_enabled": startup_enabled,
             "model_id": model_id,
             "model": None,
             "resolved_device": None,
@@ -2496,27 +2656,82 @@ class TTSRuntime:
             "cpu_fallback_active": False,
         }
 
-    def _enabled_model_kinds(self) -> list[str]:
-        with self._lock:
-            return [
-                model_kind
-                for model_kind, slot in self._model_slots.items()
-                if cast(bool, slot["enabled"])
-            ]
-
-    def _all_enabled_models_loaded_locked(self) -> bool:
-        enabled_slots = [
-            slot for slot in self._model_slots.values() if cast(bool, slot["enabled"])
+    def _startup_enabled_model_kinds(self) -> list[str]:
+        return [
+            model_kind
+            for model_kind, slot in self._model_slots.items()
+            if cast(bool, slot["startup_enabled"])
         ]
-        if not enabled_slots:
-            return False
-        return all(slot["model"] is not None for slot in enabled_slots)
+
+    def _all_startup_models_loaded_locked(self) -> bool:
+        startup_slots = [
+            slot for slot in self._model_slots.values() if cast(bool, slot["startup_enabled"])
+        ]
+        return all(slot["model"] is not None for slot in startup_slots)
 
     def _model_state(self, model_kind: str) -> dict[str, Any]:
         return self._model_slots[model_kind]
 
     def _touch_model_locked(self, model_kind: str, value: dt.datetime | None = None) -> None:
         self._model_state(model_kind)["last_used_at"] = value or _utc_now()
+
+    def _normalize_startup_model_option(self, option: str) -> str:
+        normalized_option = option.strip()
+        if normalized_option not in self.available_startup_model_options():
+            raise ValueError(
+                "startup model option must be one of: "
+                f"{', '.join(self.available_startup_model_options())}"
+            )
+        return normalized_option
+
+    def _startup_model_kinds_for_option(self, option: str) -> list[str]:
+        if option == STARTUP_MODEL_OPTION_NONE:
+            return []
+        if option == STARTUP_MODEL_OPTION_ALL:
+            return [VOICE_DESIGN_MODEL_KIND, CLONE_MODEL_KIND]
+        return [self.model_kind_for_id(option)]
+
+    def _set_startup_model_option_locked(self, option: str) -> None:
+        self._startup_model_option = option
+        startup_model_kinds = set(self._startup_model_kinds_for_option(option))
+        for model_kind, slot in self._model_slots.items():
+            slot["startup_enabled"] = model_kind in startup_model_kinds
+
+    async def _load_startup_model_option(self, *, state_store: Any) -> str:
+        result = await state_store.get(
+            key=STARTUP_MODEL_OPTION_KEY,
+            collection=RUNTIME_CONFIGURATION_COLLECTION,
+        )
+        stored_option = result.value if result is not None else None
+
+        if isinstance(stored_option, str):
+            try:
+                normalized_option = self._normalize_startup_model_option(stored_option)
+            except ValueError:
+                normalized_option = self._default_startup_model_option
+                self._emit_runtime_event(
+                    "startup_model_option_invalid_in_storage",
+                    level="minimal",
+                    stored_value=stored_option,
+                    fallback_startup_model_option=normalized_option,
+                )
+            else:
+                self._emit_runtime_event(
+                    "startup_model_option_loaded_from_storage",
+                    level="debug",
+                    startup_model_option=normalized_option,
+                )
+        else:
+            normalized_option = self._default_startup_model_option
+            self._emit_runtime_event(
+                "startup_model_option_defaulted",
+                level="debug",
+                startup_model_option=normalized_option,
+            )
+
+        with self._lock:
+            self._set_startup_model_option_locked(normalized_option)
+        return normalized_option
 
     def _set_speech_phase_locked(self, phase: str) -> None:
         if self._speech_phase != phase or self._current_phase_started_at is None:
@@ -2857,7 +3072,9 @@ class TTSRuntime:
             model_missing = self._model_state(CLONE_MODEL_KIND)["model"] is None
 
         if model_missing:
-            self.load_model(model_kind=CLONE_MODEL_KIND)
+            raise RuntimeError(
+                self.required_models_not_loaded_message(model_kinds=[CLONE_MODEL_KIND])
+            )
 
         with self._lock:
             model = self._model_state(CLONE_MODEL_KIND)["model"]

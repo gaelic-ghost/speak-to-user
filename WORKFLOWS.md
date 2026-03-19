@@ -9,15 +9,15 @@ flowchart LR
     A["FastMCP startup"] --> B["app_lifespan()"]
     B --> C["TTSRuntime.from_env()"]
     C --> D["TTSRuntime(...)"]
-    D --> E["runtime.preload()"]
+    D --> E["runtime.preload(state_store)"]
     E --> F["runtime.start_speech_worker()"]
-    E --> G["load enabled models"]
+    E --> G["load persisted startup model selection"]
     B --> H["yield {'runtime': runtime} into lifespan_context"]
     H --> I["tool calls resolve ctx.lifespan_context['runtime']"]
     B --> J["runtime.shutdown()"]
 ```
 
-The server creates one `TTSRuntime` per FastMCP process during lifespan setup. Preload starts the in-process speech worker and blocks until all enabled resident models are loaded. The runtime is then shared by every tool call in that process and shut down when the server exits.
+The server creates one `TTSRuntime` per FastMCP process during lifespan setup. Preload starts the in-process speech worker, reads the persisted startup model option from FastMCP storage, and blocks until just those startup-selected models are loaded. The runtime is then shared by every tool call in that process and shut down when the server exits.
 
 ## `health`
 
@@ -48,45 +48,63 @@ Important status behavior:
 - `speech_phase` is `opening_output` while the output stream is being opened.
 - `speech_phase` is `playing` while waveform chunks are being written to the audio device.
 - separate voice-design and clone model state is always reported.
+- startup preload configuration is reported, including the persisted `startup_model_option`.
 - recent structured runtime events are included for live diagnosis.
+
+## Model Management
+
+```mermaid
+flowchart LR
+    A["MCP tool: server.load_model(...)"] --> B["tools.load_model(ctx, ...)"]
+    B --> C["runtime.load_model(...)"]
+    D["MCP tool: server.unload_model(...)"] --> E["tools.unload_model(ctx, ...)"]
+    E --> F["runtime.unload_model(...)"]
+    G["MCP tool: server.set_startup_model(...)"] --> H["tools.set_startup_model(ctx, ...)"]
+    H --> I["runtime.set_startup_model(state_store, ...)"]
+    I --> J["persist startup option in FastMCP storage"]
+```
+
+`load_model` and `unload_model` act on concrete model ids. `set_startup_model` persists one of `none`, `all`, or one concrete model id so the next server start knows which models to preload.
 
 ## `speak_text`
 
 ```mermaid
 flowchart LR
     A["MCP tool: server.speak_text(...)"] --> B["tools.speak_text(ctx, ...)"]
-    B --> C["tools._runtime_from_context(ctx)"]
-    C --> D["chunk_text_for_tts(text)"]
-    D --> E["runtime.speak_text(...)"]
-    E --> F["enqueue one voice-design job"]
-    F --> G["speech worker reads job"]
-    G --> H["play_speech_chunks(...)"]
-    H --> I["_synthesize_audio_chunk(...)"]
-    I --> J["_model.generate_voice_design(...)"]
-    J --> K["small preroll buffer"]
-    K --> L["_open_output_stream(...)"]
-    L --> M["_write_output_stream_chunk(...)"]
+    B --> C["check required model or elicit load"]
+    C --> D["tools._runtime_from_context(ctx)"]
+    D --> E["chunk_text_for_tts(text)"]
+    E --> F["runtime.speak_text(...)"]
+    F --> G["enqueue one voice-design job"]
+    G --> H["speech worker reads job"]
+    H --> I["play_speech_chunks(...)"]
+    I --> J["_synthesize_audio_chunk(...)"]
+    J --> K["_model.generate_voice_design(...)"]
+    K --> L["small preroll buffer"]
+    L --> M["_open_output_stream(...)"]
+    M --> N["_write_output_stream_chunk(...)"]
 ```
 
-`speak_text` is the normal voice-design playback path. It enqueues one full text job for the caller's request and returns immediately. Playback then happens on the already-running in-process worker.
+`speak_text` is the normal voice-design playback path. It first requires the voice-design model to already be loaded. If the client supports FastMCP elicitation, the tool can ask whether it should load the missing model; otherwise it returns an explicit load-first error. Once the model is ready, it enqueues one full text job and returns immediately.
 
 ## `speak_text_as_clone`
 
 ```mermaid
 flowchart LR
     A["MCP tool: server.speak_text_as_clone(...)"] --> B["tools.speak_text_as_clone(ctx, ...)"]
-    B --> C["tools._runtime_from_context(ctx)"]
-    C --> D["decode reference audio"]
-    D --> E["chunk_text_for_tts(text)"]
-    E --> F["runtime.speak_text_as_clone(...)"]
-    F --> G["enqueue one clone job"]
-    G --> H["speech worker reads job"]
-    H --> I["play_speech_chunks(...)"]
-    I --> J["_synthesize_audio_chunk(...)"]
-    J --> K["_model.generate_voice_clone(...)"]
-    K --> L["small preroll buffer"]
-    L --> M["_open_output_stream(...)"]
-    M --> N["_write_output_stream_chunk(...)"]
+    B --> C["check required model or elicit load"]
+    C --> D["tools._runtime_from_context(ctx)"]
+    D --> E["decode reference audio"]
+    E --> F["chunk_text_for_tts(text)"]
+    F --> G["runtime.speak_text_as_clone(...)"]
+    G --> H["enqueue one clone job"]
+    H --> I["speech worker reads job"]
+    I --> J["play_speech_chunks(...)"]
+    J --> K["_synthesize_audio_chunk(...)"]
+    K --> L["_model.generate_voice_clone(...)"]
+    L --> M["small preroll buffer"]
+    M --> N["_open_output_stream(...)"]
+    N --> O["_write_output_stream_chunk(...)"]
 ```
 
 `speak_text_as_clone` is the ad hoc clone playback path. It reads a local reference clip, chooses clone mode from the presence of `reference_text`, and then enqueues one clone job into the same global playback queue used by `speak_text`.

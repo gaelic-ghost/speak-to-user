@@ -228,11 +228,45 @@ def test_load_clone_model_success_sets_status(
     assert status["clone_last_error"] is None
 
 
+def test_unload_model_clears_loaded_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    fake_model = FakeVoiceDesignModel()
+    released: list[tuple[object | None, str | None]] = []
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
+    monkeypatch.setattr(
+        runtime,
+        "_release_model_resources",
+        lambda model, *, resolved_device: released.append((model, resolved_device)),
+    )
+
+    result = runtime.unload_model(model_kind=VOICE_DESIGN_MODEL_KIND)
+
+    assert result["result"] == "success"
+    assert result["unloaded"] is True
+    assert runtime.status()["voice_design_model_loaded"] is False
+    assert released == [(fake_model, "cpu")]
+
+
+def test_unload_model_rejects_when_jobs_are_queued(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
+    runtime._queued_jobs_by_mode[VOICE_DESIGN_MODEL_KIND] = 1
+
+    with pytest.raises(RuntimeError, match="queued speech jobs"):
+        runtime.unload_model(model_kind=VOICE_DESIGN_MODEL_KIND)
+
+
 def test_preload_starts_worker_and_loads_enabled_models(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
     calls: list[str] = []
 
     def fake_start_speech_worker() -> bool:
@@ -248,10 +282,71 @@ def test_preload_starts_worker_and_loads_enabled_models(
     monkeypatch.setattr(runtime, "load_model", fake_load_model)
     monkeypatch.setattr(runtime, "status", lambda: {"ready": True})
 
-    result = runtime.preload()
+    result = asyncio.run(runtime.preload(state_store=state_store))
 
     assert result["result"] == "success"
     assert calls == ["worker", VOICE_DESIGN_MODEL_KIND, CLONE_MODEL_KIND]
+
+
+def test_preload_uses_persisted_startup_model_option(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+    asyncio.run(
+        state_store.put(
+            runtime_module.STARTUP_MODEL_OPTION_KEY,
+            StateValue(value=runtime.clone_model_id),
+            collection=runtime_module.RUNTIME_CONFIGURATION_COLLECTION,
+        )
+    )
+    loaded_model_kinds: list[str] = []
+
+    monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
+
+    def fake_load_model(
+        *,
+        model_kind: str = VOICE_DESIGN_MODEL_KIND,
+    ) -> dict[str, object]:
+        loaded_model_kinds.append(model_kind)
+        return {"result": "success", "loaded": True}
+
+    monkeypatch.setattr(
+        runtime,
+        "load_model",
+        fake_load_model,
+    )
+    monkeypatch.setattr(runtime, "status", lambda: {"ready": True})
+
+    result = asyncio.run(runtime.preload(state_store=state_store))
+
+    assert result["startup_model_option"] == runtime.clone_model_id
+    assert loaded_model_kinds == [CLONE_MODEL_KIND]
+
+
+def test_set_startup_model_persists_option_and_updates_status(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    state_store = FakeStateStore()
+
+    result = asyncio.run(
+        runtime.set_startup_model(
+            state_store=state_store,
+            option=runtime.voice_design_model_id,
+        )
+    )
+
+    stored_value = asyncio.run(
+        state_store.get(
+            runtime_module.STARTUP_MODEL_OPTION_KEY,
+            collection=runtime_module.RUNTIME_CONFIGURATION_COLLECTION,
+        )
+    )
+    assert stored_value is not None
+    assert stored_value.value == runtime.voice_design_model_id
+    assert result["startup_model_option"] == runtime.voice_design_model_id
+    assert result["voice_design_model_startup_enabled"] is True
+    assert result["clone_model_startup_enabled"] is False
 
 
 def test_shutdown_releases_loaded_models(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -280,6 +375,8 @@ def test_shutdown_releases_loaded_models(monkeypatch: pytest.MonkeyPatch, tmp_pa
 
 def test_speak_text_enqueues_one_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
     worker_starts = {"value": 0}
 
     def fake_start_speech_worker() -> bool:
@@ -307,6 +404,8 @@ def test_speak_text_as_clone_enqueues_one_job(
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
     monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
     reference_audio = (np.array([0.0, 0.1], dtype=np.float32), 16000)
     monkeypatch.setattr(runtime, "_decode_reference_audio_file", lambda path: reference_audio)
@@ -601,6 +700,8 @@ def test_list_and_delete_speech_profiles(tmp_path: Path) -> None:
 def test_speak_with_profile_enqueues_clone_job(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
     state_store = FakeStateStore()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
     profile = runtime_module.StoredSpeechProfile(
         name="demo",
         clone_model_id="Qwen/test-clone",
@@ -645,6 +746,8 @@ def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
     monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
 
     real_put_nowait = runtime._speech_queue.put_nowait
@@ -687,6 +790,10 @@ def test_speak_text_assigns_unique_job_ids_under_concurrent_enqueue(
 
 def test_speech_worker_dispatches_modes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["model"] = FakeVoiceDesignModel()
+    runtime._model_state(VOICE_DESIGN_MODEL_KIND)["resolved_device"] = "cpu"
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
     played_jobs: list[dict[str, object]] = []
     monkeypatch.setattr(runtime, "start_speech_worker", lambda: True)
     monkeypatch.setattr(
@@ -843,6 +950,18 @@ def test_synthesize_clone_chunk_retries_with_cpu_fallback_for_meta_tensor_error(
 
     assert result["device"] == "cpu"
     assert second_model.calls[0]["x_vector_only_mode"] is True
+
+
+def test_synthesize_chunk_requires_model_to_be_loaded_first(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    with pytest.raises(RuntimeError, match="call load_model"):
+        runtime._synthesize_audio_chunk(
+            mode=VOICE_DESIGN_MODEL_KIND,
+            text="hello",
+            voice_description="warm",
+            language="English",
+        )
 
 
 # MARK: Playback
@@ -1322,7 +1441,7 @@ def test_play_speech_chunks_fails_after_exhausting_underflow_retries(
 # MARK: Status
 
 
-def test_status_ready_requires_all_enabled_models_loaded(
+def test_status_ready_requires_all_startup_models_loaded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1342,6 +1461,19 @@ def test_status_ready_requires_all_enabled_models_loaded(
 
     runtime.load_model(model_kind=CLONE_MODEL_KIND)
     assert runtime.status()["ready"] is True
+
+
+def test_status_ready_when_no_startup_models_are_configured(tmp_path: Path) -> None:
+    runtime = TTSRuntime(
+        voice_design_model_id="Qwen/test-voice-design",
+        clone_model_id="Qwen/test-clone",
+        enable_voice_design_model=False,
+        enable_clone_model=False,
+        device_preference="cpu",
+    )
+
+    assert runtime.status()["ready"] is True
+    assert runtime.status()["startup_model_option"] == runtime_module.STARTUP_MODEL_OPTION_NONE
 
 
 def test_emit_runtime_event_records_recent_event_and_prints_json(
