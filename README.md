@@ -182,7 +182,7 @@ Recommended profile workflow:
 - `SPEAK_TO_USER_MCP_PATH`
   Default: `/mcp`
 - `SPEAK_TO_USER_STATE_DIR`
-  Default: `~/Library/Application Support/speak-to-user/state`
+  Default: `~/.local/gaelic-ghost/speak-to-user/profiles`
 - `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS`
   Default: `3.0`
 - `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS`
@@ -218,6 +218,7 @@ Operational notes:
 - `unload_model` refuses to evict a model while that model has queued or active jobs
 - `set_startup_model` accepts `none`, `all`, or one of the configured model ids and persists that choice in the FastMCP state store
 - `SPEAK_TO_USER_STATE_DIR` controls where the FastMCP file-backed state store keeps persisted startup settings and saved speech profiles
+- when `SPEAK_TO_USER_STATE_DIR` is not explicitly set, the server automatically migrates persisted state from the old default path at `~/Library/Application Support/speak-to-user/state` into `~/.local/gaelic-ghost/speak-to-user/profiles` if the new default is still empty
 - if a speech or profile tool needs a model that is not loaded, the client should load it and retry; clients with FastMCP elicitation support can accept an in-band load prompt instead
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time

@@ -456,6 +456,82 @@ def test_state_store_from_env_uses_filetree_layout(monkeypatch: pytest.MonkeyPat
     )
 
 
+def test_state_store_from_env_migrates_legacy_default_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    new_default_dir = tmp_path / "new-default"
+    legacy_default_dir = tmp_path / "legacy-default"
+    legacy_data_dir = legacy_default_dir / "data"
+    legacy_metadata_dir = legacy_default_dir / "metadata"
+    legacy_data_dir.mkdir(parents=True)
+    legacy_metadata_dir.mkdir(parents=True)
+    (legacy_data_dir / "profiles.json").write_text("profile-data", encoding="utf-8")
+    (legacy_metadata_dir / "startup.json").write_text("startup-data", encoding="utf-8")
+    monkeypatch.delenv("SPEAK_TO_USER_STATE_DIR", raising=False)
+    monkeypatch.setattr(server, "DEFAULT_STATE_DIR", new_default_dir)
+    monkeypatch.setattr(server, "LEGACY_DEFAULT_STATE_DIR", legacy_default_dir)
+
+    state_store = server.state_store_from_env()
+
+    assert state_store._data_directory == new_default_dir / "data"
+    assert state_store._metadata_directory == new_default_dir / "metadata"
+    assert (new_default_dir / "data" / "profiles.json").read_text(encoding="utf-8") == (
+        "profile-data"
+    )
+    assert (
+        new_default_dir / "metadata" / "startup.json"
+    ).read_text(encoding="utf-8") == "startup-data"
+
+
+def test_state_store_from_env_does_not_migrate_when_state_dir_is_explicit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    explicit_state_dir = tmp_path / "explicit-state"
+    new_default_dir = tmp_path / "new-default"
+    legacy_default_dir = tmp_path / "legacy-default"
+    legacy_data_dir = legacy_default_dir / "data"
+    legacy_metadata_dir = legacy_default_dir / "metadata"
+    legacy_data_dir.mkdir(parents=True)
+    legacy_metadata_dir.mkdir(parents=True)
+    (legacy_data_dir / "profiles.json").write_text("profile-data", encoding="utf-8")
+    (legacy_metadata_dir / "startup.json").write_text("startup-data", encoding="utf-8")
+    monkeypatch.setenv("SPEAK_TO_USER_STATE_DIR", str(explicit_state_dir))
+    monkeypatch.setattr(server, "DEFAULT_STATE_DIR", new_default_dir)
+    monkeypatch.setattr(server, "LEGACY_DEFAULT_STATE_DIR", legacy_default_dir)
+
+    state_store = server.state_store_from_env()
+
+    assert state_store._data_directory == explicit_state_dir / "data"
+    assert state_store._metadata_directory == explicit_state_dir / "metadata"
+    assert not (new_default_dir / "data").exists()
+
+
+def test_state_store_from_env_prefers_existing_new_default_state(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    new_default_dir = tmp_path / "new-default"
+    legacy_default_dir = tmp_path / "legacy-default"
+    new_data_dir = new_default_dir / "data"
+    legacy_data_dir = legacy_default_dir / "data"
+    new_data_dir.mkdir(parents=True)
+    legacy_data_dir.mkdir(parents=True)
+    (new_data_dir / "profiles.json").write_text("new-state", encoding="utf-8")
+    (legacy_data_dir / "profiles.json").write_text("legacy-state", encoding="utf-8")
+    monkeypatch.delenv("SPEAK_TO_USER_STATE_DIR", raising=False)
+    monkeypatch.setattr(server, "DEFAULT_STATE_DIR", new_default_dir)
+    monkeypatch.setattr(server, "LEGACY_DEFAULT_STATE_DIR", legacy_default_dir)
+
+    state_store = server.state_store_from_env()
+
+    assert state_store._data_directory == new_default_dir / "data"
+    assert (new_default_dir / "data" / "profiles.json").read_text(encoding="utf-8") == (
+        "new-state"
+    )
+
+
 def test_server_config_from_env_rejects_invalid_port(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SPEAK_TO_USER_PORT", "not-a-port")
 

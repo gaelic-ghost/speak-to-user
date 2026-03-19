@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import shutil
 import sys
 
 if __package__ in {None, ""}:
@@ -39,6 +40,13 @@ DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_HTTP_PATH = "/mcp"
 DEFAULT_STATE_DIR = (
+    Path.home()
+    / ".local"
+    / "gaelic-ghost"
+    / "speak-to-user"
+    / "profiles"
+)
+LEGACY_DEFAULT_STATE_DIR = (
     Path.home()
     / "Library"
     / "Application Support"
@@ -96,11 +104,54 @@ def _normalize_state_dir(value: str | None) -> Path:
     return Path(raw).expanduser().resolve()
 
 
+def _state_store_subdirectories(state_dir: Path) -> tuple[Path, Path]:
+    return state_dir / "data", state_dir / "metadata"
+
+
+def _directory_has_entries(path: Path) -> bool:
+    return path.exists() and any(path.iterdir())
+
+
+def _state_dir_has_store_data(state_dir: Path) -> bool:
+    data_dir, metadata_dir = _state_store_subdirectories(state_dir)
+    return _directory_has_entries(data_dir) or _directory_has_entries(metadata_dir)
+
+
+def _copy_state_directory_contents(*, source_dir: Path, destination_dir: Path) -> None:
+    source_data_dir, source_metadata_dir = _state_store_subdirectories(source_dir)
+    destination_data_dir, destination_metadata_dir = _state_store_subdirectories(destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+
+    if source_data_dir.exists():
+        shutil.copytree(source_data_dir, destination_data_dir, dirs_exist_ok=True)
+    if source_metadata_dir.exists():
+        shutil.copytree(source_metadata_dir, destination_metadata_dir, dirs_exist_ok=True)
+
+
+def _resolved_runtime_state_dir() -> Path:
+    explicit_state_dir = os.getenv("SPEAK_TO_USER_STATE_DIR")
+    resolved_state_dir = _normalize_state_dir(explicit_state_dir)
+    if explicit_state_dir is not None:
+        return resolved_state_dir
+
+    if _state_dir_has_store_data(resolved_state_dir):
+        return resolved_state_dir
+    if not _state_dir_has_store_data(LEGACY_DEFAULT_STATE_DIR):
+        return resolved_state_dir
+
+    _copy_state_directory_contents(
+        source_dir=LEGACY_DEFAULT_STATE_DIR,
+        destination_dir=resolved_state_dir,
+    )
+    return resolved_state_dir
+
+
 def state_store_from_env() -> FileTreeStore:
-    state_dir = _normalize_state_dir(os.getenv("SPEAK_TO_USER_STATE_DIR"))
+    state_dir = _resolved_runtime_state_dir()
+    data_directory, metadata_directory = _state_store_subdirectories(state_dir)
     return FileTreeStore(
-        data_directory=state_dir / "data",
-        metadata_directory=state_dir / "metadata",
+        data_directory=data_directory,
+        metadata_directory=metadata_directory,
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Generator
 import json
 import os
 from pathlib import Path
@@ -8,7 +9,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Any, Generator, cast
+from typing import Any, cast
 from urllib.parse import urlparse
 import uuid
 
