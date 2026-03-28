@@ -209,6 +209,17 @@ Recommended profile workflow:
   Default: `30.0`
 - `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS`
   Default: `20.0`
+- `SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES`
+  Default: `2`
+- `SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE`
+  Default: `1.25`
+- `SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION`
+  Default: `0.02`
+- `SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL`
+  Allowed values: `wav`, `service-v1`
+  Default: `service-v1`
+- `SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS`
+  Default: `45.0`
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY`
   Allowed values: `low`, `high`, or a positive number
   Default: `high`
@@ -230,20 +241,21 @@ Operational notes:
 - if a speech or profile tool needs a model that is not loaded, the client should load it and retry; clients with FastMCP elicitation support can accept an in-band load prompt instead
 - `tts_status` is the fastest way to confirm which models are loaded, which mode is active, and whether playback is already busy
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY` affects the `sounddevice` backend only; it does not reduce model inference time
-- `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` controls how many times playback retries the current chunk after a playback underflow or `wavbuffer` starvation event
+- `SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES` still applies to the in-process `sounddevice` backend; the `wavbuffer` backend now stays alive and waits for replacement audio instead of restarting the playback process on starvation
 - `SPEAK_TO_USER_PLAYBACK_BACKEND=null` is a test-only silent sink that still runs synthesis but skips real audio output
 - the `wavbuffer` backend expects a prebuilt binary path; do not point it at `swift run wavbuffer`
 - this repo includes a bundled `wavbuffer` binary for macOS arm64 at `app/vendor/wavbuffer/macos-arm64/wavbuffer`
 - `SPEAK_TO_USER_WAVBUFFER_BINARY_PATH` remains available as an override when you want to point at a fresh development build instead of the bundled binary
 - `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=auto` currently resolves to `seconds` so the runtime passes exactly one preroll flag to `wavbuffer`
-- when `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer`, native preroll and underrun reporting come from the Swift playback binary rather than the Python runtime
+- when `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer`, the Swift playback service is the only buffering authority; Python streams validated chunk records and terminal control frames, while Swift owns preroll, starvation waiting, resume, and final timeout
 - first-audio latency is usually dominated by model synthesis, especially on the 1.7B voice-design model
 - `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS=160` is the current live-safe default for this repo because even `240` character clone chunks on Gale's M4 Pro could still produce 9 to 12 second later chunks and lose the real-time race
 - `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS=384` is passed explicitly into Qwen instead of relying on upstream defaults so the service has a local cap on per-chunk generation budget
 - `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS=20.0` fails chunks that decode into obviously reply-inappropriate audio durations instead of letting one absurd output dominate the worker
 - `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS=30.0` is a post-call guardrail: it marks an overlong synthesis as failed once Qwen returns, but it does not preempt the Qwen Python call mid-generation
-- when `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers`, the runtime still caps the effective `wavbuffer` chunk-preroll target dynamically so 1- and 2-chunk jobs hand off with a 1-buffer target while 3+-chunk jobs cap at 2 buffers even if the configured value is higher; the separate startup-admission policy may still delay audible playback longer when chunk timing looks unsafe
-- playback startup is now admission-controlled in the Python runtime for both `sounddevice` and `wavbuffer`: 2- and 3-chunk replies wait until all chunks are buffered, while longer replies can defer first audio until buffered chunk count and buffered audio lead look safe enough against the observed synth deficit
+- every synthesized chunk now gets waveform sanity checking before playback handoff; invalid chunks are retried up to `SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES` times before the stream is failed
+- when `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers`, Python passes the configured preroll target through to `wavbuffer`, and the Swift service applies any short-stream chunk-count adjustment using the stream config metadata it received from generation
+- playback startup admission is still Python-controlled for the in-process `sounddevice` backend, but the `wavbuffer` backend now starts and resumes entirely from Swift-side buffering instead of Python-side buffered-chunk guesses
 - the accepted live verification for these defaults is recorded in [benchmarks/live-verification-2026-03-28.md](benchmarks/live-verification-2026-03-28.md)
 
 ## LaunchAgents
@@ -257,9 +269,9 @@ The checked-in plists use `$HOME` for the user-specific path prefix, but they st
 - Dev service: `http://127.0.0.1:8766/mcp`
 
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
-At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, handoff completion, underflow recovery, completion, and failure. It also emits `speech_memory_snapshot` events around chunk synthesis, preroll satisfaction, output opening, and playback start so you can correlate memory swings with the playback pipeline in the LaunchAgent stderr log. The log now also includes `speech_chunk_ready_for_playback`, `speech_playback_start_deferred`, `speech_playback_start_admitted`, `speech_first_audio_started`, and `speech_job_metrics_summary` so inter-chunk delays, startup deferrals, first-audio latency, synth-to-audio ratios, and failure reasons can be reviewed from stderr without a second metrics file. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
+At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, regeneration retries, waveform rejection, stream open/close, chunk playback, handoff completion, completion, and failure. It also emits `speech_memory_snapshot` events around chunk synthesis and playback handoff so you can correlate memory swings with the playback pipeline in the LaunchAgent stderr log. The log now also includes `speech_chunk_ready_for_playback`, `speech_first_audio_started`, and `speech_job_metrics_summary`, while the Swift `wavbuffer` service emits `playback_started`, `playback_resumed`, `underrun`, `waiting_for_audio`, `stream_config_received`, `stream_failed`, and `completed` so starvation and resume behavior can be reviewed from stderr without a second metrics file. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
-The checked-in LaunchAgent templates pin the service to the native `wavbuffer` backend, explicitly set `SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH=8`, keep `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0` for compatibility, and force `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers` with `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS=3`. The runtime still treats that configured chunk-preroll as an upper bound rather than a literal always-wait-for-3 rule: 1- and 2-chunk jobs pass `--preroll-buffers 1`, while 3+-chunk jobs cap at `2`. Separately, runtime-side playback admission can hold replies longer than the raw wavbuffer threshold until startup is actually safe: 2- and 3-chunk jobs wait for all chunks, while longer clone replies can defer first audio until the buffered lead clears the observed synth deficit. The same templates also pin the current reply-sized chunking guardrails used in development: `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS=160`, `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS=384`, `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS=30.0`, and `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS=20.0`. They rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
+The checked-in LaunchAgent templates pin the service to the native `wavbuffer` backend, explicitly set `SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH=8`, keep `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0` for compatibility, and force `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers` with `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS=3`. They now also pin `SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL=service-v1` and `SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS=45.0` so the Swift playback service owns buffering, starvation waiting, and resume behavior directly. The same templates also pin the current reply-sized chunking and regeneration guardrails used in development: `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS=160`, `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS=384`, `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS=30.0`, `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS=20.0`, and `SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES=2`. They rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
 
 To summarize a stable stderr log after a live verification run:
 
@@ -270,7 +282,7 @@ uv run scripts/summarize_stable_log.py \
   --max-job-id <job-id>
 ```
 
-That summary script condenses `speech_job_metrics_summary`, startup deferrals, wavbuffer start reasons, underruns, retries, and guardrail trips into one JSON report so you can spot regressions without manually reconstructing individual event streams. Use `--max-job-id` when you want to freeze a benchmark artifact to a specific verification batch and avoid mixing in later conversational speech jobs.
+That summary script condenses `speech_job_metrics_summary`, wavbuffer start reasons, underruns, retries, and guardrail trips into one JSON report so you can spot regressions without manually reconstructing individual event streams. Use `--max-job-id` when you want to freeze a benchmark artifact to a specific verification batch and avoid mixing in later conversational speech jobs.
 
 To refresh the bundled `wavbuffer` binary from the sibling Swift repo after rebuilding it there:
 
@@ -283,7 +295,7 @@ When diagnosing clone quality or playback problems, check both:
 
 - `tts_status` for live queue, model, and recent-event state
 - the LaunchAgent stderr log for the full structured event stream across requests and reconnects
-- repeated `wavbuffer event=underrun` plus `reason="stream_starved"` means playback drained faster than the next chunk finished synthesizing; reduce chunk size or tighten generation guardrails first, then increase buffer-count preroll if starvation still remains
+- repeated `wavbuffer event=underrun` plus `event=waiting_for_audio` means playback drained faster than the next validated replacement chunk arrived; tighten chunk regeneration and waveform guardrails first, then adjust chunk size or the Swift starvation timeout if starvation still remains
 
 Operational warning:
 

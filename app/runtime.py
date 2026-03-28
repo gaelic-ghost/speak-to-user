@@ -41,6 +41,8 @@ DEFAULT_PLAYBACK_UNDERFLOW_RETRIES = 2
 DEFAULT_PLAYBACK_BACKEND = "sounddevice"
 DEFAULT_WAVBUFFER_QUEUE_DEPTH = 8
 DEFAULT_WAVBUFFER_PREROLL_MODE = "seconds"
+DEFAULT_WAVBUFFER_INPUT_PROTOCOL = "service-v1"
+DEFAULT_WAVBUFFER_STARVATION_TIMEOUT_SECONDS = 45.0
 DEFAULT_OUTPUT_STREAM_LATENCY = "high"
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
@@ -48,6 +50,10 @@ VOICE_DESIGN_PROFILE_SEED_MAX_CHARS = 240
 DEFAULT_TTS_MAX_NEW_TOKENS = 384
 DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS = 30.0
 DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS = 20.0
+DEFAULT_TTS_CHUNK_REGEN_RETRIES = 2
+DEFAULT_TTS_WAVEFORM_MAX_ABS_SAMPLE = 1.25
+DEFAULT_TTS_WAVEFORM_CLIP_THRESHOLD = 0.999
+DEFAULT_TTS_WAVEFORM_MAX_CLIPPED_FRACTION = 0.02
 PLAYBACK_START_SAFETY_CUSHION_SECONDS = 2.0
 PLAYBACK_START_RISKY_TWO_CHUNK_MARGIN_MS = -3000
 DEFAULT_LOG_LEVEL = "info"
@@ -118,6 +124,10 @@ class StoredSpeechProfile(BaseModel):
 
 class StoredSpeechProfileIndex(BaseModel):
     names: list[str]
+
+
+class WaveformValidationError(RuntimeError):
+    pass
 
 
 # MARK: Module Helpers
@@ -274,6 +284,15 @@ def _normalize_wavbuffer_preroll_mode(raw: str | None) -> str:
     if value not in {"auto", "seconds", "buffers"}:
         raise ValueError(
             "SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE must be one of: auto, seconds, buffers"
+        )
+    return value
+
+
+def _normalize_wavbuffer_input_protocol(raw: str | None) -> str:
+    value = (raw or DEFAULT_WAVBUFFER_INPUT_PROTOCOL).strip().lower()
+    if value not in {"wav", "service-v1"}:
+        raise ValueError(
+            "SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL must be one of: wav, service-v1"
         )
     return value
 
@@ -439,10 +458,15 @@ class TTSRuntime:
         wavbuffer_binary_path: str | None = None,
         wavbuffer_queue_depth: int = DEFAULT_WAVBUFFER_QUEUE_DEPTH,
         wavbuffer_preroll_mode: str = DEFAULT_WAVBUFFER_PREROLL_MODE,
+        wavbuffer_input_protocol: str = DEFAULT_WAVBUFFER_INPUT_PROTOCOL,
+        wavbuffer_starvation_timeout_seconds: float = DEFAULT_WAVBUFFER_STARVATION_TIMEOUT_SECONDS,
         tts_chunk_max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS,
         tts_max_new_tokens: int = DEFAULT_TTS_MAX_NEW_TOKENS,
         tts_max_chunk_synth_seconds: float = DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS,
         tts_max_chunk_audio_seconds: float = DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS,
+        tts_chunk_regen_retries: int = DEFAULT_TTS_CHUNK_REGEN_RETRIES,
+        tts_waveform_max_abs_sample: float = DEFAULT_TTS_WAVEFORM_MAX_ABS_SAMPLE,
+        tts_waveform_max_clipped_fraction: float = DEFAULT_TTS_WAVEFORM_MAX_CLIPPED_FRACTION,
         output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
         log_level: str = DEFAULT_LOG_LEVEL,
     ) -> None:
@@ -471,10 +495,15 @@ class TTSRuntime:
             self.wavbuffer_binary_path = _default_wavbuffer_binary_path()
         self.wavbuffer_queue_depth = wavbuffer_queue_depth
         self.wavbuffer_preroll_mode = wavbuffer_preroll_mode
+        self.wavbuffer_input_protocol = wavbuffer_input_protocol
+        self.wavbuffer_starvation_timeout_seconds = wavbuffer_starvation_timeout_seconds
         self.tts_chunk_max_chars = tts_chunk_max_chars
         self.tts_max_new_tokens = tts_max_new_tokens
         self.tts_max_chunk_synth_seconds = tts_max_chunk_synth_seconds
         self.tts_max_chunk_audio_seconds = tts_max_chunk_audio_seconds
+        self.tts_chunk_regen_retries = tts_chunk_regen_retries
+        self.tts_waveform_max_abs_sample = tts_waveform_max_abs_sample
+        self.tts_waveform_max_clipped_fraction = tts_waveform_max_clipped_fraction
         self.output_stream_latency = output_stream_latency
         self.log_level = log_level
 
@@ -584,6 +613,14 @@ class TTSRuntime:
             wavbuffer_preroll_mode=_normalize_wavbuffer_preroll_mode(
                 os.getenv("SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE")
             ),
+            wavbuffer_input_protocol=_normalize_wavbuffer_input_protocol(
+                os.getenv("SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL")
+            ),
+            wavbuffer_starvation_timeout_seconds=_normalize_positive_float(
+                os.getenv("SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS"),
+                env_var="SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS",
+                default=DEFAULT_WAVBUFFER_STARVATION_TIMEOUT_SECONDS,
+            ),
             tts_chunk_max_chars=_normalize_positive_int(
                 os.getenv("SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS"),
                 env_var="SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS",
@@ -603,6 +640,21 @@ class TTSRuntime:
                 os.getenv("SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS"),
                 env_var="SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS",
                 default=DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS,
+            ),
+            tts_chunk_regen_retries=_normalize_nonnegative_int(
+                os.getenv("SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES"),
+                env_var="SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES",
+                default=DEFAULT_TTS_CHUNK_REGEN_RETRIES,
+            ),
+            tts_waveform_max_abs_sample=_normalize_positive_float(
+                os.getenv("SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE"),
+                env_var="SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE",
+                default=DEFAULT_TTS_WAVEFORM_MAX_ABS_SAMPLE,
+            ),
+            tts_waveform_max_clipped_fraction=_normalize_positive_float(
+                os.getenv("SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION"),
+                env_var="SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION",
+                default=DEFAULT_TTS_WAVEFORM_MAX_CLIPPED_FRACTION,
             ),
             output_stream_latency=_normalize_output_stream_latency(
                 os.getenv("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY")
@@ -1282,15 +1334,48 @@ class TTSRuntime:
                         chunk_index=chunk_index,
                         chunk_count=len(normalized_chunks),
                     )
-                    chunk_result = self._synthesize_audio_chunk(
-                        mode=mode,
-                        text=text_chunk,
-                        voice_description=normalized_description,
-                        language=normalized_language,
-                        reference_audio=reference_audio,
-                        reference_text=reference_text,
-                        voice_clone_prompt_items=voice_clone_prompt_items,
-                    )
+                    chunk_result: dict[str, Any] | None = None
+                    max_attempts = self.tts_chunk_regen_retries + 1
+                    for attempt in range(1, max_attempts + 1):
+                        try:
+                            chunk_result = self._synthesize_audio_chunk(
+                                mode=mode,
+                                text=text_chunk,
+                                voice_description=normalized_description,
+                                language=normalized_language,
+                                reference_audio=reference_audio,
+                                reference_text=reference_text,
+                                voice_clone_prompt_items=voice_clone_prompt_items,
+                            )
+                            break
+                        except BaseException as exc:
+                            self._emit_runtime_event(
+                                "speech_chunk_regeneration_attempt_failed",
+                                level="minimal",
+                                job_id=self._speech_current_job_id,
+                                mode=mode,
+                                chunk_index=chunk_index,
+                                chunk_count=len(normalized_chunks),
+                                attempt=attempt,
+                                max_attempts=max_attempts,
+                                error=str(exc),
+                            )
+                            if attempt >= max_attempts:
+                                raise RuntimeError(
+                                    "chunk generation failed after "
+                                    f"{max_attempts} attempt(s): {exc}"
+                                ) from exc
+                            self._emit_runtime_event(
+                                "speech_chunk_regeneration_retrying",
+                                level="minimal",
+                                job_id=self._speech_current_job_id,
+                                mode=mode,
+                                chunk_index=chunk_index,
+                                chunk_count=len(normalized_chunks),
+                                next_attempt=attempt + 1,
+                                max_attempts=max_attempts,
+                            )
+                    assert chunk_result is not None
                     waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
                     chunk_sample_rate = int(chunk_result["sample_rate"])
                     chunk_sample_count = int(
@@ -2262,10 +2347,12 @@ class TTSRuntime:
         process_state: dict[str, Any] | None = None
         stderr_thread: threading.Thread | None = None
         next_chunk_index = 1
-        buffered_wav_chunks: list[bytes] = []
-        buffered_chunk_payloads: list[dict[str, Any]] = []
 
-        def start_process() -> tuple[Any, dict[str, Any], threading.Thread]:
+        def start_process(
+            *,
+            current_sample_rate: int,
+            current_channel_count: int,
+        ) -> tuple[Any, dict[str, Any], threading.Thread]:
             command = self._wavbuffer_command(chunk_count=len(normalized_chunks))
             self._emit_runtime_event(
                 "speech_wavbuffer_process_starting",
@@ -2282,10 +2369,9 @@ class TTSRuntime:
                 command=command,
             )
             child = self._spawn_wavbuffer_process(command)
-            state = {
+            state: dict[str, Any] = {
                 "lines": [],
                 "parsed_events": [],
-                "retryable_failure": False,
                 "playback_started_at": None,
                 "playback_started_event": None,
             }
@@ -2303,12 +2389,22 @@ class TTSRuntime:
                 mode=mode,
                 pid=getattr(child, "pid", None),
             )
+            if self.wavbuffer_input_protocol == "service-v1":
+                assert child.stdin is not None
+                child.stdin.write(
+                    self._encode_wavbuffer_service_config_frame(
+                        chunk_count=len(normalized_chunks),
+                        sample_rate=current_sample_rate,
+                        channel_count=current_channel_count,
+                    )
+                )
+                child.stdin.flush()
             return child, state, reader_thread
 
-        def stop_process(*, close_stdin: bool) -> tuple[int | None, str, bool]:
+        def stop_process(*, close_stdin: bool) -> tuple[int | None, str]:
             nonlocal process, process_state, stderr_thread
             if process is None:
-                return None, "wavbuffer process was not running", False
+                return None, "wavbuffer process was not running"
 
             if close_stdin and getattr(process, "stdin", None) is not None:
                 with contextlib.suppress(BrokenPipeError, OSError):
@@ -2336,7 +2432,6 @@ class TTSRuntime:
                         player="wavbuffer-subprocess",
                     )
             error_detail = current_process_error()
-            retryable_failure = bool(process_state and process_state["retryable_failure"])
             self._emit_runtime_event(
                 "speech_wavbuffer_process_exited",
                 level="info",
@@ -2348,7 +2443,7 @@ class TTSRuntime:
             process = None
             process_state = None
             stderr_thread = None
-            return returncode, error_detail, retryable_failure
+            return returncode, error_detail
 
         def current_process_error() -> str:
             assert process_state is not None
@@ -2357,130 +2452,23 @@ class TTSRuntime:
                 return lines[-1]
             return "wavbuffer exited without stderr output"
 
-        def maybe_retry_current_chunk(
-            *,
-            chunk_index: int,
-            chunk_started_at: dt.datetime,
-            attempt: int,
-        ) -> None:
-            _, error_detail, retryable_failure = stop_process(close_stdin=False)
-            if retryable_failure:
-                self._emit_runtime_event(
-                    "speech_chunk_playback_underflow",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    retry_attempt=attempt + 1,
-                    max_retries=self.playback_underflow_retries,
-                )
-                if attempt >= self.playback_underflow_retries:
-                    raise RuntimeError(
-                        "audio output underflowed during streamed playback "
-                        f"after {attempt + 1} attempt(s)"
-                    )
+        def write_payload_or_fail(*, payload: bytes, context: str) -> None:
+            nonlocal process, process_state, stderr_thread
+            assert process is not None
+            assert process_state is not None
+            try:
+                assert process.stdin is not None
+                process.stdin.write(payload)
+                process.stdin.flush()
+            except (BrokenPipeError, OSError) as exc:
+                _, error_detail = stop_process(close_stdin=False)
+                raise RuntimeError(
+                    f"wavbuffer input stream failed while writing {context}: {error_detail}"
+                ) from exc
 
-                playback_recovery_duration_ms = _duration_ms(chunk_started_at, _utc_now())
-                job_metrics["playback_retry_occurred"] = True
-                self._emit_runtime_event(
-                    "speech_chunk_playback_retrying",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    retry_attempt=attempt + 1,
-                    max_retries=self.playback_underflow_retries,
-                    recovery_duration_ms=playback_recovery_duration_ms,
-                )
-                return
-
-            raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
-
-        def flush_buffered_chunks() -> None:
-            nonlocal process, process_state, stderr_thread, next_chunk_index, total_sample_count
-            while buffered_wav_chunks:
-                current_chunk_result = buffered_chunk_payloads[0]
-                current_wav_data = buffered_wav_chunks[0]
-                current_waveform = cast(np.ndarray, current_chunk_result["waveform"])
-                current_chunk_index = next_chunk_index
-
-                with self._lock:
-                    self._set_speech_phase_locked("playing")
-                    self._speech_current_chunk_index = current_chunk_index
-                    self._speech_current_chunk_count = len(normalized_chunks)
-                    self._current_chunk_started_at = _utc_now()
-                self._emit_runtime_event(
-                    "speech_chunk_playback_started",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=current_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    sample_count=int(current_waveform.shape[0]),
-                )
-                if current_chunk_index == 1:
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_chunk_playback_started",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        player="wavbuffer-subprocess",
-                        chunk_index=current_chunk_index,
-                        chunk_count=len(normalized_chunks),
-                    )
-                assert self._current_chunk_started_at is not None
-                attempt = 0
-                while True:
-                    if process is None:
-                        with self._lock:
-                            self._set_speech_phase_locked("opening_output")
-                        process, process_state, stderr_thread = start_process()
-
-                    assert process is not None
-                    assert process_state is not None
-                    try:
-                        assert process.stdin is not None
-                        process.stdin.write(current_wav_data)
-                        process.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        maybe_retry_current_chunk(
-                            chunk_index=current_chunk_index,
-                            chunk_started_at=self._current_chunk_started_at,
-                            attempt=attempt,
-                        )
-                        attempt += 1
-                        continue
-
-                    if process.poll() is not None:
-                        maybe_retry_current_chunk(
-                            chunk_index=current_chunk_index,
-                            chunk_started_at=self._current_chunk_started_at,
-                            attempt=attempt,
-                        )
-                        attempt += 1
-                        continue
-
-                    break
-
-                total_sample_count += int(current_waveform.shape[0])
-                self._emit_runtime_event(
-                    "speech_chunk_playback_handoff_completed",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=current_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    playback_duration_ms=_duration_ms(self._current_chunk_started_at, _utc_now()),
-                )
-                buffered_wav_chunks.pop(0)
-                buffered_chunk_payloads.pop(0)
-                next_chunk_index += 1
+            if process.poll() is not None:
+                _, error_detail = stop_process(close_stdin=False)
+                raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
 
         try:
             while True:
@@ -2511,86 +2499,91 @@ class TTSRuntime:
                     waveform=waveform,
                     sample_rate=sample_rate,
                 )
-                buffered_wav_chunks.append(wav_data)
-                buffered_chunk_payloads.append(chunk_result)
-                buffered_audio_seconds = round(
-                    sum(
-                        float(cast(float, item["audio_duration_seconds"]))
-                        for item in buffered_chunk_payloads
-                    ),
-                    3,
-                )
-                admission = self._evaluate_playback_start_admission(
-                    job_metrics=job_metrics,
-                    total_chunk_count=len(normalized_chunks),
-                    buffered_chunk_count=len(buffered_chunk_payloads),
-                    buffered_audio_seconds=buffered_audio_seconds,
-                    synthesis_done=False,
-                )
-                if process is None and not admission["admit"]:
-                    self._record_playback_start_deferred(
-                        job_metrics=job_metrics,
-                        buffered_chunk_count=len(buffered_chunk_payloads),
-                        buffered_audio_seconds=buffered_audio_seconds,
-                        admission=admission,
-                    )
-                    continue
 
                 if process is None:
                     with self._lock:
                         self._set_speech_phase_locked("opening_output")
-                    process, process_state, stderr_thread = start_process()
-                    self._record_playback_start_admitted(
-                        job_metrics=job_metrics,
-                        buffered_chunk_count=len(buffered_chunk_payloads),
-                        buffered_audio_seconds=buffered_audio_seconds,
-                        admission=admission,
+                    process, process_state, stderr_thread = start_process(
+                        current_sample_rate=sample_rate,
+                        current_channel_count=channel_count,
                     )
+                    job_metrics["start_admission_reason"] = "swift_owned_buffering"
 
-                flush_buffered_chunks()
+                current_chunk_index = next_chunk_index
+                current_payload = (
+                    self._encode_wavbuffer_audio_chunk_frame(wav_data=wav_data)
+                    if self.wavbuffer_input_protocol == "service-v1"
+                    else wav_data
+                )
+
+                with self._lock:
+                    self._set_speech_phase_locked("playing")
+                    self._speech_current_chunk_index = current_chunk_index
+                    self._speech_current_chunk_count = len(normalized_chunks)
+                    self._current_chunk_started_at = _utc_now()
+                self._emit_runtime_event(
+                    "speech_chunk_playback_started",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=current_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    sample_count=int(waveform.shape[0]),
+                )
+                if current_chunk_index == 1:
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_chunk_playback_started",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        player="wavbuffer-subprocess",
+                        chunk_index=current_chunk_index,
+                        chunk_count=len(normalized_chunks),
+                    )
+                assert self._current_chunk_started_at is not None
+                write_payload_or_fail(
+                    payload=current_payload,
+                    context=f"chunk {current_chunk_index}",
+                )
+                total_sample_count += int(waveform.shape[0])
+                self._emit_runtime_event(
+                    "speech_chunk_playback_handoff_completed",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=current_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    playback_duration_ms=_duration_ms(self._current_chunk_started_at, _utc_now()),
+                )
+                next_chunk_index += 1
 
             if producer_error:
-                raise RuntimeError(str(producer_error[0])) from producer_error[0]
+                if process is None:
+                    raise RuntimeError(str(producer_error[0])) from producer_error[0]
+                if self.wavbuffer_input_protocol == "service-v1":
+                    write_payload_or_fail(
+                        payload=self._encode_wavbuffer_stream_failed_frame(
+                            reason=str(producer_error[0])
+                        ),
+                        context="stream failure signal",
+                    )
+                returncode, error_detail = stop_process(close_stdin=True)
+                raise RuntimeError(
+                    f"wavbuffer playback failed: {error_detail}"
+                ) from producer_error[0]
 
             if process is None:
-                if not buffered_wav_chunks:
-                    raise RuntimeError("no speech chunks were available for playback")
-                buffered_audio_seconds = round(
-                    sum(
-                        float(cast(float, item["audio_duration_seconds"]))
-                        for item in buffered_chunk_payloads
-                    ),
-                    3,
-                )
-                admission = self._evaluate_playback_start_admission(
-                    job_metrics=job_metrics,
-                    total_chunk_count=len(normalized_chunks),
-                    buffered_chunk_count=len(buffered_chunk_payloads),
-                    buffered_audio_seconds=buffered_audio_seconds,
-                    synthesis_done=True,
-                )
-                if not admission["admit"]:
-                    self._record_playback_start_deferred(
-                        job_metrics=job_metrics,
-                        buffered_chunk_count=len(buffered_chunk_payloads),
-                        buffered_audio_seconds=buffered_audio_seconds,
-                        admission=admission,
-                    )
-                    raise RuntimeError(
-                        "live playback admission rejected: insufficient real-time safety margin"
-                    )
-                with self._lock:
-                    self._set_speech_phase_locked("opening_output")
-                process, process_state, stderr_thread = start_process()
-                self._record_playback_start_admitted(
-                    job_metrics=job_metrics,
-                    buffered_chunk_count=len(buffered_chunk_payloads),
-                    buffered_audio_seconds=buffered_audio_seconds,
-                    admission=admission,
-                )
-                flush_buffered_chunks()
+                raise RuntimeError("no speech chunks were available for playback")
 
-            returncode, error_detail, _ = stop_process(close_stdin=True)
+            if self.wavbuffer_input_protocol == "service-v1":
+                write_payload_or_fail(
+                    payload=self._encode_wavbuffer_stream_end_frame(),
+                    context="stream end signal",
+                )
+
+            returncode, error_detail = stop_process(close_stdin=True)
             if returncode not in {0, None}:
                 raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
 
@@ -2790,12 +2783,85 @@ class TTSRuntime:
         )
         return header + pcm_data
 
+    def _encode_wavbuffer_service_frame(self, *, record_type: int, payload: bytes = b"") -> bytes:
+        return b"STU1" + struct.pack("<BI", record_type, len(payload)) + payload
+
+    def _encode_wavbuffer_service_config_frame(
+        self,
+        *,
+        chunk_count: int,
+        sample_rate: int,
+        channel_count: int,
+    ) -> bytes:
+        payload = json.dumps(
+            {
+                "protocolVersion": 1,
+                "starvationTimeoutSeconds": self.wavbuffer_starvation_timeout_seconds,
+                "expectedChunkCount": chunk_count,
+                "expectedSampleRate": float(sample_rate),
+                "expectedChannelCount": channel_count,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+        return self._encode_wavbuffer_service_frame(record_type=1, payload=payload)
+
+    def _encode_wavbuffer_audio_chunk_frame(self, *, wav_data: bytes) -> bytes:
+        return self._encode_wavbuffer_service_frame(record_type=2, payload=wav_data)
+
+    def _encode_wavbuffer_stream_end_frame(self) -> bytes:
+        return self._encode_wavbuffer_service_frame(record_type=3)
+
+    def _encode_wavbuffer_stream_failed_frame(self, *, reason: str) -> bytes:
+        return self._encode_wavbuffer_service_frame(
+            record_type=4,
+            payload=reason.encode("utf-8"),
+        )
+
+    def _validate_waveform_for_playback(
+        self,
+        *,
+        waveform: np.ndarray,
+        sample_rate: int,
+    ) -> dict[str, float]:
+        waveform_array = np.asarray(waveform, dtype=np.float32)
+        if waveform_array.size <= 0:
+            raise WaveformValidationError("waveform was empty")
+        if waveform_array.ndim not in {1, 2}:
+            raise WaveformValidationError("waveform had invalid rank after coercion")
+        if not np.isfinite(waveform_array).all():
+            raise WaveformValidationError("waveform contained non-finite samples")
+        if sample_rate <= 0:
+            raise WaveformValidationError("waveform sample rate must be positive")
+
+        max_abs_sample = float(np.max(np.abs(waveform_array)))
+        if max_abs_sample > self.tts_waveform_max_abs_sample:
+            raise WaveformValidationError(
+                "waveform exceeded max abs sample "
+                f"{self.tts_waveform_max_abs_sample:.3f} ({max_abs_sample:.3f})"
+            )
+
+        clipped_fraction = float(
+            np.mean(np.abs(waveform_array) >= DEFAULT_TTS_WAVEFORM_CLIP_THRESHOLD)
+        )
+        if clipped_fraction > self.tts_waveform_max_clipped_fraction:
+            raise WaveformValidationError(
+                "waveform clipped fraction exceeded "
+                f"{self.tts_waveform_max_clipped_fraction:.3f} ({clipped_fraction:.3f})"
+            )
+
+        return {
+            "max_abs_sample": round(max_abs_sample, 6),
+            "clipped_fraction": round(clipped_fraction, 6),
+        }
+
     def _wavbuffer_preroll_args(self, *, chunk_count: int | None = None) -> list[str]:
         mode = self.wavbuffer_preroll_mode
         if mode == "auto":
             mode = "seconds"
 
         if mode == "buffers":
+            if self.wavbuffer_input_protocol == "service-v1":
+                return ["--preroll-buffers", str(self.playback_preroll_chunks)]
             effective_chunk_count = chunk_count if chunk_count is not None else 1
             return [
                 "--preroll-buffers",
@@ -2804,12 +2870,22 @@ class TTSRuntime:
         return ["--preroll-seconds", str(self.playback_preroll_seconds)]
 
     def _wavbuffer_command(self, *, chunk_count: int | None = None) -> list[str]:
-        return [
+        command = [
             self.wavbuffer_binary_path,
             "--queue-depth",
             str(self.wavbuffer_queue_depth),
-            *self._wavbuffer_preroll_args(chunk_count=chunk_count),
         ]
+        if self.wavbuffer_input_protocol == "service-v1":
+            command.extend(
+                [
+                    "--input-protocol",
+                    self.wavbuffer_input_protocol,
+                    "--starvation-timeout-seconds",
+                    str(self.wavbuffer_starvation_timeout_seconds),
+                ]
+            )
+        command.extend(self._wavbuffer_preroll_args(chunk_count=chunk_count))
+        return command
 
     def _spawn_wavbuffer_process(self, command: list[str]) -> Any:
         binary_path = Path(command[0]).expanduser()
@@ -2858,11 +2934,6 @@ class TTSRuntime:
                 ):
                     state["playback_started_at"] = _utc_now()
                     state["playback_started_event"] = dict(parsed_event)
-                if (
-                    wavbuffer_event_name == "underrun"
-                    or parsed_event.get("reason") == "stream_starved"
-                ):
-                    state["retryable_failure"] = True
                 self._emit_runtime_event(
                     "speech_wavbuffer_event_received",
                     level="info",
@@ -3025,11 +3096,16 @@ class TTSRuntime:
             "wavbuffer_binary_path": self.wavbuffer_binary_path,
             "wavbuffer_queue_depth": self.wavbuffer_queue_depth,
             "wavbuffer_preroll_mode": self.wavbuffer_preroll_mode,
+            "wavbuffer_input_protocol": self.wavbuffer_input_protocol,
+            "wavbuffer_starvation_timeout_seconds": self.wavbuffer_starvation_timeout_seconds,
             "effective_preroll_policy": EFFECTIVE_PREROLL_POLICY,
             "tts_chunk_max_chars": self.tts_chunk_max_chars,
             "tts_max_new_tokens": self.tts_max_new_tokens,
             "tts_max_chunk_synth_seconds": self.tts_max_chunk_synth_seconds,
             "tts_max_chunk_audio_seconds": self.tts_max_chunk_audio_seconds,
+            "tts_chunk_regen_retries": self.tts_chunk_regen_retries,
+            "tts_waveform_max_abs_sample": self.tts_waveform_max_abs_sample,
+            "tts_waveform_max_clipped_fraction": self.tts_waveform_max_clipped_fraction,
             "output_stream_latency": self.output_stream_latency,
             "log_level": self.log_level,
             "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
@@ -3410,6 +3486,10 @@ class TTSRuntime:
             raise RuntimeError("model returned no waveform for synthesized chunk")
 
         waveform = waveforms[0]
+        waveform_validation = self._validate_waveform_for_playback(
+            waveform=waveform,
+            sample_rate=sample_rate,
+        )
         sample_count = int(waveform.shape[0])
         audio_duration_seconds = sample_count / sample_rate
         if audio_duration_seconds > self.tts_max_chunk_audio_seconds:
@@ -3446,6 +3526,8 @@ class TTSRuntime:
                 "synth_duration_ms": synth_duration_ms,
                 "sample_count": sample_count,
                 "audio_duration_seconds": round(audio_duration_seconds, 3),
+                "waveform_max_abs_sample": waveform_validation["max_abs_sample"],
+                "waveform_clipped_fraction": waveform_validation["clipped_fraction"],
             }
 
     def _load_model_impl(self, model_kind: str) -> Any:

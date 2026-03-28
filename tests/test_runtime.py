@@ -14,7 +14,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import app.runtime as runtime_module
-from app.runtime import CLONE_MODEL_KIND, TTSRuntime, VOICE_DESIGN_MODEL_KIND
+from app.runtime import (
+    CLONE_MODEL_KIND,
+    TTSRuntime,
+    VOICE_DESIGN_MODEL_KIND,
+    WaveformValidationError,
+)
 from fastmcp.server.server import StateValue
 
 
@@ -158,6 +163,8 @@ def test_from_env_reads_wavbuffer_settings(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("SPEAK_TO_USER_WAVBUFFER_BINARY_PATH", "/tmp/wavbuffer")
     monkeypatch.setenv("SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH", "4")
     monkeypatch.setenv("SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE", "buffers")
+    monkeypatch.setenv("SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL", "service-v1")
+    monkeypatch.setenv("SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS", "55")
 
     runtime = TTSRuntime.from_env()
 
@@ -165,6 +172,8 @@ def test_from_env_reads_wavbuffer_settings(monkeypatch: pytest.MonkeyPatch) -> N
     assert runtime.wavbuffer_binary_path == "/tmp/wavbuffer"
     assert runtime.wavbuffer_queue_depth == 4
     assert runtime.wavbuffer_preroll_mode == "buffers"
+    assert runtime.wavbuffer_input_protocol == "service-v1"
+    assert runtime.wavbuffer_starvation_timeout_seconds == 55.0
 
 
 def test_from_env_reads_tts_chunk_guardrails(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,6 +181,9 @@ def test_from_env_reads_tts_chunk_guardrails(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setenv("SPEAK_TO_USER_TTS_MAX_NEW_TOKENS", "512")
     monkeypatch.setenv("SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS", "45")
     monkeypatch.setenv("SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS", "18")
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES", "3")
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE", "1.4")
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION", "0.05")
 
     runtime = TTSRuntime.from_env()
 
@@ -179,6 +191,9 @@ def test_from_env_reads_tts_chunk_guardrails(monkeypatch: pytest.MonkeyPatch) ->
     assert runtime.tts_max_new_tokens == 512
     assert runtime.tts_max_chunk_synth_seconds == 45.0
     assert runtime.tts_max_chunk_audio_seconds == 18.0
+    assert runtime.tts_chunk_regen_retries == 3
+    assert runtime.tts_waveform_max_abs_sample == 1.4
+    assert runtime.tts_waveform_max_clipped_fraction == 0.05
 
 
 def test_from_env_reads_null_playback_backend(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1048,6 +1063,10 @@ def test_wavbuffer_command_uses_seconds_preroll_by_default(tmp_path: Path) -> No
         "/tmp/wavbuffer",
         "--queue-depth",
         "6",
+        "--input-protocol",
+        "service-v1",
+        "--starvation-timeout-seconds",
+        "45.0",
         "--preroll-seconds",
         "1.5",
     ]
@@ -1063,8 +1082,12 @@ def test_wavbuffer_command_uses_buffer_preroll_when_configured(tmp_path: Path) -
         "/tmp/wavbuffer",
         "--queue-depth",
         "8",
+        "--input-protocol",
+        "service-v1",
+        "--starvation-timeout-seconds",
+        "45.0",
         "--preroll-buffers",
-        "2",
+        "3",
     ]
 
 
@@ -1076,6 +1099,26 @@ def test_effective_preroll_chunk_target_balances_short_and_long_jobs(tmp_path: P
     assert runtime._effective_preroll_chunk_target(2) == 1
     assert runtime._effective_preroll_chunk_target(3) == 2
     assert runtime._effective_preroll_chunk_target(7) == 2
+
+
+def test_validate_waveform_for_playback_rejects_nonfinite_samples(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    with pytest.raises(WaveformValidationError, match="non-finite"):
+        runtime._validate_waveform_for_playback(
+            waveform=np.array([0.0, np.nan], dtype=np.float32),
+            sample_rate=24000,
+        )
+
+
+def test_validate_waveform_for_playback_rejects_clipped_fraction(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    with pytest.raises(WaveformValidationError, match="clipped fraction exceeded"):
+        runtime._validate_waveform_for_playback(
+            waveform=np.array([1.0, 1.0, 0.2], dtype=np.float32),
+            sample_rate=24000,
+        )
 
 
 def test_playback_start_chunk_target_holds_longer_replies_longer(tmp_path: Path) -> None:
@@ -1341,7 +1384,7 @@ def test_play_speech_chunks_recovers_from_output_underflow(
     )
 
 
-def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
+def test_play_speech_chunks_with_wavbuffer_sends_service_frames(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -1360,13 +1403,10 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
             return b""
 
     class FakeStdin:
-        def __init__(self, *, fail_on_write: bool = False) -> None:
-            self._fail_on_write = fail_on_write
+        def __init__(self) -> None:
             self.closed = False
 
         def write(self, payload: bytes) -> int:
-            if self._fail_on_write:
-                raise BrokenPipeError("stream starved")
             written_chunks.append(payload)
             return len(payload)
 
@@ -1381,12 +1421,11 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
             self,
             *,
             pid: int,
-            fail_on_write: bool,
             returncode: int,
             stderr_lines: list[bytes],
         ) -> None:
             self.pid = pid
-            self.stdin = FakeStdin(fail_on_write=fail_on_write)
+            self.stdin = FakeStdin()
             self.stderr = FakeStderr(stderr_lines)
             self._returncode = returncode
 
@@ -1401,22 +1440,12 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
     processes = [
         FakeProcess(
             pid=101,
-            fail_on_write=True,
-            returncode=1,
-            stderr_lines=[
-                b'wavbuffer event=underrun buffered_buffers=0\n',
-                b'wavbuffer event=error reason="stream_starved" description="starved"\n',
-            ],
-        ),
-        FakeProcess(
-            pid=102,
-            fail_on_write=False,
             returncode=0,
             stderr_lines=[
                 b'wavbuffer event=engine_started format="pcm"\n',
                 (
                     b'wavbuffer event=playback_started buffered_buffers=1 '
-                    b'buffered_seconds=0.5 reason="forced_input_completed"\n'
+                    b'buffered_seconds=0.5 reason="threshold_met"\n'
                 ),
                 b'wavbuffer event=completed preroll="seconds"\n',
             ],
@@ -1445,19 +1474,15 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
 
     assert result["played"] is True
     assert result["player"] == "wavbuffer-subprocess"
-    assert len(written_chunks) == 1
+    assert len(written_chunks) == 3
+    assert written_chunks[0].startswith(b"STU1")
+    assert written_chunks[1].startswith(b"STU1")
+    assert written_chunks[2].startswith(b"STU1")
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert any(event["event"] == "speech_wavbuffer_event_received" for event in recent_events)
-    assert any(event["event"] == "speech_chunk_playback_retrying" for event in recent_events)
-    assert any(event["event"] == "speech_playback_start_admitted" for event in recent_events)
     assert any(
         event["event"] == "speech_first_audio_started"
-        and event.get("reason") == "forced_input_completed"
-        for event in recent_events
-    )
-    assert any(
-        event["event"] == "speech_job_metrics_summary"
-        and event.get("wavbuffer_forced_input_completed") is True
+        and event.get("reason") == "threshold_met"
         for event in recent_events
     )
     assert any(
@@ -1466,14 +1491,14 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
     )
 
 
-def test_play_speech_chunks_with_wavbuffer_fails_after_retry_budget_exhausted(
+def test_play_speech_chunks_with_wavbuffer_reports_stream_failure_without_restart(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     runtime = make_runtime(tmp_path)
     runtime.playback_backend = "wavbuffer"
     runtime.wavbuffer_binary_path = "/tmp/wavbuffer"
-    runtime.playback_underflow_retries = 1
+    written_chunks: list[bytes] = []
 
     class FakeStderr:
         def __init__(self, lines: list[bytes]) -> None:
@@ -1486,8 +1511,8 @@ def test_play_speech_chunks_with_wavbuffer_fails_after_retry_budget_exhausted(
 
     class FakeStdin:
         def write(self, payload: bytes) -> int:
-            del payload
-            raise BrokenPipeError("stream starved")
+            written_chunks.append(payload)
+            return len(payload)
 
         def flush(self) -> None:
             return None
@@ -1501,41 +1526,82 @@ def test_play_speech_chunks_with_wavbuffer_fails_after_retry_budget_exhausted(
             self.stdin = FakeStdin()
             self.stderr = FakeStderr(
                 [
-                    b'wavbuffer event=underrun buffered_buffers=0\n',
-                    b'wavbuffer event=error reason="stream_starved" description="starved"\n',
+                    b'wavbuffer event=engine_started format="pcm"\n',
+                    b'wavbuffer event=error reason="stream_failed" description="stream failed"\n',
                 ]
             )
 
         def poll(self) -> int | None:
-            return 1
+            return None if not written_chunks or len(written_chunks) < 3 else 1
 
         def wait(self) -> int:
             return 1
 
-    processes = [FakeProcess(201), FakeProcess(202)]
-    monkeypatch.setattr(runtime, "_spawn_wavbuffer_process", lambda command: processes.pop(0))
-    monkeypatch.setattr(
-        runtime,
-        "_synthesize_audio_chunk",
-        lambda **kwargs: {
+    monkeypatch.setattr(runtime, "_spawn_wavbuffer_process", lambda command: FakeProcess(201))
+    synth_attempts = {"count": 0}
+
+    def fake_synthesize(**kwargs: object) -> dict[str, object]:
+        synth_attempts["count"] += 1
+        if synth_attempts["count"] >= 2:
+            raise RuntimeError("waveform validation failed")
+        return {
             "waveform": np.array([0.0, 0.1, 0.2], dtype=np.float32),
             "sample_rate": 24000,
             "model_id": "Qwen/test-clone",
             "device": "cpu",
             "language": kwargs["language"],
-        },
+        }
+
+    monkeypatch.setattr(
+        runtime,
+        "_synthesize_audio_chunk",
+        fake_synthesize,
     )
 
-    with pytest.raises(
-        RuntimeError,
-        match="audio output underflowed during streamed playback after 2 attempt\\(s\\)",
-    ):
+    with pytest.raises(RuntimeError, match="wavbuffer playback failed"):
         runtime.play_speech_chunks(
             mode=CLONE_MODEL_KIND,
-            chunks=["Hello there"],
+            chunks=["Hello there", "Another chunk"],
             reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
             language="en",
         )
+    assert len(written_chunks) == 3
+
+
+def test_waveform_regeneration_retries_invalid_chunk_before_queueing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.playback_backend = "null"
+    runtime.tts_chunk_regen_retries = 1
+    synth_attempts = {"count": 0}
+
+    def fake_synthesize(**kwargs: object) -> dict[str, object]:
+        synth_attempts["count"] += 1
+        if synth_attempts["count"] == 1:
+            raise WaveformValidationError("waveform contained non-finite samples")
+        return {
+            "waveform": np.array([0.0, 0.1, 0.2], dtype=np.float32),
+            "sample_rate": 24000,
+            "model_id": "Qwen/test-clone",
+            "device": "cpu",
+            "language": kwargs["language"],
+        }
+
+    monkeypatch.setattr(runtime, "_synthesize_audio_chunk", fake_synthesize)
+
+    result = runtime.play_speech_chunks(
+        mode=CLONE_MODEL_KIND,
+        chunks=["Hello there"],
+        reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
+        language="en",
+    )
+
+    assert result["played"] is True
+    assert synth_attempts["count"] == 2
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert any(event["event"] == "speech_chunk_regeneration_retrying" for event in recent_events)
 
 
 def test_play_speech_chunks_with_null_backend_discards_audio(tmp_path: Path) -> None:
