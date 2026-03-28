@@ -18,6 +18,7 @@ from app import server
 
 class StubRuntime:
     def __init__(self) -> None:
+        self.tts_chunk_max_chars = 360
         self.status_payload = {
             "ready": True,
             "model_loaded": True,
@@ -66,6 +67,10 @@ class StubRuntime:
             "speech_last_error": None,
             "speech_last_event_at": None,
             "speech_last_event": None,
+            "tts_chunk_max_chars": 360,
+            "tts_max_new_tokens": 384,
+            "tts_max_chunk_synth_seconds": 30.0,
+            "tts_max_chunk_audio_seconds": 20.0,
             "recent_events": [],
             "current_job_started_at": None,
             "current_chunk_started_at": None,
@@ -749,6 +754,31 @@ def test_speak_text_queues_audio() -> None:
         {
             "mode": "voice_design",
             "chunks": ["hello"],
+            "voice_description": "warm",
+            "language": "en",
+        }
+    ]
+
+
+def test_speak_text_respects_runtime_chunk_limit() -> None:
+    runtime = StubRuntime()
+    runtime.tts_chunk_max_chars = 5
+    runtime.status_payload["tts_chunk_max_chars"] = 5
+    ctx = StubContext(runtime)
+
+    result = asyncio.run(
+        server.speak_text(
+            "alpha beta gamma",
+            "warm",
+            ctx=cast(Context, ctx),
+        )
+    )
+
+    assert result["result"] == "success"
+    assert runtime.queued_jobs == [
+        {
+            "mode": "voice_design",
+            "chunks": ["alpha", "beta", "gamma"],
             "voice_description": "warm",
             "language": "en",
         }

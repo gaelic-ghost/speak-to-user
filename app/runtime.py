@@ -23,6 +23,7 @@ import numpy as np
 import sounddevice as sd  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
+from app.text_chunking import DEFAULT_TTS_CHUNK_MAX_CHARS
 from fastmcp.server.server import StateValue
 
 # MARK: Constants
@@ -44,6 +45,9 @@ DEFAULT_OUTPUT_STREAM_LATENCY = "high"
 DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
 DEFAULT_SPEECH_PHASE = "idle"
 VOICE_DESIGN_PROFILE_SEED_MAX_CHARS = 240
+DEFAULT_TTS_MAX_NEW_TOKENS = 384
+DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS = 30.0
+DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS = 20.0
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_RECENT_EVENT_LIMIT = 100
 SPEECH_PROFILE_COLLECTION = "speak_to_user_profiles"
@@ -432,6 +436,10 @@ class TTSRuntime:
         wavbuffer_binary_path: str | None = None,
         wavbuffer_queue_depth: int = DEFAULT_WAVBUFFER_QUEUE_DEPTH,
         wavbuffer_preroll_mode: str = DEFAULT_WAVBUFFER_PREROLL_MODE,
+        tts_chunk_max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS,
+        tts_max_new_tokens: int = DEFAULT_TTS_MAX_NEW_TOKENS,
+        tts_max_chunk_synth_seconds: float = DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS,
+        tts_max_chunk_audio_seconds: float = DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS,
         output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
         log_level: str = DEFAULT_LOG_LEVEL,
     ) -> None:
@@ -460,6 +468,10 @@ class TTSRuntime:
             self.wavbuffer_binary_path = _default_wavbuffer_binary_path()
         self.wavbuffer_queue_depth = wavbuffer_queue_depth
         self.wavbuffer_preroll_mode = wavbuffer_preroll_mode
+        self.tts_chunk_max_chars = tts_chunk_max_chars
+        self.tts_max_new_tokens = tts_max_new_tokens
+        self.tts_max_chunk_synth_seconds = tts_max_chunk_synth_seconds
+        self.tts_max_chunk_audio_seconds = tts_max_chunk_audio_seconds
         self.output_stream_latency = output_stream_latency
         self.log_level = log_level
 
@@ -564,6 +576,26 @@ class TTSRuntime:
             ),
             wavbuffer_preroll_mode=_normalize_wavbuffer_preroll_mode(
                 os.getenv("SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE")
+            ),
+            tts_chunk_max_chars=_normalize_positive_int(
+                os.getenv("SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS"),
+                env_var="SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS",
+                default=DEFAULT_TTS_CHUNK_MAX_CHARS,
+            ),
+            tts_max_new_tokens=_normalize_positive_int(
+                os.getenv("SPEAK_TO_USER_TTS_MAX_NEW_TOKENS"),
+                env_var="SPEAK_TO_USER_TTS_MAX_NEW_TOKENS",
+                default=DEFAULT_TTS_MAX_NEW_TOKENS,
+            ),
+            tts_max_chunk_synth_seconds=_normalize_positive_float(
+                os.getenv("SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS"),
+                env_var="SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS",
+                default=DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS,
+            ),
+            tts_max_chunk_audio_seconds=_normalize_positive_float(
+                os.getenv("SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS"),
+                env_var="SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS",
+                default=DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS,
             ),
             output_stream_latency=_normalize_output_stream_latency(
                 os.getenv("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY")
@@ -1193,7 +1225,6 @@ class TTSRuntime:
         def synthesize_into_queue() -> None:
             try:
                 for chunk_index, text_chunk in enumerate(normalized_chunks, start=1):
-                    synth_started_at = _utc_now()
                     self._emit_runtime_event(
                         "speech_chunk_synthesis_started",
                         level="info",
@@ -1221,6 +1252,22 @@ class TTSRuntime:
                         voice_clone_prompt_items=voice_clone_prompt_items,
                     )
                     waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
+                    chunk_sample_rate = int(chunk_result["sample_rate"])
+                    chunk_sample_count = int(
+                        cast(int, chunk_result.get("sample_count", int(waveform.shape[0])))
+                    )
+                    chunk_audio_duration_seconds = float(
+                        cast(
+                            float,
+                            chunk_result.get(
+                                "audio_duration_seconds",
+                                round(chunk_sample_count / chunk_sample_rate, 3),
+                            ),
+                        )
+                    )
+                    chunk_synth_duration_ms = int(
+                        cast(int, chunk_result.get("synth_duration_ms", 0))
+                    )
                     self._emit_runtime_event(
                         "speech_chunk_synthesis_completed",
                         level="info",
@@ -1228,8 +1275,9 @@ class TTSRuntime:
                         mode=mode,
                         chunk_index=chunk_index,
                         chunk_count=len(normalized_chunks),
-                        synth_duration_ms=_duration_ms(synth_started_at, _utc_now()),
-                        sample_count=int(waveform.shape[0]),
+                        synth_duration_ms=chunk_synth_duration_ms,
+                        sample_count=chunk_sample_count,
+                        audio_duration_seconds=chunk_audio_duration_seconds,
                     )
                     self._emit_runtime_memory_snapshot(
                         level="info",
@@ -2258,6 +2306,10 @@ class TTSRuntime:
             "wavbuffer_binary_path": self.wavbuffer_binary_path,
             "wavbuffer_queue_depth": self.wavbuffer_queue_depth,
             "wavbuffer_preroll_mode": self.wavbuffer_preroll_mode,
+            "tts_chunk_max_chars": self.tts_chunk_max_chars,
+            "tts_max_new_tokens": self.tts_max_new_tokens,
+            "tts_max_chunk_synth_seconds": self.tts_max_chunk_synth_seconds,
+            "tts_max_chunk_audio_seconds": self.tts_max_chunk_audio_seconds,
             "output_stream_latency": self.output_stream_latency,
             "log_level": self.log_level,
             "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
@@ -2536,6 +2588,7 @@ class TTSRuntime:
                     text=text,
                     language=language,
                     instruct=voice_description,
+                    max_new_tokens=self.tts_max_new_tokens,
                     non_streaming_mode=True,
                 )
                 return cast(list[Any], wavs), int(sample_rate)
@@ -2543,6 +2596,7 @@ class TTSRuntime:
             generate_kwargs: dict[str, Any] = {
                 "text": text,
                 "language": language,
+                "max_new_tokens": self.tts_max_new_tokens,
                 "non_streaming_mode": True,
             }
             if voice_clone_prompt_items is not None:
@@ -2555,6 +2609,8 @@ class TTSRuntime:
                     generate_kwargs["ref_text"] = reference_text
             wavs, sample_rate = active_model.generate_voice_clone(**generate_kwargs)
             return cast(list[Any], wavs), int(sample_rate)
+
+        generate_started_at = _utc_now()
 
         try:
             wavs, sample_rate = generate(model)
@@ -2601,9 +2657,53 @@ class TTSRuntime:
                 )
                 raise
 
+        generate_completed_at = _utc_now()
+        synth_duration_ms = _duration_ms(generate_started_at, generate_completed_at)
+        if (
+            synth_duration_ms is not None
+            and synth_duration_ms > int(self.tts_max_chunk_synth_seconds * 1000)
+        ):
+            self._emit_runtime_event(
+                "speech_chunk_synthesis_guardrail_tripped",
+                level="minimal",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                guardrail="synth_duration",
+                synth_duration_ms=synth_duration_ms,
+                max_chunk_synth_seconds=self.tts_max_chunk_synth_seconds,
+                chunk_char_count=len(text),
+            )
+            raise RuntimeError(
+                "chunk synthesis exceeded "
+                f"{self.tts_max_chunk_synth_seconds:.1f}s guardrail "
+                f"({synth_duration_ms}ms)"
+            )
+
         waveforms = [self._coerce_waveform(waveform) for waveform in wavs]
         if not waveforms:
             raise RuntimeError("model returned no waveform for synthesized chunk")
+
+        waveform = waveforms[0]
+        sample_count = int(waveform.shape[0])
+        audio_duration_seconds = sample_count / sample_rate
+        if audio_duration_seconds > self.tts_max_chunk_audio_seconds:
+            self._emit_runtime_event(
+                "speech_chunk_synthesis_guardrail_tripped",
+                level="minimal",
+                job_id=self._speech_current_job_id,
+                mode=mode,
+                guardrail="audio_duration",
+                sample_count=sample_count,
+                sample_rate=sample_rate,
+                audio_duration_seconds=round(audio_duration_seconds, 3),
+                max_chunk_audio_seconds=self.tts_max_chunk_audio_seconds,
+                chunk_char_count=len(text),
+            )
+            raise RuntimeError(
+                "chunk audio duration exceeded "
+                f"{self.tts_max_chunk_audio_seconds:.1f}s guardrail "
+                f"({audio_duration_seconds:.3f}s)"
+            )
 
         with self._lock:
             slot = self._model_state(mode)
@@ -2612,11 +2712,14 @@ class TTSRuntime:
             self._last_error = None
             self._touch_model_locked(mode, now)
             return {
-                "waveform": waveforms[0],
+                "waveform": waveform,
                 "sample_rate": sample_rate,
                 "model_id": slot["model_id"],
                 "device": slot["resolved_device"],
                 "language": language,
+                "synth_duration_ms": synth_duration_ms,
+                "sample_count": sample_count,
+                "audio_duration_seconds": round(audio_duration_seconds, 3),
             }
 
     def _load_model_impl(self, model_kind: str) -> Any:

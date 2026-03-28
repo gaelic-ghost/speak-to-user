@@ -192,7 +192,7 @@ async def speak_text(
     )
 
     return runtime.speak_text(
-        chunks=chunk_text_for_tts(normalized_text),
+        chunks=chunk_text_for_tts(normalized_text, max_chars=runtime.tts_chunk_max_chars),
         voice_description=voice_description,
         language=language,
     )
@@ -221,7 +221,7 @@ async def speak_text_as_clone(
     )
 
     return runtime.speak_text_as_clone(
-        chunks=chunk_text_for_tts(normalized_text),
+        chunks=chunk_text_for_tts(normalized_text, max_chars=runtime.tts_chunk_max_chars),
         reference_audio_path=normalized_reference_audio_path,
         reference_text=reference_text,
         language=language,
@@ -318,6 +318,6 @@ async def speak_with_profile(
     return await runtime.speak_with_profile(
         state_store=_state_store_from_context(ctx),
         name=name,
-        chunks=chunk_text_for_tts(normalized_text),
+        chunks=chunk_text_for_tts(normalized_text, max_chars=runtime.tts_chunk_max_chars),
         language=language,
     )

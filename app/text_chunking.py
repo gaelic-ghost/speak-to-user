@@ -4,7 +4,7 @@ import re
 
 # MARK: Constants
 
-DEFAULT_TTS_CHUNK_MAX_CHARS = 1200
+DEFAULT_TTS_CHUNK_MAX_CHARS = 360
 _SENTENCE_BREAK_RE = re.compile(r"(?<=[.!?])\s+")
 
 

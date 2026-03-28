@@ -201,6 +201,14 @@ Recommended profile workflow:
 - `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE`
   Allowed values: `auto`, `seconds`, `buffers`
   Default: `seconds`
+- `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS`
+  Default: `360`
+- `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS`
+  Default: `384`
+- `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS`
+  Default: `30.0`
+- `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS`
+  Default: `20.0`
 - `SPEAK_TO_USER_OUTPUT_STREAM_LATENCY`
   Allowed values: `low`, `high`, or a positive number
   Default: `high`
@@ -230,6 +238,10 @@ Operational notes:
 - `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=auto` currently resolves to `seconds` so the runtime passes exactly one preroll flag to `wavbuffer`
 - when `SPEAK_TO_USER_PLAYBACK_BACKEND=wavbuffer`, native preroll and underrun reporting come from the Swift playback binary rather than the Python runtime
 - first-audio latency is usually dominated by model synthesis, especially on the 1.7B voice-design model
+- `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS=360` is the conservative default for this repo because longer clone chunks on Gale's M4 Pro repeatedly produced 40 to 70 second audio segments and, in one pathological case, more than 10 minutes of audio from a single chunk
+- `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS=384` is passed explicitly into Qwen instead of relying on upstream defaults so the service has a local cap on per-chunk generation budget
+- `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS=20.0` fails chunks that decode into obviously reply-inappropriate audio durations instead of letting one absurd output dominate the worker
+- `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS=30.0` is a post-call guardrail: it marks an overlong synthesis as failed once Qwen returns, but it does not preempt the Qwen Python call mid-generation
 
 ## LaunchAgents
 
@@ -244,7 +256,7 @@ The checked-in plists use `$HOME` for the user-specific path prefix, but they st
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
 At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, handoff completion, underflow recovery, completion, and failure. It also emits `speech_memory_snapshot` events around chunk synthesis, preroll satisfaction, output opening, and playback start so you can correlate memory swings with the playback pipeline in the LaunchAgent stderr log. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
-The checked-in LaunchAgent templates currently pin the service to the native `wavbuffer` backend, keep the existing `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0` setting, and also force `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers` with `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS=3`. That deeper initial buffer is intentional for long clone/profile playback, where synthesis can run slower than real time and a one-buffer start can repeatedly starve `wavbuffer` mid-job. They now rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
+The checked-in LaunchAgent templates pin the service to the native `wavbuffer` backend, explicitly set `SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH=8`, keep `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0` for compatibility, and force `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers` with `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS=3`. That deeper initial buffer is intentional for long clone/profile playback, where synthesis can run slower than real time and a one-buffer start can repeatedly starve `wavbuffer` mid-job. The same templates also pin the conservative reply-sized chunking guardrails used in development: `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS=360`, `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS=384`, `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS=30.0`, and `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS=20.0`. They rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
 
 To refresh the bundled `wavbuffer` binary from the sibling Swift repo after rebuilding it there:
 
@@ -257,7 +269,7 @@ When diagnosing clone quality or playback problems, check both:
 
 - `tts_status` for live queue, model, and recent-event state
 - the LaunchAgent stderr log for the full structured event stream across requests and reconnects
-- repeated `wavbuffer event=underrun` plus `reason="stream_starved"` means playback drained faster than the next chunk finished synthesizing; increasing buffer-count preroll is the first tuning knob to try
+- repeated `wavbuffer event=underrun` plus `reason="stream_starved"` means playback drained faster than the next chunk finished synthesizing; reduce chunk size or tighten generation guardrails first, then increase buffer-count preroll if starvation still remains
 
 Operational warning:
 

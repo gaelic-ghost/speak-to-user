@@ -30,6 +30,7 @@ class FakeVoiceDesignModel:
         text: str | list[str],
         language: str | list[str],
         instruct: str | list[str],
+        max_new_tokens: int,
         non_streaming_mode: bool,
     ) -> tuple[list[list[float]], int]:
         self.calls.append(
@@ -37,6 +38,7 @@ class FakeVoiceDesignModel:
                 "text": text,
                 "language": language,
                 "instruct": instruct,
+                "max_new_tokens": max_new_tokens,
                 "non_streaming_mode": non_streaming_mode,
             }
         )
@@ -163,6 +165,20 @@ def test_from_env_reads_wavbuffer_settings(monkeypatch: pytest.MonkeyPatch) -> N
     assert runtime.wavbuffer_binary_path == "/tmp/wavbuffer"
     assert runtime.wavbuffer_queue_depth == 4
     assert runtime.wavbuffer_preroll_mode == "buffers"
+
+
+def test_from_env_reads_tts_chunk_guardrails(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS", "320")
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_MAX_NEW_TOKENS", "512")
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS", "45")
+    monkeypatch.setenv("SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS", "18")
+
+    runtime = TTSRuntime.from_env()
+
+    assert runtime.tts_chunk_max_chars == 320
+    assert runtime.tts_max_new_tokens == 512
+    assert runtime.tts_max_chunk_synth_seconds == 45.0
+    assert runtime.tts_max_chunk_audio_seconds == 18.0
 
 
 def test_from_env_reads_null_playback_backend(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -855,6 +871,7 @@ def test_synthesize_voice_design_chunk_uses_non_streaming_mode(
             "text": "hello",
             "language": "English",
             "instruct": "warm",
+            "max_new_tokens": runtime.tts_max_new_tokens,
             "non_streaming_mode": True,
         }
     ]
@@ -883,6 +900,7 @@ def test_synthesize_clone_chunk_uses_x_vector_only_without_reference_text(
             "language": "English",
             "ref_audio": reference_audio,
             "x_vector_only_mode": True,
+            "max_new_tokens": runtime.tts_max_new_tokens,
             "non_streaming_mode": True,
         }
     ]
@@ -912,9 +930,61 @@ def test_synthesize_clone_chunk_uses_reference_text_when_present(
             "ref_audio": reference_audio,
             "ref_text": "reference text",
             "x_vector_only_mode": False,
+            "max_new_tokens": runtime.tts_max_new_tokens,
             "non_streaming_mode": True,
         }
     ]
+
+
+def test_synthesize_chunk_rejects_audio_duration_over_guardrail(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.tts_max_chunk_audio_seconds = 0.001
+    fake_model = FakeCloneModel(waveform=[0.0] * 128, sample_rate=24000)
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+
+    with pytest.raises(RuntimeError, match="chunk audio duration exceeded"):
+        runtime._synthesize_audio_chunk(
+            mode=CLONE_MODEL_KIND,
+            text="hello",
+            language="English",
+            reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
+        )
+
+
+def test_synthesize_chunk_rejects_synth_duration_over_guardrail(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.tts_max_chunk_synth_seconds = 0.001
+    fake_model = FakeCloneModel()
+    runtime._model_state(CLONE_MODEL_KIND)["model"] = fake_model
+    runtime._model_state(CLONE_MODEL_KIND)["resolved_device"] = "cpu"
+
+    timestamps = iter(
+        [
+            dt.datetime(2026, 3, 14, 0, 0, 0, tzinfo=dt.UTC),
+            dt.datetime(2026, 3, 14, 0, 0, 1, tzinfo=dt.UTC),
+            dt.datetime(2026, 3, 14, 0, 0, 1, tzinfo=dt.UTC),
+        ]
+    )
+
+    def fake_utc_now() -> dt.datetime:
+        try:
+            return next(timestamps)
+        except StopIteration:
+            return dt.datetime(2026, 3, 14, 0, 0, 1, tzinfo=dt.UTC)
+
+    monkeypatch.setattr(runtime_module, "_utc_now", fake_utc_now)
+
+    with pytest.raises(RuntimeError, match="chunk synthesis exceeded"):
+        runtime._synthesize_audio_chunk(
+            mode=CLONE_MODEL_KIND,
+            text="hello",
+            language="English",
+            reference_audio=(np.array([0.0, 0.1], dtype=np.float32), 16000),
+        )
 
 
 def test_synthesize_clone_chunk_retries_with_cpu_fallback_for_meta_tensor_error(
