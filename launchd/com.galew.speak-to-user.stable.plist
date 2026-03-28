@@ -18,6 +18,10 @@
         <string>8765</string>
         <key>SPEAK_TO_USER_PLAYBACK_BACKEND</key>
         <string>wavbuffer</string>
+        <key>SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE</key>
+        <string>buffers</string>
+        <key>SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS</key>
+        <string>3</string>
         <key>SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS</key>
         <string>5.0</string>
     </dict>

@@ -244,7 +244,7 @@ The checked-in plists use `$HOME` for the user-specific path prefix, but they st
 Runtime observability is split between the LaunchAgent stderr logs and `tts_status`.
 At the default `info` log level, the runtime emits structured JSON events for job queueing, synthesis, preroll, stream open/close, chunk playback, handoff completion, underflow recovery, completion, and failure. It also emits `speech_memory_snapshot` events around chunk synthesis, preroll satisfaction, output opening, and playback start so you can correlate memory swings with the playback pipeline in the LaunchAgent stderr log. `tts_status` also includes a bounded in-memory `recent_events` history plus the latest event name and timestamps for the current job, chunk, and phase.
 
-The checked-in LaunchAgent templates currently pin the service to the native `wavbuffer` backend with `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0`. They now rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
+The checked-in LaunchAgent templates currently pin the service to the native `wavbuffer` backend, keep the existing `SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS=5.0` setting, and also force `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers` with `SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS=3`. That deeper initial buffer is intentional for long clone/profile playback, where synthesis can run slower than real time and a one-buffer start can repeatedly starve `wavbuffer` mid-job. They now rely on the bundled repo copy of `wavbuffer` by default, rather than pointing at a sibling Swift build output. That is a service-level setting for the included launchd setup, not a change to the runtime-wide default documented in the configuration table above.
 
 To refresh the bundled `wavbuffer` binary from the sibling Swift repo after rebuilding it there:
 
@@ -257,6 +257,7 @@ When diagnosing clone quality or playback problems, check both:
 
 - `tts_status` for live queue, model, and recent-event state
 - the LaunchAgent stderr log for the full structured event stream across requests and reconnects
+- repeated `wavbuffer event=underrun` plus `reason="stream_starved"` means playback drained faster than the next chunk finished synthesizing; increasing buffer-count preroll is the first tuning knob to try
 
 Operational warning:
 
