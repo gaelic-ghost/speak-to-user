@@ -1082,10 +1082,10 @@ def test_playback_start_chunk_target_holds_longer_replies_longer(tmp_path: Path)
     runtime = make_runtime(tmp_path)
 
     assert runtime._playback_start_chunk_target(1) == 1
-    assert runtime._playback_start_chunk_target(2) == 1
-    assert runtime._playback_start_chunk_target(3) == 2
-    assert runtime._playback_start_chunk_target(4) == 3
-    assert runtime._playback_start_chunk_target(7) == 3
+    assert runtime._playback_start_chunk_target(2) == 2
+    assert runtime._playback_start_chunk_target(3) == 3
+    assert runtime._playback_start_chunk_target(4) == 4
+    assert runtime._playback_start_chunk_target(7) == 4
 
 
 def test_required_start_buffer_seconds_scales_with_observed_deficit(tmp_path: Path) -> None:
@@ -1110,11 +1110,11 @@ def test_required_start_buffer_seconds_scales_with_observed_deficit(tmp_path: Pa
     job_metrics["min_real_time_margin_ms"] = -10000
     assert (
         runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=2)
-        == 17.0
+        == 0.0
     )
     assert (
         runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=3)
-        == 17.0
+        == 0.0
     )
     assert (
         runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=4)
@@ -1147,7 +1147,7 @@ def test_evaluate_playback_start_admission_defers_until_safe_buffer(tmp_path: Pa
     admitted = runtime._evaluate_playback_start_admission(
         job_metrics=job_metrics,
         total_chunk_count=4,
-        buffered_chunk_count=3,
+        buffered_chunk_count=4,
         buffered_audio_seconds=30.96,
         synthesis_done=False,
     )

@@ -1423,11 +1423,11 @@ class TTSRuntime:
     def _playback_start_chunk_target(self, total_chunk_count: int) -> int:
         if total_chunk_count <= 0:
             raise ValueError("total_chunk_count must be greater than zero")
-        if total_chunk_count <= 2:
+        if total_chunk_count <= 1:
             return 1
-        if total_chunk_count == 3:
-            return 2
-        return min(3, total_chunk_count)
+        if total_chunk_count <= 3:
+            return total_chunk_count
+        return min(4, total_chunk_count)
 
     def _required_start_buffer_seconds(
         self,
@@ -1446,15 +1446,8 @@ class TTSRuntime:
 
         if total_chunk_count <= 1:
             return 0.0
-        if total_chunk_count == 2:
-            if (
-                min_real_time_margin_ms is None
-                or min_real_time_margin_ms > PLAYBACK_START_RISKY_TWO_CHUNK_MARGIN_MS
-            ):
-                return 0.0
-            return max(12.0, deficit_requirement)
-        if total_chunk_count == 3:
-            return max(12.0, deficit_requirement)
+        if total_chunk_count <= 3:
+            return 0.0
         return max(18.0, deficit_requirement)
 
     def _evaluate_playback_start_admission(
