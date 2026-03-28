@@ -1078,6 +1078,93 @@ def test_effective_preroll_chunk_target_balances_short_and_long_jobs(tmp_path: P
     assert runtime._effective_preroll_chunk_target(7) == 2
 
 
+def test_playback_start_chunk_target_holds_longer_replies_longer(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    assert runtime._playback_start_chunk_target(1) == 1
+    assert runtime._playback_start_chunk_target(2) == 1
+    assert runtime._playback_start_chunk_target(3) == 2
+    assert runtime._playback_start_chunk_target(4) == 3
+    assert runtime._playback_start_chunk_target(7) == 3
+
+
+def test_required_start_buffer_seconds_scales_with_observed_deficit(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    job_metrics = runtime._new_job_metrics(
+        mode=CLONE_MODEL_KIND,
+        normalized_chunks=["a", "b", "c", "d"],
+        effective_preroll_chunks=2,
+        total_chunk_char_count=4,
+        job_started_at=dt.datetime.now(dt.UTC),
+    )
+
+    assert (
+        runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=2)
+        == 0.0
+    )
+    assert (
+        runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=4)
+        == 18.0
+    )
+
+    job_metrics["min_real_time_margin_ms"] = -10000
+    assert (
+        runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=2)
+        == 17.0
+    )
+    assert (
+        runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=3)
+        == 17.0
+    )
+    assert (
+        runtime._required_start_buffer_seconds(job_metrics=job_metrics, total_chunk_count=4)
+        == 18.0
+    )
+
+
+def test_evaluate_playback_start_admission_defers_until_safe_buffer(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    job_metrics = runtime._new_job_metrics(
+        mode=CLONE_MODEL_KIND,
+        normalized_chunks=["a", "b", "c", "d"],
+        effective_preroll_chunks=2,
+        total_chunk_char_count=4,
+        job_started_at=dt.datetime.now(dt.UTC),
+    )
+    job_metrics["min_real_time_margin_ms"] = -14886
+    job_metrics["max_synth_to_audio_ratio"] = 1.994
+
+    deferred = runtime._evaluate_playback_start_admission(
+        job_metrics=job_metrics,
+        total_chunk_count=4,
+        buffered_chunk_count=2,
+        buffered_audio_seconds=18.96,
+        synthesis_done=False,
+    )
+    assert deferred["admit"] is False
+    assert deferred["defer_reason"] == "waiting_for_chunk_target"
+
+    admitted = runtime._evaluate_playback_start_admission(
+        job_metrics=job_metrics,
+        total_chunk_count=4,
+        buffered_chunk_count=3,
+        buffered_audio_seconds=30.96,
+        synthesis_done=False,
+    )
+    assert admitted["admit"] is True
+    assert admitted["reason"] == "safe_buffer_threshold_met"
+
+    fully_buffered = runtime._evaluate_playback_start_admission(
+        job_metrics=job_metrics,
+        total_chunk_count=4,
+        buffered_chunk_count=4,
+        buffered_audio_seconds=43.12,
+        synthesis_done=True,
+    )
+    assert fully_buffered["admit"] is True
+    assert fully_buffered["reason"] == "all_chunks_buffered"
+
+
 def test_encode_waveform_as_wav_bytes_uses_float32_pcm(tmp_path: Path) -> None:
     runtime = make_runtime(tmp_path)
 
@@ -1171,6 +1258,7 @@ def test_play_speech_chunks_generates_and_writes_clone_chunks(
     assert played[1] == pytest.approx([0.3, 0.4, 0.5])
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert any(event["event"] == "speech_chunk_ready_for_playback" for event in recent_events)
+    assert any(event["event"] == "speech_playback_start_admitted" for event in recent_events)
     assert any(event["event"] == "speech_first_audio_started" for event in recent_events)
     assert any(event["event"] == "speech_job_metrics_summary" for event in recent_events)
 
@@ -1361,6 +1449,7 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert any(event["event"] == "speech_wavbuffer_event_received" for event in recent_events)
     assert any(event["event"] == "speech_chunk_playback_retrying" for event in recent_events)
+    assert any(event["event"] == "speech_playback_start_admitted" for event in recent_events)
     assert any(
         event["event"] == "speech_first_audio_started"
         and event.get("reason") == "forced_input_completed"

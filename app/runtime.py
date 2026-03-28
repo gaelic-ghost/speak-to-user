@@ -48,6 +48,8 @@ VOICE_DESIGN_PROFILE_SEED_MAX_CHARS = 240
 DEFAULT_TTS_MAX_NEW_TOKENS = 384
 DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS = 30.0
 DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS = 20.0
+PLAYBACK_START_SAFETY_CUSHION_SECONDS = 2.0
+PLAYBACK_START_RISKY_TWO_CHUNK_MARGIN_MS = -3000
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_RECENT_EVENT_LIMIT = 100
 EFFECTIVE_PREROLL_POLICY = "balanced_dynamic_chunk_cap_v1"
@@ -1418,6 +1420,119 @@ class TTSRuntime:
             return 1
         return min(self.playback_preroll_chunks, 2, total_chunk_count)
 
+    def _playback_start_chunk_target(self, total_chunk_count: int) -> int:
+        if total_chunk_count <= 0:
+            raise ValueError("total_chunk_count must be greater than zero")
+        if total_chunk_count <= 2:
+            return 1
+        if total_chunk_count == 3:
+            return 2
+        return min(3, total_chunk_count)
+
+    def _required_start_buffer_seconds(
+        self,
+        *,
+        job_metrics: dict[str, Any],
+        total_chunk_count: int,
+    ) -> float:
+        min_real_time_margin_ms = cast(int | None, job_metrics["min_real_time_margin_ms"])
+        deficit_seconds = 0.0
+        if min_real_time_margin_ms is not None and min_real_time_margin_ms < 0:
+            deficit_seconds = abs(min_real_time_margin_ms) / 1000
+        deficit_requirement = round(
+            (deficit_seconds * 1.5) + PLAYBACK_START_SAFETY_CUSHION_SECONDS,
+            3,
+        )
+
+        if total_chunk_count <= 1:
+            return 0.0
+        if total_chunk_count == 2:
+            if (
+                min_real_time_margin_ms is None
+                or min_real_time_margin_ms > PLAYBACK_START_RISKY_TWO_CHUNK_MARGIN_MS
+            ):
+                return 0.0
+            return max(12.0, deficit_requirement)
+        if total_chunk_count == 3:
+            return max(12.0, deficit_requirement)
+        return max(18.0, deficit_requirement)
+
+    def _evaluate_playback_start_admission(
+        self,
+        *,
+        job_metrics: dict[str, Any],
+        total_chunk_count: int,
+        buffered_chunk_count: int,
+        buffered_audio_seconds: float,
+        synthesis_done: bool,
+    ) -> dict[str, Any]:
+        required_chunk_count = self._playback_start_chunk_target(total_chunk_count)
+        required_buffered_audio_seconds = self._required_start_buffer_seconds(
+            job_metrics=job_metrics,
+            total_chunk_count=total_chunk_count,
+        )
+        max_synth_to_audio_ratio = cast(float | None, job_metrics["max_synth_to_audio_ratio"])
+        min_real_time_margin_ms = cast(int | None, job_metrics["min_real_time_margin_ms"])
+
+        if buffered_chunk_count <= 0:
+            return {
+                "admit": False,
+                "reason": "no_buffered_audio",
+                "defer_reason": "no_buffered_audio",
+                "required_chunk_count": required_chunk_count,
+                "required_buffered_audio_seconds": required_buffered_audio_seconds,
+                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
+                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
+                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
+            }
+
+        if synthesis_done and buffered_chunk_count >= total_chunk_count:
+            return {
+                "admit": True,
+                "reason": "all_chunks_buffered",
+                "defer_reason": None,
+                "required_chunk_count": required_chunk_count,
+                "required_buffered_audio_seconds": required_buffered_audio_seconds,
+                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
+                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
+                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
+            }
+
+        if buffered_chunk_count < required_chunk_count:
+            return {
+                "admit": False,
+                "reason": "waiting_for_chunk_target",
+                "defer_reason": "waiting_for_chunk_target",
+                "required_chunk_count": required_chunk_count,
+                "required_buffered_audio_seconds": required_buffered_audio_seconds,
+                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
+                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
+                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
+            }
+
+        if buffered_audio_seconds < required_buffered_audio_seconds:
+            return {
+                "admit": False,
+                "reason": "waiting_for_safe_buffer",
+                "defer_reason": "waiting_for_safe_buffer",
+                "required_chunk_count": required_chunk_count,
+                "required_buffered_audio_seconds": required_buffered_audio_seconds,
+                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
+                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
+                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
+            }
+
+        return {
+            "admit": True,
+            "reason": "safe_buffer_threshold_met",
+            "defer_reason": None,
+            "required_chunk_count": required_chunk_count,
+            "required_buffered_audio_seconds": required_buffered_audio_seconds,
+            "buffered_audio_seconds": round(buffered_audio_seconds, 3),
+            "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
+            "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
+        }
+
     def _new_job_metrics(
         self,
         *,
@@ -1451,6 +1566,11 @@ class TTSRuntime:
             "failure_reason": None,
             "wavbuffer_forced_input_completed": False,
             "completed_chunk_count": 0,
+            "startup_deferred_count": 0,
+            "max_buffered_audio_seconds_before_start": 0.0,
+            "required_buffered_audio_seconds_at_start": None,
+            "start_admission_reason": None,
+            "playback_retry_occurred": False,
         }
 
     def _update_job_metrics_for_chunk(
@@ -1526,6 +1646,79 @@ class TTSRuntime:
             reason=reason,
         )
 
+    def _record_playback_start_deferred(
+        self,
+        *,
+        job_metrics: dict[str, Any],
+        buffered_chunk_count: int,
+        buffered_audio_seconds: float,
+        admission: dict[str, Any],
+    ) -> None:
+        job_metrics["startup_deferred_count"] = (
+            int(cast(int, job_metrics["startup_deferred_count"])) + 1
+        )
+        max_buffered_audio_seconds_before_start = float(
+            cast(float, job_metrics["max_buffered_audio_seconds_before_start"])
+        )
+        if buffered_audio_seconds > max_buffered_audio_seconds_before_start:
+            job_metrics["max_buffered_audio_seconds_before_start"] = round(
+                buffered_audio_seconds,
+                3,
+            )
+        self._emit_runtime_event(
+            "speech_playback_start_deferred",
+            level="info",
+            job_id=job_metrics["job_id"],
+            mode=job_metrics["mode"],
+            chunk_count=job_metrics["chunk_count"],
+            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
+            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
+            buffered_chunk_count=buffered_chunk_count,
+            buffered_audio_seconds=round(buffered_audio_seconds, 3),
+            worst_synth_to_audio_ratio=admission["worst_synth_to_audio_ratio"],
+            worst_negative_real_time_margin_ms=admission["worst_negative_real_time_margin_ms"],
+            required_chunk_count=admission["required_chunk_count"],
+            required_buffered_audio_seconds=admission["required_buffered_audio_seconds"],
+            defer_reason=admission["defer_reason"],
+        )
+
+    def _record_playback_start_admitted(
+        self,
+        *,
+        job_metrics: dict[str, Any],
+        buffered_chunk_count: int,
+        buffered_audio_seconds: float,
+        admission: dict[str, Any],
+    ) -> None:
+        max_buffered_audio_seconds_before_start = float(
+            cast(float, job_metrics["max_buffered_audio_seconds_before_start"])
+        )
+        if buffered_audio_seconds > max_buffered_audio_seconds_before_start:
+            job_metrics["max_buffered_audio_seconds_before_start"] = round(
+                buffered_audio_seconds,
+                3,
+            )
+        job_metrics["required_buffered_audio_seconds_at_start"] = admission[
+            "required_buffered_audio_seconds"
+        ]
+        job_metrics["start_admission_reason"] = admission["reason"]
+        self._emit_runtime_event(
+            "speech_playback_start_admitted",
+            level="info",
+            job_id=job_metrics["job_id"],
+            mode=job_metrics["mode"],
+            chunk_count=job_metrics["chunk_count"],
+            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
+            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
+            buffered_chunk_count=buffered_chunk_count,
+            buffered_audio_seconds=round(buffered_audio_seconds, 3),
+            worst_synth_to_audio_ratio=admission["worst_synth_to_audio_ratio"],
+            worst_negative_real_time_margin_ms=admission["worst_negative_real_time_margin_ms"],
+            required_chunk_count=admission["required_chunk_count"],
+            required_buffered_audio_seconds=admission["required_buffered_audio_seconds"],
+            admission_reason=admission["reason"],
+        )
+
     def _record_job_metrics(self, job_metrics: dict[str, Any]) -> None:
         with self._lock:
             self._last_effective_preroll_chunks = cast(
@@ -1567,9 +1760,18 @@ class TTSRuntime:
             avg_chunk_audio_seconds=avg_chunk_audio_seconds,
             max_synth_to_audio_ratio=job_metrics["max_synth_to_audio_ratio"],
             min_real_time_margin_ms=job_metrics["min_real_time_margin_ms"],
+            startup_deferred_count=job_metrics["startup_deferred_count"],
+            max_buffered_audio_seconds_before_start=job_metrics[
+                "max_buffered_audio_seconds_before_start"
+            ],
+            required_buffered_audio_seconds_at_start=job_metrics[
+                "required_buffered_audio_seconds_at_start"
+            ],
+            start_admission_reason=job_metrics["start_admission_reason"],
             failure_reason=job_metrics["failure_reason"],
             failed_chunk_index=job_metrics["failed_chunk_index"],
             wavbuffer_forced_input_completed=job_metrics["wavbuffer_forced_input_completed"],
+            playback_retry_occurred=job_metrics["playback_retry_occurred"],
         )
 
     def _play_speech_chunks_with_sounddevice(
@@ -1588,6 +1790,7 @@ class TTSRuntime:
         total_sample_count = 0
         buffered_sample_count = 0
         buffered_waveforms: list[np.ndarray] = []
+        buffered_waveform_payloads: list[dict[str, Any]] = []
         buffered_chunk_count = 0
         sample_rate: int | None = None
         channel_count: int | None = None
@@ -1687,6 +1890,7 @@ class TTSRuntime:
                 close_output_stream(stream_for_write)
                 stream_for_write = open_output_stream_for_playback()
                 playback_recovery_duration_ms = _duration_ms(chunk_started_at, _utc_now())
+                job_metrics["playback_retry_occurred"] = True
                 self._emit_runtime_event(
                     "speech_chunk_playback_retrying",
                     level="minimal",
@@ -1730,8 +1934,16 @@ class TTSRuntime:
 
                 if stream_holder[0] is None:
                     buffered_waveforms.append(waveform)
+                    buffered_waveform_payloads.append(chunk_result)
                     buffered_sample_count += int(waveform.shape[0])
                     buffered_chunk_count += 1
+                    buffered_audio_seconds = round(
+                        sum(
+                            float(cast(float, item["audio_duration_seconds"]))
+                            for item in buffered_waveform_payloads
+                        ),
+                        3,
+                    )
                     assert sample_rate is not None
                     preroll_sample_target = max(
                         1,
@@ -1739,11 +1951,27 @@ class TTSRuntime:
                     )
                     have_enough_preroll_audio = buffered_sample_count >= preroll_sample_target
                     have_enough_preroll_chunks = buffered_chunk_count >= effective_preroll_chunks
+                    admission = self._evaluate_playback_start_admission(
+                        job_metrics=job_metrics,
+                        total_chunk_count=len(normalized_chunks),
+                        buffered_chunk_count=buffered_chunk_count,
+                        buffered_audio_seconds=buffered_audio_seconds,
+                        synthesis_done=synthesis_done.is_set(),
+                    )
                     if (
                         not synthesis_done.is_set()
-                        and not have_enough_preroll_audio
-                        and not have_enough_preroll_chunks
+                        and (
+                            (not have_enough_preroll_audio and not have_enough_preroll_chunks)
+                            or not admission["admit"]
+                        )
                     ):
+                        if not admission["admit"]:
+                            self._record_playback_start_deferred(
+                                job_metrics=job_metrics,
+                                buffered_chunk_count=buffered_chunk_count,
+                                buffered_audio_seconds=buffered_audio_seconds,
+                                admission=admission,
+                            )
                         self._emit_runtime_event(
                             "speech_preroll_waiting",
                             level="debug",
@@ -1754,8 +1982,20 @@ class TTSRuntime:
                             preroll_sample_target=preroll_sample_target,
                             configured_preroll_chunks=self.playback_preroll_chunks,
                             effective_preroll_chunks=effective_preroll_chunks,
+                            buffered_audio_seconds=buffered_audio_seconds,
                         )
                         continue
+
+                    if not admission["admit"]:
+                        self._record_playback_start_deferred(
+                            job_metrics=job_metrics,
+                            buffered_chunk_count=buffered_chunk_count,
+                            buffered_audio_seconds=buffered_audio_seconds,
+                            admission=admission,
+                        )
+                        raise RuntimeError(
+                            "live playback admission rejected: insufficient real-time safety margin"
+                        )
 
                     self._emit_runtime_memory_snapshot(
                         level="info",
@@ -1767,9 +2007,16 @@ class TTSRuntime:
                         preroll_sample_target=preroll_sample_target,
                         configured_preroll_chunks=self.playback_preroll_chunks,
                         effective_preroll_chunks=effective_preroll_chunks,
+                        buffered_audio_seconds=buffered_audio_seconds,
                     )
                     stream_holder[0] = open_output_stream_for_playback()
                     playback_started_at = _utc_now()
+                    self._record_playback_start_admitted(
+                        job_metrics=job_metrics,
+                        buffered_chunk_count=buffered_chunk_count,
+                        buffered_audio_seconds=buffered_audio_seconds,
+                        admission=admission,
+                    )
                     self._record_first_audio_started(
                         job_metrics=job_metrics,
                         started_at=playback_started_at,
@@ -1826,6 +2073,7 @@ class TTSRuntime:
                         )
                         next_chunk_index += 1
                     buffered_waveforms.clear()
+                    buffered_waveform_payloads.clear()
                     continue
 
                 assert stream_holder[0] is not None
@@ -1881,7 +2129,106 @@ class TTSRuntime:
                 raise RuntimeError(str(producer_error[0])) from producer_error[0]
 
             if stream_holder[0] is None:
-                raise RuntimeError("no speech chunks were available for playback")
+                if not buffered_waveforms:
+                    raise RuntimeError("no speech chunks were available for playback")
+                buffered_audio_seconds = round(
+                    sum(
+                        float(cast(float, item["audio_duration_seconds"]))
+                        for item in buffered_waveform_payloads
+                    ),
+                    3,
+                )
+                admission = self._evaluate_playback_start_admission(
+                    job_metrics=job_metrics,
+                    total_chunk_count=len(normalized_chunks),
+                    buffered_chunk_count=buffered_chunk_count,
+                    buffered_audio_seconds=buffered_audio_seconds,
+                    synthesis_done=True,
+                )
+                if not admission["admit"]:
+                    self._record_playback_start_deferred(
+                        job_metrics=job_metrics,
+                        buffered_chunk_count=buffered_chunk_count,
+                        buffered_audio_seconds=buffered_audio_seconds,
+                        admission=admission,
+                    )
+                    raise RuntimeError(
+                        "live playback admission rejected: insufficient real-time safety margin"
+                    )
+                self._emit_runtime_memory_snapshot(
+                    level="info",
+                    snapshot_event="speech_preroll_satisfied",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    buffered_chunk_count=buffered_chunk_count,
+                    buffered_sample_count=buffered_sample_count,
+                    preroll_sample_target=preroll_sample_target,
+                    configured_preroll_chunks=self.playback_preroll_chunks,
+                    effective_preroll_chunks=effective_preroll_chunks,
+                    buffered_audio_seconds=buffered_audio_seconds,
+                )
+                stream_holder[0] = open_output_stream_for_playback()
+                playback_started_at = _utc_now()
+                self._record_playback_start_admitted(
+                    job_metrics=job_metrics,
+                    buffered_chunk_count=buffered_chunk_count,
+                    buffered_audio_seconds=buffered_audio_seconds,
+                    admission=admission,
+                )
+                self._record_first_audio_started(
+                    job_metrics=job_metrics,
+                    started_at=playback_started_at,
+                    reason="all_chunks_buffered",
+                    player="sounddevice-stream",
+                )
+                for buffered_waveform in buffered_waveforms:
+                    with self._lock:
+                        self._set_speech_phase_locked("playing")
+                        self._speech_current_chunk_index = next_chunk_index
+                        self._speech_current_chunk_count = len(normalized_chunks)
+                        self._current_chunk_started_at = _utc_now()
+                    self._emit_runtime_event(
+                        "speech_chunk_playback_started",
+                        level="info",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        player="sounddevice-stream",
+                        chunk_index=next_chunk_index,
+                        chunk_count=len(normalized_chunks),
+                        sample_count=int(buffered_waveform.shape[0]),
+                    )
+                    if next_chunk_index == 1:
+                        self._emit_runtime_memory_snapshot(
+                            level="info",
+                            snapshot_event="speech_chunk_playback_started",
+                            job_id=self._speech_current_job_id,
+                            mode=mode,
+                            player="sounddevice-stream",
+                            chunk_index=next_chunk_index,
+                            chunk_count=len(normalized_chunks),
+                        )
+                    assert self._current_chunk_started_at is not None
+                    stream_holder[0] = write_chunk_with_recovery(
+                        stream_holder[0],
+                        chunk_index=next_chunk_index,
+                        waveform_to_write=buffered_waveform,
+                        chunk_started_at=self._current_chunk_started_at,
+                    )
+                    total_sample_count += int(buffered_waveform.shape[0])
+                    self._emit_runtime_event(
+                        "speech_chunk_playback_handoff_completed",
+                        level="info",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        player="sounddevice-stream",
+                        chunk_index=next_chunk_index,
+                        chunk_count=len(normalized_chunks),
+                        playback_duration_ms=_duration_ms(
+                            self._current_chunk_started_at or playback_started_at,
+                            _utc_now(),
+                        ),
+                    )
+                    next_chunk_index += 1
 
             assert sample_rate is not None
             assert model_id is not None
@@ -1922,6 +2269,8 @@ class TTSRuntime:
         process_state: dict[str, Any] | None = None
         stderr_thread: threading.Thread | None = None
         next_chunk_index = 1
+        buffered_wav_chunks: list[bytes] = []
+        buffered_chunk_payloads: list[dict[str, Any]] = []
 
         def start_process() -> tuple[Any, dict[str, Any], threading.Thread]:
             command = self._wavbuffer_command(chunk_count=len(normalized_chunks))
@@ -2041,6 +2390,7 @@ class TTSRuntime:
                     )
 
                 playback_recovery_duration_ms = _duration_ms(chunk_started_at, _utc_now())
+                job_metrics["playback_retry_occurred"] = True
                 self._emit_runtime_event(
                     "speech_chunk_playback_retrying",
                     level="minimal",
@@ -2056,6 +2406,88 @@ class TTSRuntime:
                 return
 
             raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
+
+        def flush_buffered_chunks() -> None:
+            nonlocal process, process_state, stderr_thread, next_chunk_index, total_sample_count
+            while buffered_wav_chunks:
+                current_chunk_result = buffered_chunk_payloads[0]
+                current_wav_data = buffered_wav_chunks[0]
+                current_waveform = cast(np.ndarray, current_chunk_result["waveform"])
+                current_chunk_index = next_chunk_index
+
+                with self._lock:
+                    self._set_speech_phase_locked("playing")
+                    self._speech_current_chunk_index = current_chunk_index
+                    self._speech_current_chunk_count = len(normalized_chunks)
+                    self._current_chunk_started_at = _utc_now()
+                self._emit_runtime_event(
+                    "speech_chunk_playback_started",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=current_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    sample_count=int(current_waveform.shape[0]),
+                )
+                if current_chunk_index == 1:
+                    self._emit_runtime_memory_snapshot(
+                        level="info",
+                        snapshot_event="speech_chunk_playback_started",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        player="wavbuffer-subprocess",
+                        chunk_index=current_chunk_index,
+                        chunk_count=len(normalized_chunks),
+                    )
+                assert self._current_chunk_started_at is not None
+                attempt = 0
+                while True:
+                    if process is None:
+                        with self._lock:
+                            self._set_speech_phase_locked("opening_output")
+                        process, process_state, stderr_thread = start_process()
+
+                    assert process is not None
+                    assert process_state is not None
+                    try:
+                        assert process.stdin is not None
+                        process.stdin.write(current_wav_data)
+                        process.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        maybe_retry_current_chunk(
+                            chunk_index=current_chunk_index,
+                            chunk_started_at=self._current_chunk_started_at,
+                            attempt=attempt,
+                        )
+                        attempt += 1
+                        continue
+
+                    if process.poll() is not None:
+                        maybe_retry_current_chunk(
+                            chunk_index=current_chunk_index,
+                            chunk_started_at=self._current_chunk_started_at,
+                            attempt=attempt,
+                        )
+                        attempt += 1
+                        continue
+
+                    break
+
+                total_sample_count += int(current_waveform.shape[0])
+                self._emit_runtime_event(
+                    "speech_chunk_playback_handoff_completed",
+                    level="info",
+                    job_id=self._speech_current_job_id,
+                    mode=mode,
+                    player="wavbuffer-subprocess",
+                    chunk_index=current_chunk_index,
+                    chunk_count=len(normalized_chunks),
+                    playback_duration_ms=_duration_ms(self._current_chunk_started_at, _utc_now()),
+                )
+                buffered_wav_chunks.pop(0)
+                buffered_chunk_payloads.pop(0)
+                next_chunk_index += 1
 
         try:
             while True:
@@ -2086,84 +2518,84 @@ class TTSRuntime:
                     waveform=waveform,
                     sample_rate=sample_rate,
                 )
-
-                with self._lock:
-                    self._set_speech_phase_locked("playing")
-                    self._speech_current_chunk_index = next_chunk_index
-                    self._speech_current_chunk_count = len(normalized_chunks)
-                    self._current_chunk_started_at = _utc_now()
-                self._emit_runtime_event(
-                    "speech_chunk_playback_started",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=next_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    sample_count=int(waveform.shape[0]),
+                buffered_wav_chunks.append(wav_data)
+                buffered_chunk_payloads.append(chunk_result)
+                buffered_audio_seconds = round(
+                    sum(
+                        float(cast(float, item["audio_duration_seconds"]))
+                        for item in buffered_chunk_payloads
+                    ),
+                    3,
                 )
-                if next_chunk_index == 1:
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_chunk_playback_started",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        player="wavbuffer-subprocess",
-                        chunk_index=next_chunk_index,
-                        chunk_count=len(normalized_chunks),
+                admission = self._evaluate_playback_start_admission(
+                    job_metrics=job_metrics,
+                    total_chunk_count=len(normalized_chunks),
+                    buffered_chunk_count=len(buffered_chunk_payloads),
+                    buffered_audio_seconds=buffered_audio_seconds,
+                    synthesis_done=False,
+                )
+                if process is None and not admission["admit"]:
+                    self._record_playback_start_deferred(
+                        job_metrics=job_metrics,
+                        buffered_chunk_count=len(buffered_chunk_payloads),
+                        buffered_audio_seconds=buffered_audio_seconds,
+                        admission=admission,
                     )
-                assert self._current_chunk_started_at is not None
-                attempt = 0
-                while True:
-                    if process is None:
-                        with self._lock:
-                            self._set_speech_phase_locked("opening_output")
-                        process, process_state, stderr_thread = start_process()
+                    continue
 
-                    assert process is not None
-                    assert process_state is not None
-                    try:
-                        assert process.stdin is not None
-                        process.stdin.write(wav_data)
-                        process.stdin.flush()
-                    except (BrokenPipeError, OSError):
-                        maybe_retry_current_chunk(
-                            chunk_index=next_chunk_index,
-                            chunk_started_at=self._current_chunk_started_at,
-                            attempt=attempt,
-                        )
-                        attempt += 1
-                        continue
+                if process is None:
+                    with self._lock:
+                        self._set_speech_phase_locked("opening_output")
+                    process, process_state, stderr_thread = start_process()
+                    self._record_playback_start_admitted(
+                        job_metrics=job_metrics,
+                        buffered_chunk_count=len(buffered_chunk_payloads),
+                        buffered_audio_seconds=buffered_audio_seconds,
+                        admission=admission,
+                    )
 
-                    if process.poll() is not None:
-                        maybe_retry_current_chunk(
-                            chunk_index=next_chunk_index,
-                            chunk_started_at=self._current_chunk_started_at,
-                            attempt=attempt,
-                        )
-                        attempt += 1
-                        continue
-
-                    break
-
-                total_sample_count += int(waveform.shape[0])
-                self._emit_runtime_event(
-                    "speech_chunk_playback_handoff_completed",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=next_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    playback_duration_ms=_duration_ms(self._current_chunk_started_at, _utc_now()),
-                )
-                next_chunk_index += 1
+                flush_buffered_chunks()
 
             if producer_error:
                 raise RuntimeError(str(producer_error[0])) from producer_error[0]
 
             if process is None:
-                raise RuntimeError("no speech chunks were available for playback")
+                if not buffered_wav_chunks:
+                    raise RuntimeError("no speech chunks were available for playback")
+                buffered_audio_seconds = round(
+                    sum(
+                        float(cast(float, item["audio_duration_seconds"]))
+                        for item in buffered_chunk_payloads
+                    ),
+                    3,
+                )
+                admission = self._evaluate_playback_start_admission(
+                    job_metrics=job_metrics,
+                    total_chunk_count=len(normalized_chunks),
+                    buffered_chunk_count=len(buffered_chunk_payloads),
+                    buffered_audio_seconds=buffered_audio_seconds,
+                    synthesis_done=True,
+                )
+                if not admission["admit"]:
+                    self._record_playback_start_deferred(
+                        job_metrics=job_metrics,
+                        buffered_chunk_count=len(buffered_chunk_payloads),
+                        buffered_audio_seconds=buffered_audio_seconds,
+                        admission=admission,
+                    )
+                    raise RuntimeError(
+                        "live playback admission rejected: insufficient real-time safety margin"
+                    )
+                with self._lock:
+                    self._set_speech_phase_locked("opening_output")
+                process, process_state, stderr_thread = start_process()
+                self._record_playback_start_admitted(
+                    job_metrics=job_metrics,
+                    buffered_chunk_count=len(buffered_chunk_payloads),
+                    buffered_audio_seconds=buffered_audio_seconds,
+                    admission=admission,
+                )
+                flush_buffered_chunks()
 
             returncode, error_detail, _ = stop_process(close_stdin=True)
             if returncode not in {0, None}:
