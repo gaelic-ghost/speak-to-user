@@ -1059,13 +1059,23 @@ def test_wavbuffer_command_uses_buffer_preroll_when_configured(tmp_path: Path) -
     runtime.wavbuffer_preroll_mode = "buffers"
     runtime.playback_preroll_chunks = 3
 
-    assert runtime._wavbuffer_command() == [
+    assert runtime._wavbuffer_command(chunk_count=4) == [
         "/tmp/wavbuffer",
         "--queue-depth",
         "8",
         "--preroll-buffers",
-        "3",
+        "2",
     ]
+
+
+def test_effective_preroll_chunk_target_balances_short_and_long_jobs(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    runtime.playback_preroll_chunks = 3
+
+    assert runtime._effective_preroll_chunk_target(1) == 1
+    assert runtime._effective_preroll_chunk_target(2) == 1
+    assert runtime._effective_preroll_chunk_target(3) == 2
+    assert runtime._effective_preroll_chunk_target(7) == 2
 
 
 def test_encode_waveform_as_wav_bytes_uses_float32_pcm(tmp_path: Path) -> None:
@@ -1159,6 +1169,10 @@ def test_play_speech_chunks_generates_and_writes_clone_chunks(
     assert opened_streams[0].closed is True
     assert played[0] == pytest.approx([0.0, 0.1, 0.2])
     assert played[1] == pytest.approx([0.3, 0.4, 0.5])
+    recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
+    assert any(event["event"] == "speech_chunk_ready_for_playback" for event in recent_events)
+    assert any(event["event"] == "speech_first_audio_started" for event in recent_events)
+    assert any(event["event"] == "speech_job_metrics_summary" for event in recent_events)
 
 
 def test_play_speech_chunks_recovers_from_output_underflow(
@@ -1312,6 +1326,10 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
             returncode=0,
             stderr_lines=[
                 b'wavbuffer event=engine_started format="pcm"\n',
+                (
+                    b'wavbuffer event=playback_started buffered_buffers=1 '
+                    b'buffered_seconds=0.5 reason="forced_input_completed"\n'
+                ),
                 b'wavbuffer event=completed preroll="seconds"\n',
             ],
         ),
@@ -1343,6 +1361,16 @@ def test_play_speech_chunks_with_wavbuffer_retries_after_stream_starvation(
     recent_events = cast(list[dict[str, object]], runtime.status()["recent_events"])
     assert any(event["event"] == "speech_wavbuffer_event_received" for event in recent_events)
     assert any(event["event"] == "speech_chunk_playback_retrying" for event in recent_events)
+    assert any(
+        event["event"] == "speech_first_audio_started"
+        and event.get("reason") == "forced_input_completed"
+        for event in recent_events
+    )
+    assert any(
+        event["event"] == "speech_job_metrics_summary"
+        and event.get("wavbuffer_forced_input_completed") is True
+        for event in recent_events
+    )
     assert any(
         event["event"] == "speech_chunk_playback_handoff_completed"
         for event in recent_events

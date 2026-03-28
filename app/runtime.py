@@ -50,6 +50,7 @@ DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS = 30.0
 DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS = 20.0
 DEFAULT_LOG_LEVEL = "info"
 DEFAULT_RECENT_EVENT_LIMIT = 100
+EFFECTIVE_PREROLL_POLICY = "balanced_dynamic_chunk_cap_v1"
 SPEECH_PROFILE_COLLECTION = "speak_to_user_profiles"
 SPEECH_PROFILE_INDEX_KEY = "index"
 RUNTIME_CONFIGURATION_COLLECTION = "speak_to_user_runtime"
@@ -519,6 +520,10 @@ class TTSRuntime:
         self._recent_events: deque[dict[str, Any]] = deque(maxlen=DEFAULT_RECENT_EVENT_LIMIT)
         self._speech_profile_count: int | None = None
         self._speech_profile_last_error: str | None = None
+        self._last_effective_preroll_chunks: int | None = None
+        self._last_first_audio_latency_ms: int | None = None
+        self._last_first_chunk_ready_to_first_audio_ms: int | None = None
+        self._last_failure_reason: str | None = None
 
     @classmethod
     def from_env(cls) -> TTSRuntime:
@@ -1150,6 +1155,18 @@ class TTSRuntime:
                     "reference_audio or voice_clone_prompt_items must be provided "
                     "for clone playback"
                 )
+        job_started_at = self._current_job_started_at or _utc_now()
+        total_chunk_char_count = sum(len(chunk) for chunk in normalized_chunks)
+        effective_preroll_chunks = self._effective_preroll_chunk_target(
+            len(normalized_chunks)
+        )
+        job_metrics = self._new_job_metrics(
+            mode=mode,
+            normalized_chunks=normalized_chunks,
+            effective_preroll_chunks=effective_preroll_chunks,
+            total_chunk_char_count=total_chunk_char_count,
+            job_started_at=job_started_at,
+        )
         (
             waveform_queue,
             queue_sentinel,
@@ -1164,11 +1181,24 @@ class TTSRuntime:
             reference_audio=reference_audio,
             reference_text=reference_text,
             voice_clone_prompt_items=voice_clone_prompt_items,
+            effective_preroll_chunks=effective_preroll_chunks,
+            job_metrics=job_metrics,
         )
 
         try:
             if self.playback_backend == "wavbuffer":
-                return self._play_speech_chunks_with_wavbuffer(
+                result = self._play_speech_chunks_with_wavbuffer(
+                    mode=mode,
+                    normalized_chunks=normalized_chunks,
+                    normalized_language=normalized_language,
+                    waveform_queue=waveform_queue,
+                    queue_sentinel=queue_sentinel,
+                    producer_error=producer_error,
+                    effective_preroll_chunks=effective_preroll_chunks,
+                    job_metrics=job_metrics,
+                )
+            elif self.playback_backend == "null":
+                result = self._play_speech_chunks_with_null(
                     mode=mode,
                     normalized_chunks=normalized_chunks,
                     normalized_language=normalized_language,
@@ -1176,27 +1206,29 @@ class TTSRuntime:
                     queue_sentinel=queue_sentinel,
                     producer_error=producer_error,
                 )
-            if self.playback_backend == "null":
-                return self._play_speech_chunks_with_null(
+            else:
+                result = self._play_speech_chunks_with_sounddevice(
                     mode=mode,
                     normalized_chunks=normalized_chunks,
                     normalized_language=normalized_language,
                     waveform_queue=waveform_queue,
                     queue_sentinel=queue_sentinel,
                     producer_error=producer_error,
+                    synthesis_done=synthesis_done,
+                    effective_preroll_chunks=effective_preroll_chunks,
+                    job_metrics=job_metrics,
                 )
-
-            return self._play_speech_chunks_with_sounddevice(
-                mode=mode,
-                normalized_chunks=normalized_chunks,
-                normalized_language=normalized_language,
-                waveform_queue=waveform_queue,
-                queue_sentinel=queue_sentinel,
-                producer_error=producer_error,
-                synthesis_done=synthesis_done,
-            )
+        except Exception as exc:
+            job_metrics["failure_reason"] = str(exc)
+            self._record_job_metrics(job_metrics)
+            self._emit_job_metrics_summary(job_metrics=job_metrics)
+            raise
         finally:
             producer_thread.join(timeout=1)
+
+        self._record_job_metrics(job_metrics)
+        self._emit_job_metrics_summary(job_metrics=job_metrics)
+        return result
 
     def _start_waveform_producer(
         self,
@@ -1208,6 +1240,8 @@ class TTSRuntime:
         reference_audio: tuple[np.ndarray, int] | None,
         reference_text: str | None,
         voice_clone_prompt_items: list[Any] | None,
+        effective_preroll_chunks: int,
+        job_metrics: dict[str, Any],
     ) -> tuple[
         queue.Queue[dict[str, Any] | object],
         object,
@@ -1223,8 +1257,12 @@ class TTSRuntime:
         queue_sentinel = object()
 
         def synthesize_into_queue() -> None:
+            current_chunk_index: int | None = None
+            previous_chunk_audio_ms: int | None = None
+            previous_chunk_ready_at: dt.datetime | None = None
             try:
                 for chunk_index, text_chunk in enumerate(normalized_chunks, start=1):
+                    current_chunk_index = chunk_index
                     self._emit_runtime_event(
                         "speech_chunk_synthesis_started",
                         level="info",
@@ -1268,6 +1306,28 @@ class TTSRuntime:
                     chunk_synth_duration_ms = int(
                         cast(int, chunk_result.get("synth_duration_ms", 0))
                     )
+                    chunk_ready_at = _utc_now()
+                    chunk_audio_ms = int(round(chunk_audio_duration_seconds * 1000))
+                    synth_to_audio_ratio = (
+                        round(chunk_synth_duration_ms / chunk_audio_ms, 3)
+                        if chunk_audio_ms > 0
+                        else None
+                    )
+                    real_time_margin_ms = (
+                        previous_chunk_audio_ms - chunk_synth_duration_ms
+                        if previous_chunk_audio_ms is not None
+                        else None
+                    )
+                    chunk_ready_gap_ms = _duration_ms(previous_chunk_ready_at, chunk_ready_at)
+                    self._update_job_metrics_for_chunk(
+                        job_metrics=job_metrics,
+                        chunk_index=chunk_index,
+                        synth_duration_ms=chunk_synth_duration_ms,
+                        audio_duration_seconds=chunk_audio_duration_seconds,
+                        synth_to_audio_ratio=synth_to_audio_ratio,
+                        real_time_margin_ms=real_time_margin_ms,
+                        chunk_ready_at=chunk_ready_at,
+                    )
                     self._emit_runtime_event(
                         "speech_chunk_synthesis_completed",
                         level="info",
@@ -1278,6 +1338,25 @@ class TTSRuntime:
                         synth_duration_ms=chunk_synth_duration_ms,
                         sample_count=chunk_sample_count,
                         audio_duration_seconds=chunk_audio_duration_seconds,
+                    )
+                    self._emit_runtime_event(
+                        "speech_chunk_ready_for_playback",
+                        level="info",
+                        job_id=self._speech_current_job_id,
+                        mode=mode,
+                        chunk_index=chunk_index,
+                        chunk_count=len(normalized_chunks),
+                        chunk_char_count=len(text_chunk),
+                        sample_count=chunk_sample_count,
+                        synth_duration_ms=chunk_synth_duration_ms,
+                        audio_duration_seconds=chunk_audio_duration_seconds,
+                        chunk_ready_at=chunk_ready_at.isoformat(),
+                        chunk_ready_gap_ms=chunk_ready_gap_ms,
+                        synth_to_audio_ratio=synth_to_audio_ratio,
+                        real_time_margin_ms=real_time_margin_ms,
+                        configured_preroll_chunks=self.playback_preroll_chunks,
+                        effective_preroll_chunks=effective_preroll_chunks,
+                        ready_satisfies_effective_preroll=chunk_index >= effective_preroll_chunks,
                     )
                     self._emit_runtime_memory_snapshot(
                         level="info",
@@ -1294,10 +1373,25 @@ class TTSRuntime:
                             "model_id": str(chunk_result["model_id"]),
                             "device": str(chunk_result["device"]),
                             "language": str(chunk_result["language"]),
+                            "chunk_index": chunk_index,
+                            "chunk_count": len(normalized_chunks),
+                            "chunk_char_count": len(text_chunk),
+                            "sample_count": chunk_sample_count,
+                            "synth_duration_ms": chunk_synth_duration_ms,
+                            "audio_duration_seconds": chunk_audio_duration_seconds,
+                            "chunk_ready_at": chunk_ready_at,
+                            "synth_to_audio_ratio": synth_to_audio_ratio,
+                            "real_time_margin_ms": real_time_margin_ms,
+                            "chunk_ready_gap_ms": chunk_ready_gap_ms,
                         }
                     )
+                    previous_chunk_audio_ms = chunk_audio_ms
+                    previous_chunk_ready_at = chunk_ready_at
             except BaseException as exc:
                 producer_error.append(exc)
+                if current_chunk_index is not None:
+                    job_metrics["failed_chunk_index"] = current_chunk_index
+                job_metrics["failure_reason"] = str(exc)
                 self._emit_runtime_event(
                     "speech_chunk_producer_failed",
                     level="minimal",
@@ -1317,6 +1411,167 @@ class TTSRuntime:
         producer_thread.start()
         return waveform_queue, queue_sentinel, producer_error, synthesis_done, producer_thread
 
+    def _effective_preroll_chunk_target(self, total_chunk_count: int) -> int:
+        if total_chunk_count <= 0:
+            raise ValueError("total_chunk_count must be greater than zero")
+        if total_chunk_count <= 2:
+            return 1
+        return min(self.playback_preroll_chunks, 2, total_chunk_count)
+
+    def _new_job_metrics(
+        self,
+        *,
+        mode: str,
+        normalized_chunks: list[str],
+        effective_preroll_chunks: int,
+        total_chunk_char_count: int,
+        job_started_at: dt.datetime,
+    ) -> dict[str, Any]:
+        return {
+            "job_id": self._speech_current_job_id,
+            "mode": mode,
+            "chunk_count": len(normalized_chunks),
+            "chunk_char_count_total": total_chunk_char_count,
+            "configured_preroll_chunks": self.playback_preroll_chunks,
+            "effective_preroll_chunks": effective_preroll_chunks,
+            "effective_preroll_policy": EFFECTIVE_PREROLL_POLICY,
+            "job_started_at": job_started_at,
+            "first_chunk_ready_at": None,
+            "first_audio_started_at": None,
+            "first_audio_start_reason": None,
+            "first_audio_latency_ms": None,
+            "first_chunk_ready_to_first_audio_ms": None,
+            "max_chunk_synth_duration_ms": None,
+            "sum_chunk_synth_duration_ms": 0,
+            "max_chunk_audio_seconds": None,
+            "sum_chunk_audio_seconds": 0.0,
+            "max_synth_to_audio_ratio": None,
+            "min_real_time_margin_ms": None,
+            "failed_chunk_index": None,
+            "failure_reason": None,
+            "wavbuffer_forced_input_completed": False,
+            "completed_chunk_count": 0,
+        }
+
+    def _update_job_metrics_for_chunk(
+        self,
+        *,
+        job_metrics: dict[str, Any],
+        chunk_index: int,
+        synth_duration_ms: int,
+        audio_duration_seconds: float,
+        synth_to_audio_ratio: float | None,
+        real_time_margin_ms: int | None,
+        chunk_ready_at: dt.datetime,
+    ) -> None:
+        if job_metrics["first_chunk_ready_at"] is None:
+            job_metrics["first_chunk_ready_at"] = chunk_ready_at
+        job_metrics["completed_chunk_count"] = max(
+            int(cast(int, job_metrics["completed_chunk_count"])),
+            chunk_index,
+        )
+        job_metrics["sum_chunk_synth_duration_ms"] = (
+            int(cast(int, job_metrics["sum_chunk_synth_duration_ms"])) + synth_duration_ms
+        )
+        job_metrics["sum_chunk_audio_seconds"] = (
+            float(cast(float, job_metrics["sum_chunk_audio_seconds"])) + audio_duration_seconds
+        )
+        existing_max_synth = cast(int | None, job_metrics["max_chunk_synth_duration_ms"])
+        if existing_max_synth is None or synth_duration_ms > existing_max_synth:
+            job_metrics["max_chunk_synth_duration_ms"] = synth_duration_ms
+        existing_max_audio = cast(float | None, job_metrics["max_chunk_audio_seconds"])
+        if existing_max_audio is None or audio_duration_seconds > existing_max_audio:
+            job_metrics["max_chunk_audio_seconds"] = audio_duration_seconds
+        existing_max_ratio = cast(float | None, job_metrics["max_synth_to_audio_ratio"])
+        if synth_to_audio_ratio is not None and (
+            existing_max_ratio is None or synth_to_audio_ratio > existing_max_ratio
+        ):
+            job_metrics["max_synth_to_audio_ratio"] = synth_to_audio_ratio
+        existing_min_margin = cast(int | None, job_metrics["min_real_time_margin_ms"])
+        if real_time_margin_ms is not None and (
+            existing_min_margin is None or real_time_margin_ms < existing_min_margin
+        ):
+            job_metrics["min_real_time_margin_ms"] = real_time_margin_ms
+
+    def _record_first_audio_started(
+        self,
+        *,
+        job_metrics: dict[str, Any],
+        started_at: dt.datetime,
+        reason: str,
+        player: str,
+    ) -> None:
+        if job_metrics["first_audio_started_at"] is not None:
+            return
+        job_metrics["first_audio_started_at"] = started_at
+        job_metrics["first_audio_start_reason"] = reason
+        job_metrics["wavbuffer_forced_input_completed"] = reason == "forced_input_completed"
+        job_started_at = cast(dt.datetime, job_metrics["job_started_at"])
+        first_chunk_ready_at = cast(dt.datetime | None, job_metrics["first_chunk_ready_at"])
+        first_audio_latency_ms = _duration_ms(job_started_at, started_at)
+        first_chunk_ready_to_first_audio_ms = _duration_ms(first_chunk_ready_at, started_at)
+        job_metrics["first_audio_latency_ms"] = first_audio_latency_ms
+        job_metrics["first_chunk_ready_to_first_audio_ms"] = first_chunk_ready_to_first_audio_ms
+        self._emit_runtime_event(
+            "speech_first_audio_started",
+            level="info",
+            job_id=job_metrics["job_id"],
+            mode=job_metrics["mode"],
+            player=player,
+            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
+            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
+            effective_preroll_policy=job_metrics["effective_preroll_policy"],
+            first_audio_latency_ms=first_audio_latency_ms,
+            first_chunk_ready_to_first_audio_ms=first_chunk_ready_to_first_audio_ms,
+            reason=reason,
+        )
+
+    def _record_job_metrics(self, job_metrics: dict[str, Any]) -> None:
+        with self._lock:
+            self._last_effective_preroll_chunks = cast(
+                int | None, job_metrics["effective_preroll_chunks"]
+            )
+            self._last_first_audio_latency_ms = cast(
+                int | None, job_metrics["first_audio_latency_ms"]
+            )
+            self._last_first_chunk_ready_to_first_audio_ms = cast(
+                int | None, job_metrics["first_chunk_ready_to_first_audio_ms"]
+            )
+            self._last_failure_reason = cast(str | None, job_metrics["failure_reason"])
+
+    def _emit_job_metrics_summary(self, *, job_metrics: dict[str, Any]) -> None:
+        completed_chunk_count = max(1, int(cast(int, job_metrics["completed_chunk_count"])))
+        avg_chunk_synth_duration_ms = round(
+            int(cast(int, job_metrics["sum_chunk_synth_duration_ms"])) / completed_chunk_count, 3
+        )
+        avg_chunk_audio_seconds = round(
+            float(cast(float, job_metrics["sum_chunk_audio_seconds"])) / completed_chunk_count, 3
+        )
+        self._emit_runtime_event(
+            "speech_job_metrics_summary",
+            level="minimal",
+            job_id=job_metrics["job_id"],
+            mode=job_metrics["mode"],
+            chunk_count=job_metrics["chunk_count"],
+            chunk_char_count_total=job_metrics["chunk_char_count_total"],
+            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
+            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
+            effective_preroll_policy=job_metrics["effective_preroll_policy"],
+            first_audio_latency_ms=job_metrics["first_audio_latency_ms"],
+            first_chunk_ready_to_first_audio_ms=job_metrics[
+                "first_chunk_ready_to_first_audio_ms"
+            ],
+            max_chunk_synth_duration_ms=job_metrics["max_chunk_synth_duration_ms"],
+            avg_chunk_synth_duration_ms=avg_chunk_synth_duration_ms,
+            max_chunk_audio_seconds=job_metrics["max_chunk_audio_seconds"],
+            avg_chunk_audio_seconds=avg_chunk_audio_seconds,
+            max_synth_to_audio_ratio=job_metrics["max_synth_to_audio_ratio"],
+            min_real_time_margin_ms=job_metrics["min_real_time_margin_ms"],
+            failure_reason=job_metrics["failure_reason"],
+            failed_chunk_index=job_metrics["failed_chunk_index"],
+            wavbuffer_forced_input_completed=job_metrics["wavbuffer_forced_input_completed"],
+        )
+
     def _play_speech_chunks_with_sounddevice(
         self,
         *,
@@ -1327,6 +1582,8 @@ class TTSRuntime:
         queue_sentinel: object,
         producer_error: list[BaseException],
         synthesis_done: threading.Event,
+        effective_preroll_chunks: int,
+        job_metrics: dict[str, Any],
     ) -> dict[str, Any]:
         total_sample_count = 0
         buffered_sample_count = 0
@@ -1481,12 +1738,7 @@ class TTSRuntime:
                         int(sample_rate * self.playback_preroll_seconds),
                     )
                     have_enough_preroll_audio = buffered_sample_count >= preroll_sample_target
-                    have_enough_preroll_chunks = (
-                        buffered_chunk_count >= min(
-                            self.playback_preroll_chunks,
-                            len(normalized_chunks),
-                        )
-                    )
+                    have_enough_preroll_chunks = buffered_chunk_count >= effective_preroll_chunks
                     if (
                         not synthesis_done.is_set()
                         and not have_enough_preroll_audio
@@ -1500,6 +1752,8 @@ class TTSRuntime:
                             buffered_chunk_count=buffered_chunk_count,
                             buffered_sample_count=buffered_sample_count,
                             preroll_sample_target=preroll_sample_target,
+                            configured_preroll_chunks=self.playback_preroll_chunks,
+                            effective_preroll_chunks=effective_preroll_chunks,
                         )
                         continue
 
@@ -1511,9 +1765,17 @@ class TTSRuntime:
                         buffered_chunk_count=buffered_chunk_count,
                         buffered_sample_count=buffered_sample_count,
                         preroll_sample_target=preroll_sample_target,
+                        configured_preroll_chunks=self.playback_preroll_chunks,
+                        effective_preroll_chunks=effective_preroll_chunks,
                     )
                     stream_holder[0] = open_output_stream_for_playback()
                     playback_started_at = _utc_now()
+                    self._record_first_audio_started(
+                        job_metrics=job_metrics,
+                        started_at=playback_started_at,
+                        reason="threshold_met",
+                        player="sounddevice-stream",
+                    )
 
                     for buffered_waveform in buffered_waveforms:
                         with self._lock:
@@ -1648,6 +1910,8 @@ class TTSRuntime:
         waveform_queue: queue.Queue[dict[str, Any] | object],
         queue_sentinel: object,
         producer_error: list[BaseException],
+        effective_preroll_chunks: int,
+        job_metrics: dict[str, Any],
     ) -> dict[str, Any]:
         total_sample_count = 0
         sample_rate: int | None = None
@@ -1660,7 +1924,7 @@ class TTSRuntime:
         next_chunk_index = 1
 
         def start_process() -> tuple[Any, dict[str, Any], threading.Thread]:
-            command = self._wavbuffer_command()
+            command = self._wavbuffer_command(chunk_count=len(normalized_chunks))
             self._emit_runtime_event(
                 "speech_wavbuffer_process_starting",
                 level="info",
@@ -1680,6 +1944,8 @@ class TTSRuntime:
                 "lines": [],
                 "parsed_events": [],
                 "retryable_failure": False,
+                "playback_started_at": None,
+                "playback_started_event": None,
             }
             reader_thread = threading.Thread(
                 target=self._read_wavbuffer_stderr,
@@ -1709,6 +1975,24 @@ class TTSRuntime:
             returncode = process.wait()
             if stderr_thread is not None:
                 stderr_thread.join(timeout=1)
+            if process_state is not None:
+                playback_started_at = cast(
+                    dt.datetime | None, process_state.get("playback_started_at")
+                )
+                playback_started_event = cast(
+                    dict[str, str] | None, process_state.get("playback_started_event")
+                )
+                if playback_started_at is not None:
+                    self._record_first_audio_started(
+                        job_metrics=job_metrics,
+                        started_at=playback_started_at,
+                        reason=(
+                            playback_started_event.get("reason", "threshold_met")
+                            if playback_started_event is not None
+                            else "threshold_met"
+                        ),
+                        player="wavbuffer-subprocess",
+                    )
             error_detail = current_process_error()
             retryable_failure = bool(process_state and process_state["retryable_failure"])
             self._emit_runtime_event(
@@ -2081,21 +2365,25 @@ class TTSRuntime:
         )
         return header + pcm_data
 
-    def _wavbuffer_preroll_args(self) -> list[str]:
+    def _wavbuffer_preroll_args(self, *, chunk_count: int | None = None) -> list[str]:
         mode = self.wavbuffer_preroll_mode
         if mode == "auto":
             mode = "seconds"
 
         if mode == "buffers":
-            return ["--preroll-buffers", str(self.playback_preroll_chunks)]
+            effective_chunk_count = chunk_count if chunk_count is not None else 1
+            return [
+                "--preroll-buffers",
+                str(self._effective_preroll_chunk_target(effective_chunk_count)),
+            ]
         return ["--preroll-seconds", str(self.playback_preroll_seconds)]
 
-    def _wavbuffer_command(self) -> list[str]:
+    def _wavbuffer_command(self, *, chunk_count: int | None = None) -> list[str]:
         return [
             self.wavbuffer_binary_path,
             "--queue-depth",
             str(self.wavbuffer_queue_depth),
-            *self._wavbuffer_preroll_args(),
+            *self._wavbuffer_preroll_args(chunk_count=chunk_count),
         ]
 
     def _spawn_wavbuffer_process(self, command: list[str]) -> Any:
@@ -2139,6 +2427,12 @@ class TTSRuntime:
             if parsed_event is not None:
                 cast(list[dict[str, str]], state["parsed_events"]).append(parsed_event)
                 wavbuffer_event_name = parsed_event.get("event")
+                if (
+                    wavbuffer_event_name == "playback_started"
+                    and state.get("playback_started_at") is None
+                ):
+                    state["playback_started_at"] = _utc_now()
+                    state["playback_started_event"] = dict(parsed_event)
                 if (
                     wavbuffer_event_name == "underrun"
                     or parsed_event.get("reason") == "stream_starved"
@@ -2306,6 +2600,7 @@ class TTSRuntime:
             "wavbuffer_binary_path": self.wavbuffer_binary_path,
             "wavbuffer_queue_depth": self.wavbuffer_queue_depth,
             "wavbuffer_preroll_mode": self.wavbuffer_preroll_mode,
+            "effective_preroll_policy": EFFECTIVE_PREROLL_POLICY,
             "tts_chunk_max_chars": self.tts_chunk_max_chars,
             "tts_max_new_tokens": self.tts_max_new_tokens,
             "tts_max_chunk_synth_seconds": self.tts_max_chunk_synth_seconds,
@@ -2356,6 +2651,12 @@ class TTSRuntime:
             "current_phase_started_at": _timestamp_value(self._current_phase_started_at),
             "speech_last_event_at": _timestamp_value(self._speech_last_event_at),
             "speech_last_event": self._speech_last_event,
+            "last_effective_preroll_chunks": self._last_effective_preroll_chunks,
+            "last_first_audio_latency_ms": self._last_first_audio_latency_ms,
+            "last_first_chunk_ready_to_first_audio_ms": (
+                self._last_first_chunk_ready_to_first_audio_ms
+            ),
+            "last_failure_reason": self._last_failure_reason,
             "recent_events": list(self._recent_events),
             **dependency_status,
             **self._speech_status_payload_locked(),

@@ -27,7 +27,7 @@
         <key>SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS</key>
         <string>5.0</string>
         <key>SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS</key>
-        <string>360</string>
+        <string>240</string>
         <key>SPEAK_TO_USER_TTS_MAX_NEW_TOKENS</key>
         <string>384</string>
         <key>SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS</key>
