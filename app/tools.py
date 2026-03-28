@@ -26,8 +26,10 @@ Use set_startup_model to persist which model or models preload on server startup
 Agent defaults:
 - prefer language=\"en\" unless the caller needs another language
 - check tts_status before assuming speech is broken
+- use the status and profiles state resources when you need a read-only snapshot
 - load required models before retrying a model-gated tool
 - remember playback is global and serial across clients
+- this service is tuned for reply playback, not long-form narration
 - prefer accurate reference_text when cloning from real audio
 - prefer short seed text for generate_speech_profile_from_voice_design
   because it is not a long narration path
@@ -107,7 +109,10 @@ def choose_speak_to_user_workflow_prompt() -> str:
         "Use load_model or unload_model when you need explicit model residency control, "
         "and set_startup_model when you want startup preload behavior to persist. "
         "Check tts_status first if readiness or "
-        "busy state is unclear."
+        "busy state is unclear. "
+        "Use the read-only status and profiles resources when you need current service "
+        "state without mutating anything. "
+        "Treat this server as reply playback infrastructure, not a long-form narration path."
     )
 
 
@@ -118,7 +123,7 @@ def guide_speech_profile_workflow_prompt() -> str:
         "Use generate_speech_profile_from_voice_design only when you need "
         "the server to synthesize a short seed clip for profile creation. "
         "Keep seed text short and focused, then use speak_with_profile for "
-        "longer playback after the profile exists. Recreate weak profiles "
+        "reply-sized playback after the profile exists. Recreate weak profiles "
         "from better source material instead "
         "of reusing poor seeds."
     )

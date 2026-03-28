@@ -18,7 +18,7 @@ from app import server
 
 class StubRuntime:
     def __init__(self) -> None:
-        self.tts_chunk_max_chars = 360
+        self.tts_chunk_max_chars = 160
         self.status_payload = {
             "ready": True,
             "model_loaded": True,
@@ -67,7 +67,7 @@ class StubRuntime:
             "speech_last_error": None,
             "speech_last_event_at": None,
             "speech_last_event": None,
-            "tts_chunk_max_chars": 360,
+            "tts_chunk_max_chars": 160,
             "tts_max_new_tokens": 384,
             "tts_max_chunk_synth_seconds": 30.0,
             "tts_max_chunk_audio_seconds": 20.0,
@@ -710,6 +710,8 @@ def test_choose_speak_to_user_workflow_prompt_renders_expected_guidance() -> Non
         assert "speak_text_as_clone" in text
         assert "speak_with_profile" in text
         assert "tts_status" in text
+        assert "resources" in text
+        assert "reply playback" in text
 
     asyncio.run(run())
 
@@ -719,6 +721,8 @@ def test_usage_guide_resource_reads_expected_content() -> None:
         result = await server.mcp.read_resource("guide://speak-to-user/usage")
         assert "generate_speech_profile_from_voice_design" in result.contents[0].content
         assert "playback is global and serial" in result.contents[0].content
+        assert "status and profiles state resources" in result.contents[0].content
+        assert "reply playback" in result.contents[0].content
 
     asyncio.run(run())
 

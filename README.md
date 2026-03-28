@@ -242,7 +242,7 @@ Operational notes:
 - `SPEAK_TO_USER_TTS_MAX_NEW_TOKENS=384` is passed explicitly into Qwen instead of relying on upstream defaults so the service has a local cap on per-chunk generation budget
 - `SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS=20.0` fails chunks that decode into obviously reply-inappropriate audio durations instead of letting one absurd output dominate the worker
 - `SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS=30.0` is a post-call guardrail: it marks an overlong synthesis as failed once Qwen returns, but it does not preempt the Qwen Python call mid-generation
-- when `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers`, the runtime still caps the effective wavbuffer chunk-preroll target dynamically so 1- and 2-chunk jobs start after the first ready chunk while 3+-chunk jobs cap at 2 buffers even if the configured value is higher
+- when `SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE=buffers`, the runtime still caps the effective `wavbuffer` chunk-preroll target dynamically so 1- and 2-chunk jobs hand off with a 1-buffer target while 3+-chunk jobs cap at 2 buffers even if the configured value is higher; the separate startup-admission policy may still delay audible playback longer when chunk timing looks unsafe
 - playback startup is now admission-controlled in the Python runtime for both `sounddevice` and `wavbuffer`: 2- and 3-chunk replies wait until all chunks are buffered, while longer replies can defer first audio until buffered chunk count and buffered audio lead look safe enough against the observed synth deficit
 - the accepted live verification for these defaults is recorded in [benchmarks/live-verification-2026-03-28.md](benchmarks/live-verification-2026-03-28.md)
 
