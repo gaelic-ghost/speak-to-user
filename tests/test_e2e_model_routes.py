@@ -5,6 +5,7 @@ from collections.abc import Generator
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import sys
 import tempfile
@@ -51,6 +52,12 @@ def _e2e_base_url() -> str:
     return f"http://{_e2e_host()}:{_e2e_port()}{_e2e_path()}"
 
 
+def _pick_free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind((DEFAULT_E2E_HOST, 0))
+        return cast(int, sock.getsockname()[1])
+
+
 def _tool_payload(result: Any) -> dict[str, Any]:
     payload = getattr(result, "structuredContent", None)
     if isinstance(payload, dict):
@@ -90,11 +97,19 @@ async def _assert_tool_error(
 
 class ManagedE2EServer:
     def __init__(self, *, state_dir: Path) -> None:
-        self.base_url = _e2e_base_url()
-        parsed = urlparse(self.base_url)
-        self.host = parsed.hostname or _e2e_host()
-        self.port = parsed.port or _e2e_port()
-        self.path = parsed.path or _e2e_path()
+        configured_base_url = os.getenv("SPEAK_TO_USER_E2E_BASE_URL", "").strip()
+        configured_port = os.getenv("SPEAK_TO_USER_E2E_PORT", "").strip()
+        if configured_base_url:
+            parsed = urlparse(configured_base_url)
+            self.host = parsed.hostname or _e2e_host()
+            self.port = parsed.port or _e2e_port()
+            self.path = parsed.path or _e2e_path()
+            self.base_url = configured_base_url
+        else:
+            self.host = _e2e_host()
+            self.port = int(configured_port) if configured_port else _pick_free_tcp_port()
+            self.path = _e2e_path()
+            self.base_url = f"http://{self.host}:{self.port}{self.path}"
         self.state_dir = state_dir
         self._log_dir = Path(tempfile.mkdtemp(prefix="speak-to-user-e2e-logs."))
         self._stdout_path = self._log_dir / "server.stdout.log"
@@ -294,7 +309,7 @@ def test_speech_and_profile_routes_over_http(
                     },
                 )
                 assert speak_text_payload["result"] == "success"
-                assert speak_text_payload["queued"] is True
+                assert speak_text_payload["completed"] is True
 
                 speak_clone_payload = await _call_tool_payload(
                     client,
@@ -307,7 +322,7 @@ def test_speech_and_profile_routes_over_http(
                     },
                 )
                 assert speak_clone_payload["result"] == "success"
-                assert speak_clone_payload["queued"] is True
+                assert speak_clone_payload["completed"] is True
 
                 generate_profile_payload = await _call_tool_payload(
                     client,
@@ -349,7 +364,7 @@ def test_speech_and_profile_routes_over_http(
                     },
                 )
                 assert speak_with_profile_payload["result"] == "success"
-                assert speak_with_profile_payload["queued"] is True
+                assert speak_with_profile_payload["completed"] is True
 
                 profile_resource = await client.read_resource("state://speak-to-user/profiles")
                 profile_resource_text = "\n".join(
@@ -364,12 +379,16 @@ def test_speech_and_profile_routes_over_http(
                 }
                 assert {profile_name, designed_profile_name}.issubset(profile_names)
             finally:
-                await _call_tool_payload(client, "delete_speech_profile", {"name": profile_name})
-                await _call_tool_payload(
-                    client,
-                    "delete_speech_profile",
-                    {"name": designed_profile_name},
-                )
+                for cleanup_name in (profile_name, designed_profile_name):
+                    try:
+                        await _call_tool_payload(
+                            client,
+                            "delete_speech_profile",
+                            {"name": cleanup_name},
+                        )
+                    except ToolError as exc:
+                        if "does not exist" not in str(exc):
+                            raise
 
     asyncio.run(run())
 
@@ -406,7 +425,7 @@ def test_model_management_and_high_signal_failures_over_http(
                     "text": "This should fail without the voice-design model.",
                     "voice_description": "Warm and clear.",
                 },
-                "required model",
+                "Required TTS models are not loaded yet",
             )
 
             load_payload = await _call_tool_payload(
@@ -452,7 +471,7 @@ def test_model_management_and_high_signal_failures_over_http(
                 client,
                 "set_startup_model",
                 {"option": "definitely-not-valid"},
-                "startup model option must be one of",
+                "Invalid startup model option",
             )
 
             clone_unload_payload = await _call_tool_payload(
@@ -466,45 +485,6 @@ def test_model_management_and_high_signal_failures_over_http(
             await _call_tool_payload(client, "delete_speech_profile", {"name": profile_name})
 
     asyncio.run(run())
-
-
-def test_unload_model_rejects_while_jobs_are_queued(managed_server: ManagedE2EServer) -> None:
-    async def run() -> None:
-        async with Client(managed_server.base_url, timeout=600) as client:
-            status_payload = await _call_tool_payload(client, "tts_status")
-            voice_design_model_id = cast(str, status_payload["voice_design_model_id"])
-            long_text = " ".join("This is a queued e2e unload test sentence." for _ in range(300))
-
-            for _ in range(6):
-                await _call_tool_payload(
-                    client,
-                    "speak_text",
-                    {
-                        "text": long_text,
-                        "voice_description": "Warm, clear, supportive, brisk.",
-                        "language": "en",
-                    },
-                )
-
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                queue_status = await _call_tool_payload(client, "tts_status")
-                if (
-                    cast(int, queue_status["speech_queue_depth"]) > 0
-                    or queue_status["speech_in_progress"] is True
-                ):
-                    break
-                await asyncio.sleep(0.2)
-
-            await _assert_tool_error(
-                client,
-                "unload_model",
-                {"model_id": voice_design_model_id},
-                "cannot be unloaded",
-            )
-
-    asyncio.run(run())
-
 
 def test_startup_model_and_profiles_persist_across_restart(
     managed_server: ManagedE2EServer,

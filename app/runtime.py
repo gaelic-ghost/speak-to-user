@@ -120,12 +120,7 @@ class TTSRuntime:
 
     async def preload(self, *, state_store: Any) -> None:
         self.profiles_dir.mkdir(parents=True, exist_ok=True)
-        stored_option = await state_store.get(
-            STARTUP_MODEL_KEY,
-            collection=STARTUP_MODEL_COLLECTION,
-            default=DEFAULT_STARTUP_MODEL_OPTION,
-        )
-        option = stored_option if isinstance(stored_option, str) else DEFAULT_STARTUP_MODEL_OPTION
+        option = await self._read_startup_model_option(state_store)
         self._startup_model_option = option
 
         for model_kind in self._model_kinds_for_option(option):
@@ -213,7 +208,7 @@ class TTSRuntime:
             )
         await state_store.put(
             STARTUP_MODEL_KEY,
-            normalized_option,
+            {"option": normalized_option},
             collection=STARTUP_MODEL_COLLECTION,
         )
         self._startup_model_option = normalized_option
@@ -1165,8 +1160,17 @@ class TTSRuntime:
             self._speech_last_event_at = timestamp
             self._recent_events.append(event)
 
-    def _metadata_dir(self) -> Path:
-        return self.profiles_dir.parent / "metadata"
+    def _profile_data_dir(self) -> Path:
+        return self.profiles_dir.parent / "data" / PROFILE_COLLECTION
+
+    def _profile_file_path(self, name: str) -> Path:
+        return self._profile_data_dir() / f"{name}.json"
+
+    def _runtime_config_data_dir(self) -> Path:
+        return self.profiles_dir.parent / "data" / STARTUP_MODEL_COLLECTION
+
+    def _startup_model_option_file_path(self) -> Path:
+        return self._runtime_config_data_dir() / f"{STARTUP_MODEL_KEY}.json"
 
     def _validated_reference_audio_path(self, raw_path: str) -> Path:
         path = Path(raw_path.strip()).expanduser().resolve()
@@ -1176,23 +1180,81 @@ class TTSRuntime:
             raise ValueError(f"Reference audio path `{path}` is not a regular file")
         return path
 
+    def _startup_model_option_from_payload(self, payload: Any) -> str:
+        normalized_payload = self._state_store_value_payload(payload)
+        if isinstance(normalized_payload, str):
+            return normalized_payload
+        if isinstance(normalized_payload, dict):
+            option = normalized_payload.get("option")
+            if isinstance(option, str):
+                return option
+        return DEFAULT_STARTUP_MODEL_OPTION
+
+    async def _read_startup_model_option(self, state_store: Any) -> str:
+        startup_model_option_file_path = self._startup_model_option_file_path()
+        if startup_model_option_file_path.exists():
+            return self._startup_model_option_from_payload(
+                self._read_json_file(
+                    startup_model_option_file_path,
+                    not_found_message=(
+                        "Startup model option file disappeared before it could be read"
+                    ),
+                    unreadable_message=(
+                        "Startup model option file contains unreadable JSON at "
+                        f"`{startup_model_option_file_path}`"
+                    ),
+                )
+            )
+
+        get_method = getattr(state_store, "get", None)
+        if get_method is None:
+            return DEFAULT_STARTUP_MODEL_OPTION
+
+        try:
+            payload = await get_method(
+                STARTUP_MODEL_KEY,
+                collection=STARTUP_MODEL_COLLECTION,
+            )
+        except TypeError:
+            return DEFAULT_STARTUP_MODEL_OPTION
+
+        return self._startup_model_option_from_payload(payload)
+
     async def _get_profile(self, state_store: Any, name: str) -> SpeechProfile | None:
-        payload = await state_store.get(name, collection=PROFILE_COLLECTION, default=None)
+        profile_file_path = self._profile_file_path(name)
+        if profile_file_path.exists():
+            return _speech_profile_from_payload(
+                self._state_store_value_payload(
+                    self._read_json_file(
+                        profile_file_path,
+                        not_found_message=(
+                            f"Speech profile `{name}` disappeared before it could be read"
+                        ),
+                        unreadable_message=(
+                            f"Speech profile `{name}` has unreadable JSON on disk at "
+                            f"`{profile_file_path}`"
+                        ),
+                    )
+                )
+            )
+
+        payload = await state_store.get(name, collection=PROFILE_COLLECTION)
         if payload is None:
             return None
-        if not isinstance(payload, dict):
+        normalized_payload = self._state_store_value_payload(payload)
+        if not isinstance(normalized_payload, dict):
             raise RuntimeError(
                 f"Speech profile `{name}` has unreadable state-store data and cannot be loaded"
             )
-        return _speech_profile_from_payload(payload)
+        return _speech_profile_from_payload(normalized_payload)
 
     async def _put_profile(self, state_store: Any, profile: SpeechProfile) -> None:
         await state_store.put(profile.name, asdict(profile), collection=PROFILE_COLLECTION)
 
     async def _list_profiles(self, state_store: Any) -> list[SpeechProfile]:
         profiles: list[SpeechProfile] = []
-        metadata_dir = self._metadata_dir()
-        if not metadata_dir.exists():
+        profile_data_dir = self._profile_data_dir()
+        if not profile_data_dir.exists():
             values = getattr(state_store, "values", None)
             if isinstance(values, dict):
                 for (key, collection), payload in values.items():
@@ -1202,24 +1264,58 @@ class TTSRuntime:
                         profiles.append(_speech_profile_from_payload(payload))
             return profiles
 
-        for metadata_path in sorted(metadata_dir.glob("*.json")):
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except json.JSONDecodeError:
-                continue
-
-            if metadata.get("collection") != PROFILE_COLLECTION:
-                continue
-
-            key = metadata.get("key")
-            if not isinstance(key, str):
-                continue
-
-            profile = await self._get_profile(state_store, key)
-            if profile is not None:
-                profiles.append(profile)
+        for profile_path in sorted(profile_data_dir.glob("*.json")):
+            profiles.append(
+                _speech_profile_from_payload(
+                    self._state_store_value_payload(
+                        self._read_json_file(
+                            profile_path,
+                            not_found_message=(
+                                f"Speech profile file `{profile_path}` disappeared during listing"
+                            ),
+                            unreadable_message=(
+                                f"Speech profile file `{profile_path}` contains unreadable JSON"
+                            ),
+                        )
+                    )
+                )
+            )
 
         return profiles
+
+    def _state_store_value_payload(self, payload: Any) -> Any:
+        if not isinstance(payload, dict):
+            return payload
+        value = payload.get("value")
+        if isinstance(value, dict):
+            return value
+        return payload
+
+    def _read_json_file(
+        self,
+        path: Path,
+        *,
+        not_found_message: str,
+        unreadable_message: str,
+    ) -> dict[str, Any]:
+        try:
+            raw_text = path.read_text(encoding="utf-8")
+        except FileNotFoundError as exc:
+            raise RuntimeError(not_found_message) from exc
+        except OSError as exc:
+            raise RuntimeError(f"{unreadable_message}. Original error: {exc}") from exc
+
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"{unreadable_message}. Original error: {exc}") from exc
+
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"{unreadable_message}. Expected a JSON object at `{path}`, "
+                f"but found `{type(payload).__name__}`"
+            )
+        return payload
 
 
 # MARK: Helpers
