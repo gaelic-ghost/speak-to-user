@@ -4,3 +4,7 @@
 .ruff_cache/
 __pycache__/
 generated-audio/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

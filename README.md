@@ -1,6 +1,6 @@
 # speak-to-user
 
-[![Coverage](https://img.shields.io/badge/coverage-65%25-yellow)](./.coverage)
+[![Coverage](https://img.shields.io/badge/coverage-pytest--cov-blue)](#validation)
 
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server that turns agent replies into spoken audio on Gale's Mac.
 
@@ -109,3 +109,16 @@ uv run pytest --cov=app --cov-report=term-missing
 uv run ruff check .
 uv run mypy .
 ```
+
+`pytest-cov` and `coverage.py` are configured through `pyproject.toml`.
+The `.coverage` database and generated reports stay local and should not be committed.
+
+## Pre-commit
+
+Install the lightweight local hooks with:
+
+```bash
+uv run pre-commit install
+```
+
+These hooks stay fast on purpose. Coverage stays a manual or CI check instead of running on every commit.

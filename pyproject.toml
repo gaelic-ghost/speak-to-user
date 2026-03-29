@@ -16,6 +16,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "mypy>=1.19.1",
+    "pre-commit>=4.3.0",
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
     "ruff>=0.15.6",
@@ -35,6 +36,15 @@ markers = [
     "e2e: optional HTTP end-to-end tests that load the real models",
     "serial: tests that must run alone because of memory-heavy model usage",
 ]
+
+[tool.coverage.run]
+branch = true
+source = ["app"]
+data_file = ".coverage"
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
 
 [tool.mypy]
 python_version = "3.12"
