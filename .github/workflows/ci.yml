@@ -4,6 +4,10 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   validate:
     runs-on: macos-latest
@@ -45,3 +49,9 @@ jobs:
         with:
           name: coverage-xml
           path: coverage.xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: coverage.xml
+          use_oidc: true

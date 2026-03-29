@@ -16,34 +16,6 @@
         <string>127.0.0.1</string>
         <key>SPEAK_TO_USER_PORT</key>
         <string>8766</string>
-        <key>SPEAK_TO_USER_PLAYBACK_BACKEND</key>
-        <string>wavbuffer</string>
-        <key>SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH</key>
-        <string>8</string>
-        <key>SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE</key>
-        <string>buffers</string>
-        <key>SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL</key>
-        <string>service-v1</string>
-        <key>SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS</key>
-        <string>45.0</string>
-        <key>SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS</key>
-        <string>3</string>
-        <key>SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS</key>
-        <string>5.0</string>
-        <key>SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS</key>
-        <string>160</string>
-        <key>SPEAK_TO_USER_TTS_MAX_NEW_TOKENS</key>
-        <string>384</string>
-        <key>SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS</key>
-        <string>30.0</string>
-        <key>SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS</key>
-        <string>20.0</string>
-        <key>SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES</key>
-        <string>2</string>
-        <key>SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE</key>
-        <string>1.25</string>
-        <key>SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION</key>
-        <string>0.02</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>

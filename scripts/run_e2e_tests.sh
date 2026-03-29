@@ -4,9 +4,7 @@ set -eu
 ROOT_DIR=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 LOCK_DIR="${TMPDIR:-/tmp}/speak-to-user-e2e.lock"
 E2E_HOST="${SPEAK_TO_USER_E2E_HOST:-127.0.0.1}"
-E2E_PORT="${SPEAK_TO_USER_E2E_PORT:-8876}"
 E2E_PATH="${SPEAK_TO_USER_E2E_PATH:-/mcp}"
-E2E_BASE_URL="http://${E2E_HOST}:${E2E_PORT}${E2E_PATH}"
 
 cleanup() {
     rm -rf "${LOCK_DIR}"
@@ -31,9 +29,14 @@ fi
 
 echo "Running uv run pytest -m e2e -q"
 (
-    cd "${ROOT_DIR}" && \
+    cd "${ROOT_DIR}" || exit 1
+
+    if [ -n "${SPEAK_TO_USER_E2E_PORT:-}" ]; then
         SPEAK_TO_USER_E2E_HOST="${E2E_HOST}" \
-        SPEAK_TO_USER_E2E_PORT="${E2E_PORT}" \
-        SPEAK_TO_USER_E2E_PATH="${E2E_PATH}" \
+            SPEAK_TO_USER_E2E_PORT="${SPEAK_TO_USER_E2E_PORT}" \
+            SPEAK_TO_USER_E2E_PATH="${E2E_PATH}" \
+            uv run pytest -m e2e -q -o addopts='-q --strict-markers'
+    else
         uv run pytest -m e2e -q -o addopts='-q --strict-markers'
+    fi
 )

@@ -1,6 +1,6 @@
 # speak-to-user
 
-[![Coverage](https://img.shields.io/badge/coverage-pytest--cov-blue)](#validation)
+[![codecov](https://codecov.io/gh/gaelic-ghost/speak-to-user/graph/badge.svg?branch=main)](https://codecov.io/gh/gaelic-ghost/speak-to-user)
 
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server that turns agent replies into spoken audio on Gale's Mac.
 
