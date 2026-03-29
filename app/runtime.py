@@ -498,9 +498,9 @@ class TTSRuntime:
             return model_kind in self._models
 
     def _load_model_impl(self, model_kind: str) -> Any:
-        from mlx_audio.tts.utils import load_model
+        from mlx_audio.tts.utils import load
 
-        return load_model(self._model_id_for_kind(model_kind))
+        return load(self._model_id_for_kind(model_kind))
 
     def _run_speech_job(
         self,
