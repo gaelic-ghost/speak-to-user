@@ -1,5 +1,7 @@
 # speak-to-user
 
+[![Coverage](https://img.shields.io/badge/coverage-65%25-yellow)](./.coverage)
+
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server that turns agent replies into spoken audio on Gale's Mac.
 
 This rewrite uses [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) as the synthesis runtime instead of the older `qwen-tts` stack. The repo stays intentionally small: two resident model lanes, direct playback, and reusable profile artifacts stored in FastMCP state.
@@ -103,6 +105,7 @@ By default the MCP endpoint is served at `http://127.0.0.1:8765/mcp`.
 
 ```bash
 uv run pytest
+uv run pytest --cov=app --cov-report=term-missing
 uv run ruff check .
 uv run mypy .
 ```
