@@ -1,560 +1,104 @@
 from __future__ import annotations
 
-import builtins
+# MARK: Imports
+
 from collections import deque
-import contextlib
+from dataclasses import asdict, dataclass
 import datetime as dt
-import gc
-import importlib.util
 import json
 import os
 from pathlib import Path
-import queue
 import shutil
-import shlex
-import struct
-import subprocess
-import sys
-import tempfile
 import threading
-from typing import Any, cast
+from typing import Any, Literal, cast
+import uuid
 
 import numpy as np
-import sounddevice as sd  # type: ignore[import-untyped]
-from pydantic import BaseModel
+import sounddevice as sd
+import soundfile as sf
 
-from app.text_chunking import DEFAULT_TTS_CHUNK_MAX_CHARS
-from fastmcp.server.server import StateValue
 
 # MARK: Constants
 
 VOICE_DESIGN_MODEL_KIND = "voice_design"
 CLONE_MODEL_KIND = "clone"
-DEFAULT_VOICE_DESIGN_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign"
-DEFAULT_CLONE_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-0.6B-Base"
-DEFAULT_ENABLE_VOICE_DESIGN_MODEL = True
-DEFAULT_ENABLE_CLONE_MODEL = True
-DEFAULT_PLAYBACK_PREROLL_SECONDS = 3.0
-DEFAULT_PLAYBACK_PREROLL_CHUNKS = 2
-DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE = 16
-DEFAULT_PLAYBACK_UNDERFLOW_RETRIES = 2
-DEFAULT_PLAYBACK_BACKEND = "sounddevice"
-DEFAULT_WAVBUFFER_QUEUE_DEPTH = 8
-DEFAULT_WAVBUFFER_PREROLL_MODE = "seconds"
-DEFAULT_WAVBUFFER_INPUT_PROTOCOL = "service-v1"
-DEFAULT_WAVBUFFER_STARVATION_TIMEOUT_SECONDS = 45.0
-DEFAULT_OUTPUT_STREAM_LATENCY = "high"
-DEFAULT_SPEECH_QUEUE_MAXSIZE = 32
-DEFAULT_SPEECH_PHASE = "idle"
-VOICE_DESIGN_PROFILE_SEED_MAX_CHARS = 240
-DEFAULT_TTS_MAX_NEW_TOKENS = 384
-DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS = 30.0
-DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS = 20.0
-DEFAULT_TTS_CHUNK_REGEN_RETRIES = 2
-DEFAULT_TTS_WAVEFORM_MAX_ABS_SAMPLE = 1.25
-DEFAULT_TTS_WAVEFORM_CLIP_THRESHOLD = 0.999
-DEFAULT_TTS_WAVEFORM_MAX_CLIPPED_FRACTION = 0.02
-PLAYBACK_START_SAFETY_CUSHION_SECONDS = 2.0
-PLAYBACK_START_RISKY_TWO_CHUNK_MARGIN_MS = -3000
-DEFAULT_LOG_LEVEL = "info"
-DEFAULT_RECENT_EVENT_LIMIT = 100
-EFFECTIVE_PREROLL_POLICY = "balanced_dynamic_chunk_cap_v1"
-SPEECH_PROFILE_COLLECTION = "speak_to_user_profiles"
-SPEECH_PROFILE_INDEX_KEY = "index"
-RUNTIME_CONFIGURATION_COLLECTION = "speak_to_user_runtime"
-STARTUP_MODEL_OPTION_KEY = "startup_model_option"
-STARTUP_MODEL_OPTION_NONE = "none"
-STARTUP_MODEL_OPTION_ALL = "all"
-LOG_LEVEL_PRIORITY = {"minimal": 0, "info": 1, "debug": 2}
-LANGUAGE_ALIASES = {
-    "auto": "Auto",
-    "en": "English",
-    "english": "English",
-    "fr": "French",
-    "french": "French",
-    "de": "German",
-    "german": "German",
-    "it": "Italian",
-    "italian": "Italian",
-    "ja": "Japanese",
-    "japanese": "Japanese",
-    "ko": "Korean",
-    "korean": "Korean",
-    "pt": "Portuguese",
-    "portuguese": "Portuguese",
-    "ru": "Russian",
-    "russian": "Russian",
-    "es": "Spanish",
-    "spanish": "Spanish",
-    "zh": "Chinese",
-    "chinese": "Chinese",
-}
-
-os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
-_ORIGINAL_PRINT = builtins.print
-_PRINT_REDIRECT_LOCK = threading.RLock()
-_PRINT_REDIRECT_THREAD_COUNTS: dict[int, int] = {}
-_ACTIVE_PRINT_REDIRECTS = 0
+PROFILE_COLLECTION = "speech_profiles"
+STARTUP_MODEL_COLLECTION = "runtime_config"
+STARTUP_MODEL_KEY = "startup_model_option"
+DEFAULT_STATE_DIR = Path.home() / ".local" / "gaelic-ghost" / "speak-to-user" / "profiles"
+DEFAULT_VOICE_DESIGN_MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16"
+DEFAULT_CLONE_MODEL_ID = "mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-6bit"
+RECENT_EVENT_LIMIT = 25
 
 
-class SerializedTensor(BaseModel):
-    dtype: str
-    data: list[Any]
+# MARK: Data Structures
+
+PlaybackBackend = Literal["sounddevice", "null"]
 
 
-class StoredSpeechProfilePromptItem(BaseModel):
-    ref_code: SerializedTensor | None = None
-    ref_spk_embedding: SerializedTensor
-    x_vector_only_mode: bool
-    icl_mode: bool
-    ref_text: str | None = None
-
-
-class StoredSpeechProfile(BaseModel):
+@dataclass(slots=True)
+class SpeechProfile:
     name: str
-    clone_model_id: str
-    clone_mode: str
+    model_id: str
+    reference_audio_path: str
+    reference_text: str | None
+    language: str
+    source_kind: str
     created_at: str
-    updated_at: str
-    prompt_items: list[StoredSpeechProfilePromptItem]
-    profile_source: str | None = None
     seed_text: str | None = None
     voice_description: str | None = None
 
 
-class StoredSpeechProfileIndex(BaseModel):
-    names: list[str]
-
-
-class WaveformValidationError(RuntimeError):
-    pass
-
-
-# MARK: Module Helpers
-
-def _utc_now() -> dt.datetime:
-    return dt.datetime.now(dt.UTC)
-
-
-def _timestamp_value(value: dt.datetime | None) -> str | None:
-    return value.isoformat() if value is not None else None
-
-
-def _normalize_enabled_flag(
-    raw: str | None,
-    *,
-    env_var: str,
-    default: bool,
-) -> bool:
-    if raw is None:
-        return default
-
-    value = raw.strip().lower()
-    if value in {"1", "true", "yes", "on"}:
-        return True
-    if value in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"{env_var} must be one of: true, false, 1, 0, yes, no, on, off")
-
-
-def _default_startup_model_option(
-    *,
-    voice_design_model_id: str,
-    clone_model_id: str,
-    enable_voice_design_model: bool,
-    enable_clone_model: bool,
-) -> str:
-    if enable_voice_design_model and enable_clone_model:
-        return STARTUP_MODEL_OPTION_ALL
-    if enable_voice_design_model:
-        return voice_design_model_id
-    if enable_clone_model:
-        return clone_model_id
-    return STARTUP_MODEL_OPTION_NONE
-
-
-def _normalize_device(raw: str | None) -> str:
-    value = (raw or "auto").strip().lower()
-    if value not in {"auto", "cpu", "mps"}:
-        raise ValueError("SPEAK_TO_USER_DEVICE must be one of: auto, cpu, mps")
-    return value
-
-
-def _normalize_torch_dtype(raw: str | None) -> str | None:
-    value = (raw or "").strip().lower()
-    if not value:
-        return None
-    if value not in {"float16", "bfloat16", "float32"}:
-        raise ValueError(
-            "SPEAK_TO_USER_TORCH_DTYPE must be one of: float16, bfloat16, float32"
-        )
-    return value
-
-
-def _normalize_positive_float(raw: str | None, *, env_var: str, default: float) -> float:
-    if raw is None:
-        return default
-
-    value = raw.strip()
-    if not value:
-        raise ValueError(f"{env_var} must not be empty")
-
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise ValueError(f"{env_var} must be a number") from exc
-
-    if parsed <= 0:
-        raise ValueError(f"{env_var} must be greater than zero")
-    return parsed
-
-
-def _normalize_positive_int(raw: str | None, *, env_var: str, default: int) -> int:
-    if raw is None:
-        return default
-
-    value = raw.strip()
-    if not value:
-        raise ValueError(f"{env_var} must not be empty")
-
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{env_var} must be an integer") from exc
-
-    if parsed <= 0:
-        raise ValueError(f"{env_var} must be greater than zero")
-    return parsed
-
-
-def _normalize_nonnegative_int(raw: str | None, *, env_var: str, default: int) -> int:
-    if raw is None:
-        return default
-
-    value = raw.strip()
-    if not value:
-        raise ValueError(f"{env_var} must not be empty")
-
-    try:
-        parsed = int(value)
-    except ValueError as exc:
-        raise ValueError(f"{env_var} must be an integer") from exc
-
-    if parsed < 0:
-        raise ValueError(f"{env_var} must be zero or greater")
-    return parsed
-
-
-def _normalize_output_stream_latency(raw: str | None) -> str | float:
-    value = (raw or DEFAULT_OUTPUT_STREAM_LATENCY).strip().lower()
-    if value in {"low", "high"}:
-        return value
-
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise ValueError(
-            "SPEAK_TO_USER_OUTPUT_STREAM_LATENCY must be low, high, or a number"
-        ) from exc
-
-    if parsed <= 0:
-        raise ValueError("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY must be greater than zero")
-    return parsed
-
-
-def _normalize_log_level(raw: str | None) -> str:
-    value = (raw or DEFAULT_LOG_LEVEL).strip().lower()
-    if value not in LOG_LEVEL_PRIORITY:
-        raise ValueError("SPEAK_TO_USER_LOG_LEVEL must be one of: minimal, info, debug")
-    return value
-
-
-def _normalize_playback_backend(raw: str | None) -> str:
-    value = (raw or DEFAULT_PLAYBACK_BACKEND).strip().lower()
-    if value not in {"sounddevice", "wavbuffer", "null"}:
-        raise ValueError(
-            "SPEAK_TO_USER_PLAYBACK_BACKEND must be one of: "
-            "sounddevice, wavbuffer, null"
-        )
-    return value
-
-
-def _normalize_wavbuffer_preroll_mode(raw: str | None) -> str:
-    value = (raw or DEFAULT_WAVBUFFER_PREROLL_MODE).strip().lower()
-    if value not in {"auto", "seconds", "buffers"}:
-        raise ValueError(
-            "SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE must be one of: auto, seconds, buffers"
-        )
-    return value
-
-
-def _normalize_wavbuffer_input_protocol(raw: str | None) -> str:
-    value = (raw or DEFAULT_WAVBUFFER_INPUT_PROTOCOL).strip().lower()
-    if value not in {"wav", "service-v1"}:
-        raise ValueError(
-            "SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL must be one of: wav, service-v1"
-        )
-    return value
-
-
-def _default_wavbuffer_binary_path() -> str:
-    package_dir = Path(__file__).resolve().parent
-    return str(package_dir / "vendor" / "wavbuffer" / "macos-arm64" / "wavbuffer")
-
-
-def _normalize_wavbuffer_binary_path(raw: str | None) -> str:
-    value = (raw or _default_wavbuffer_binary_path()).strip()
-    if not value:
-        raise ValueError("SPEAK_TO_USER_WAVBUFFER_BINARY_PATH must not be empty")
-    return str(Path(value).expanduser())
-
-
-def _normalize_language(value: str) -> str:
-    normalized = value.strip()
-    if not normalized:
-        raise ValueError("language must not be empty")
-
-    lowered = normalized.lower()
-    alias = LANGUAGE_ALIASES.get(lowered)
-    if alias is not None:
-        return alias
-
-    for separator in ("-", "_"):
-        if separator in lowered:
-            base_language = lowered.split(separator, 1)[0]
-            alias = LANGUAGE_ALIASES.get(base_language)
-            if alias is not None:
-                return alias
-
-    return normalized
-
-
-def _runtime_dependency_status() -> dict[str, bool]:
-    return {
-        "sox_available": shutil.which("sox") is not None,
-        "qwen_tts_available": importlib.util.find_spec("qwen_tts") is not None,
-        "torch_available": importlib.util.find_spec("torch") is not None,
-        "torchaudio_available": importlib.util.find_spec("torchaudio") is not None,
-        "soundfile_available": importlib.util.find_spec("soundfile") is not None,
-    }
-
-
-def _runtime_dependencies_ready() -> bool:
-    status = _runtime_dependency_status()
-    return bool(
-        status["sox_available"]
-        and status["qwen_tts_available"]
-        and status["soundfile_available"]
-    )
-
-
-def _meta_tensor_runtime_error(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return "meta tensor" in message and "tensor.item()" in message
-
-
-def _duration_ms(start: dt.datetime | None, end: dt.datetime | None) -> int | None:
-    if start is None or end is None:
-        return None
-    return max(0, int((end - start).total_seconds() * 1000))
-
-
-def _current_process_memory_snapshot() -> dict[str, Any]:
-    snapshot: dict[str, Any] = {}
-
-    try:
-        result = subprocess.run(
-            ["ps", "-o", "rss=", "-p", str(os.getpid())],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        rss_kib = int(result.stdout.strip())
-        snapshot["process_rss_kib"] = rss_kib
-        snapshot["process_rss_bytes"] = rss_kib * 1024
-        snapshot["process_rss_mib"] = round((rss_kib * 1024) / (1024 * 1024), 2)
-    except (subprocess.SubprocessError, ValueError):
-        snapshot["process_rss_kib"] = None
-        snapshot["process_rss_bytes"] = None
-        snapshot["process_rss_mib"] = None
-
-    try:
-        import torch
-
-        if hasattr(torch, "mps") and hasattr(torch.mps, "current_allocated_memory"):
-            snapshot["torch_mps_current_allocated_bytes"] = int(
-                torch.mps.current_allocated_memory()
-            )
-        if hasattr(torch, "mps") and hasattr(torch.mps, "driver_allocated_memory"):
-            snapshot["torch_mps_driver_allocated_bytes"] = int(
-                torch.mps.driver_allocated_memory()
-            )
-    except Exception:
-        snapshot.setdefault("torch_mps_current_allocated_bytes", None)
-        snapshot.setdefault("torch_mps_driver_allocated_bytes", None)
-
-    snapshot.setdefault("torch_mps_current_allocated_bytes", None)
-    snapshot.setdefault("torch_mps_driver_allocated_bytes", None)
-    return snapshot
-
-
-def safe_print(*args: Any, **kwargs: Any) -> None:
-    file = kwargs.get("file")
-    thread_id = threading.get_ident()
-    with _PRINT_REDIRECT_LOCK:
-        should_redirect = _PRINT_REDIRECT_THREAD_COUNTS.get(thread_id, 0) > 0
-
-    if should_redirect and (file is None or file is sys.stdout):
-        kwargs["file"] = sys.stderr
-
-    _ORIGINAL_PRINT(*args, **kwargs)
-
-
-@contextlib.contextmanager
-def _suppress_default_stdout_prints_for_current_thread() -> Any:
-    thread_id = threading.get_ident()
-    global _ACTIVE_PRINT_REDIRECTS
-
-    with _PRINT_REDIRECT_LOCK:
-        _PRINT_REDIRECT_THREAD_COUNTS[thread_id] = (
-            _PRINT_REDIRECT_THREAD_COUNTS.get(thread_id, 0) + 1
-        )
-        _ACTIVE_PRINT_REDIRECTS += 1
-        builtins.print = safe_print
-    try:
-        yield
-    finally:
-        with _PRINT_REDIRECT_LOCK:
-            remaining = _PRINT_REDIRECT_THREAD_COUNTS[thread_id] - 1
-            if remaining > 0:
-                _PRINT_REDIRECT_THREAD_COUNTS[thread_id] = remaining
-            else:
-                del _PRINT_REDIRECT_THREAD_COUNTS[thread_id]
-
-            _ACTIVE_PRINT_REDIRECTS -= 1
-            if _ACTIVE_PRINT_REDIRECTS == 0:
-                builtins.print = _ORIGINAL_PRINT
-
-
 # MARK: Runtime
-
 
 class TTSRuntime:
     def __init__(
         self,
         *,
-        voice_design_model_id: str = DEFAULT_VOICE_DESIGN_MODEL_ID,
-        clone_model_id: str = DEFAULT_CLONE_MODEL_ID,
-        enable_voice_design_model: bool = DEFAULT_ENABLE_VOICE_DESIGN_MODEL,
-        enable_clone_model: bool = DEFAULT_ENABLE_CLONE_MODEL,
-        device_preference: str,
-        torch_dtype_name: str | None = None,
-        speech_queue_maxsize: int = DEFAULT_SPEECH_QUEUE_MAXSIZE,
-        playback_preroll_seconds: float = DEFAULT_PLAYBACK_PREROLL_SECONDS,
-        playback_preroll_chunks: int = DEFAULT_PLAYBACK_PREROLL_CHUNKS,
-        playback_waveform_queue_maxsize: int = DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
-        playback_underflow_retries: int = DEFAULT_PLAYBACK_UNDERFLOW_RETRIES,
-        playback_backend: str = DEFAULT_PLAYBACK_BACKEND,
-        wavbuffer_binary_path: str | None = None,
-        wavbuffer_queue_depth: int = DEFAULT_WAVBUFFER_QUEUE_DEPTH,
-        wavbuffer_preroll_mode: str = DEFAULT_WAVBUFFER_PREROLL_MODE,
-        wavbuffer_input_protocol: str = DEFAULT_WAVBUFFER_INPUT_PROTOCOL,
-        wavbuffer_starvation_timeout_seconds: float = DEFAULT_WAVBUFFER_STARVATION_TIMEOUT_SECONDS,
-        tts_chunk_max_chars: int = DEFAULT_TTS_CHUNK_MAX_CHARS,
-        tts_max_new_tokens: int = DEFAULT_TTS_MAX_NEW_TOKENS,
-        tts_max_chunk_synth_seconds: float = DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS,
-        tts_max_chunk_audio_seconds: float = DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS,
-        tts_chunk_regen_retries: int = DEFAULT_TTS_CHUNK_REGEN_RETRIES,
-        tts_waveform_max_abs_sample: float = DEFAULT_TTS_WAVEFORM_MAX_ABS_SAMPLE,
-        tts_waveform_max_clipped_fraction: float = DEFAULT_TTS_WAVEFORM_MAX_CLIPPED_FRACTION,
-        output_stream_latency: str | float = DEFAULT_OUTPUT_STREAM_LATENCY,
-        log_level: str = DEFAULT_LOG_LEVEL,
+        voice_design_model_id: str,
+        clone_model_id: str,
+        enable_voice_design_model: bool,
+        enable_clone_model: bool,
+        playback_backend: PlaybackBackend,
+        state_dir: Path,
+        tts_chunk_max_chars: int = 160,
     ) -> None:
         self.voice_design_model_id = voice_design_model_id
         self.clone_model_id = clone_model_id
         self.enable_voice_design_model = enable_voice_design_model
         self.enable_clone_model = enable_clone_model
-        self._default_startup_model_option = _default_startup_model_option(
-            voice_design_model_id=voice_design_model_id,
-            clone_model_id=clone_model_id,
-            enable_voice_design_model=enable_voice_design_model,
-            enable_clone_model=enable_clone_model,
-        )
-        self._startup_model_option = self._default_startup_model_option
-        self.device_preference = device_preference
-        self.torch_dtype_name = torch_dtype_name
-        self.speech_queue_maxsize = speech_queue_maxsize
-        self.playback_preroll_seconds = playback_preroll_seconds
-        self.playback_preroll_chunks = playback_preroll_chunks
-        self.playback_waveform_queue_maxsize = playback_waveform_queue_maxsize
-        self.playback_underflow_retries = playback_underflow_retries
         self.playback_backend = playback_backend
-        if wavbuffer_binary_path is not None:
-            self.wavbuffer_binary_path = wavbuffer_binary_path
-        else:
-            self.wavbuffer_binary_path = _default_wavbuffer_binary_path()
-        self.wavbuffer_queue_depth = wavbuffer_queue_depth
-        self.wavbuffer_preroll_mode = wavbuffer_preroll_mode
-        self.wavbuffer_input_protocol = wavbuffer_input_protocol
-        self.wavbuffer_starvation_timeout_seconds = wavbuffer_starvation_timeout_seconds
+        self.state_dir = state_dir
         self.tts_chunk_max_chars = tts_chunk_max_chars
-        self.tts_max_new_tokens = tts_max_new_tokens
-        self.tts_max_chunk_synth_seconds = tts_max_chunk_synth_seconds
-        self.tts_max_chunk_audio_seconds = tts_max_chunk_audio_seconds
-        self.tts_chunk_regen_retries = tts_chunk_regen_retries
-        self.tts_waveform_max_abs_sample = tts_waveform_max_abs_sample
-        self.tts_waveform_max_clipped_fraction = tts_waveform_max_clipped_fraction
-        self.output_stream_latency = output_stream_latency
-        self.log_level = log_level
+        self.profiles_dir = self.state_dir / "profile_audio"
 
-        self._lock = threading.RLock()
-        self._shutdown_requested = threading.Event()
-        self._speech_queue: queue.Queue[dict[str, Any] | None] = queue.Queue(
-            maxsize=speech_queue_maxsize
-        )
-        self._speech_worker_thread: threading.Thread | None = None
-        self._speech_worker_started = False
+        self._models: dict[str, Any] = {}
+        self._model_lock = threading.RLock()
+        self._speech_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._recent_events: deque[dict[str, object]] = deque(maxlen=RECENT_EVENT_LIMIT)
 
-        self._model_slots: dict[str, dict[str, Any]] = {
-            VOICE_DESIGN_MODEL_KIND: self._new_model_slot(
-                model_id=voice_design_model_id,
-                startup_enabled=enable_voice_design_model,
-            ),
-            CLONE_MODEL_KIND: self._new_model_slot(
-                model_id=clone_model_id,
-                startup_enabled=enable_clone_model,
-            ),
-        }
-        self._last_error: str | None = None
-        self._queued_jobs_by_mode = {
-            VOICE_DESIGN_MODEL_KIND: 0,
-            CLONE_MODEL_KIND: 0,
-        }
-
+        self._startup_model_option = self._default_startup_model_option()
         self._speech_in_progress = False
-        self._speech_phase = DEFAULT_SPEECH_PHASE
-        self._speech_current_job_id: int | None = None
-        self._speech_current_chunk_index: int | None = None
-        self._speech_current_chunk_count: int | None = None
-        self._speech_current_mode: str | None = None
-        self._speech_jobs_queued = 0
+        self._speech_phase = "idle"
+        self._speech_current_job_id: str | None = None
         self._speech_jobs_completed = 0
         self._speech_jobs_failed = 0
-        self._speech_last_enqueued_at: dt.datetime | None = None
-        self._speech_last_completed_at: dt.datetime | None = None
         self._speech_last_error: str | None = None
-        self._current_job_started_at: dt.datetime | None = None
-        self._current_chunk_started_at: dt.datetime | None = None
-        self._current_phase_started_at: dt.datetime | None = None
-        self._speech_last_event_at: dt.datetime | None = None
         self._speech_last_event: str | None = None
-        self._recent_events: deque[dict[str, Any]] = deque(maxlen=DEFAULT_RECENT_EVENT_LIMIT)
-        self._speech_profile_count: int | None = None
-        self._speech_profile_last_error: str | None = None
-        self._last_effective_preroll_chunks: int | None = None
-        self._last_first_audio_latency_ms: int | None = None
-        self._last_first_chunk_ready_to_first_audio_ms: int | None = None
-        self._last_failure_reason: str | None = None
+        self._speech_last_event_at: str | None = None
+        self._last_loaded_at: dict[str, str | None] = {
+            VOICE_DESIGN_MODEL_KIND: None,
+            CLONE_MODEL_KIND: None,
+        }
+        self._last_used_at: dict[str, str | None] = {
+            VOICE_DESIGN_MODEL_KIND: None,
+            CLONE_MODEL_KIND: None,
+        }
+        self._last_model_error: dict[str, str | None] = {
+            VOICE_DESIGN_MODEL_KIND: None,
+            CLONE_MODEL_KIND: None,
+        }
 
     @classmethod
     def from_env(cls) -> TTSRuntime:
@@ -562,387 +106,170 @@ class TTSRuntime:
             voice_design_model_id=os.getenv(
                 "SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID",
                 DEFAULT_VOICE_DESIGN_MODEL_ID,
-            ),
+            ).strip()
+            or DEFAULT_VOICE_DESIGN_MODEL_ID,
             clone_model_id=os.getenv(
                 "SPEAK_TO_USER_CLONE_MODEL_ID",
                 DEFAULT_CLONE_MODEL_ID,
+            ).strip()
+            or DEFAULT_CLONE_MODEL_ID,
+            enable_voice_design_model=_env_bool(
+                "SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL",
+                default=True,
             ),
-            enable_voice_design_model=_normalize_enabled_flag(
-                os.getenv("SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL"),
-                env_var="SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL",
-                default=DEFAULT_ENABLE_VOICE_DESIGN_MODEL,
+            enable_clone_model=_env_bool(
+                "SPEAK_TO_USER_ENABLE_CLONE_MODEL",
+                default=True,
             ),
-            enable_clone_model=_normalize_enabled_flag(
-                os.getenv("SPEAK_TO_USER_ENABLE_CLONE_MODEL"),
-                env_var="SPEAK_TO_USER_ENABLE_CLONE_MODEL",
-                default=DEFAULT_ENABLE_CLONE_MODEL,
+            playback_backend=_env_playback_backend(
+                os.getenv("SPEAK_TO_USER_PLAYBACK_BACKEND", "sounddevice")
             ),
-            device_preference=_normalize_device(os.getenv("SPEAK_TO_USER_DEVICE")),
-            torch_dtype_name=_normalize_torch_dtype(os.getenv("SPEAK_TO_USER_TORCH_DTYPE")),
-            playback_preroll_seconds=_normalize_positive_float(
-                os.getenv("SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS"),
-                env_var="SPEAK_TO_USER_PLAYBACK_PREROLL_SECONDS",
-                default=DEFAULT_PLAYBACK_PREROLL_SECONDS,
+            state_dir=_env_state_dir(os.getenv("SPEAK_TO_USER_STATE_DIR")),
+            tts_chunk_max_chars=_env_positive_int(
+                "SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS",
+                default=160,
             ),
-            playback_preroll_chunks=_normalize_positive_int(
-                os.getenv("SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS"),
-                env_var="SPEAK_TO_USER_PLAYBACK_PREROLL_CHUNKS",
-                default=DEFAULT_PLAYBACK_PREROLL_CHUNKS,
-            ),
-            playback_waveform_queue_maxsize=_normalize_positive_int(
-                os.getenv("SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE"),
-                env_var="SPEAK_TO_USER_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE",
-                default=DEFAULT_PLAYBACK_WAVEFORM_QUEUE_MAXSIZE,
-            ),
-            playback_underflow_retries=_normalize_nonnegative_int(
-                os.getenv("SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES"),
-                env_var="SPEAK_TO_USER_PLAYBACK_UNDERFLOW_RETRIES",
-                default=DEFAULT_PLAYBACK_UNDERFLOW_RETRIES,
-            ),
-            playback_backend=_normalize_playback_backend(
-                os.getenv("SPEAK_TO_USER_PLAYBACK_BACKEND")
-            ),
-            wavbuffer_binary_path=_normalize_wavbuffer_binary_path(
-                os.getenv("SPEAK_TO_USER_WAVBUFFER_BINARY_PATH")
-            ),
-            wavbuffer_queue_depth=_normalize_positive_int(
-                os.getenv("SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH"),
-                env_var="SPEAK_TO_USER_WAVBUFFER_QUEUE_DEPTH",
-                default=DEFAULT_WAVBUFFER_QUEUE_DEPTH,
-            ),
-            wavbuffer_preroll_mode=_normalize_wavbuffer_preroll_mode(
-                os.getenv("SPEAK_TO_USER_WAVBUFFER_PREROLL_MODE")
-            ),
-            wavbuffer_input_protocol=_normalize_wavbuffer_input_protocol(
-                os.getenv("SPEAK_TO_USER_WAVBUFFER_INPUT_PROTOCOL")
-            ),
-            wavbuffer_starvation_timeout_seconds=_normalize_positive_float(
-                os.getenv("SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS"),
-                env_var="SPEAK_TO_USER_WAVBUFFER_STARVATION_TIMEOUT_SECONDS",
-                default=DEFAULT_WAVBUFFER_STARVATION_TIMEOUT_SECONDS,
-            ),
-            tts_chunk_max_chars=_normalize_positive_int(
-                os.getenv("SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS"),
-                env_var="SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS",
-                default=DEFAULT_TTS_CHUNK_MAX_CHARS,
-            ),
-            tts_max_new_tokens=_normalize_positive_int(
-                os.getenv("SPEAK_TO_USER_TTS_MAX_NEW_TOKENS"),
-                env_var="SPEAK_TO_USER_TTS_MAX_NEW_TOKENS",
-                default=DEFAULT_TTS_MAX_NEW_TOKENS,
-            ),
-            tts_max_chunk_synth_seconds=_normalize_positive_float(
-                os.getenv("SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS"),
-                env_var="SPEAK_TO_USER_TTS_MAX_CHUNK_SYNTH_SECONDS",
-                default=DEFAULT_TTS_MAX_CHUNK_SYNTH_SECONDS,
-            ),
-            tts_max_chunk_audio_seconds=_normalize_positive_float(
-                os.getenv("SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS"),
-                env_var="SPEAK_TO_USER_TTS_MAX_CHUNK_AUDIO_SECONDS",
-                default=DEFAULT_TTS_MAX_CHUNK_AUDIO_SECONDS,
-            ),
-            tts_chunk_regen_retries=_normalize_nonnegative_int(
-                os.getenv("SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES"),
-                env_var="SPEAK_TO_USER_TTS_CHUNK_REGEN_RETRIES",
-                default=DEFAULT_TTS_CHUNK_REGEN_RETRIES,
-            ),
-            tts_waveform_max_abs_sample=_normalize_positive_float(
-                os.getenv("SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE"),
-                env_var="SPEAK_TO_USER_TTS_WAVEFORM_MAX_ABS_SAMPLE",
-                default=DEFAULT_TTS_WAVEFORM_MAX_ABS_SAMPLE,
-            ),
-            tts_waveform_max_clipped_fraction=_normalize_positive_float(
-                os.getenv("SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION"),
-                env_var="SPEAK_TO_USER_TTS_WAVEFORM_MAX_CLIPPED_FRACTION",
-                default=DEFAULT_TTS_WAVEFORM_MAX_CLIPPED_FRACTION,
-            ),
-            output_stream_latency=_normalize_output_stream_latency(
-                os.getenv("SPEAK_TO_USER_OUTPUT_STREAM_LATENCY")
-            ),
-            log_level=_normalize_log_level(os.getenv("SPEAK_TO_USER_LOG_LEVEL")),
         )
 
-    async def preload(self, *, state_store: Any) -> dict[str, Any]:
-        self._emit_runtime_event("runtime_preload_started", level="minimal")
-        self.start_speech_worker()
+    # MARK: Lifecycle
 
-        startup_model_option = await self._load_startup_model_option(state_store=state_store)
-        startup_model_kinds = self._startup_model_kinds_for_option(startup_model_option)
-        for model_kind in startup_model_kinds:
+    async def preload(self, *, state_store: Any) -> None:
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.profiles_dir.mkdir(parents=True, exist_ok=True)
+        stored_option = await state_store.get(
+            STARTUP_MODEL_KEY,
+            collection=STARTUP_MODEL_COLLECTION,
+            default=self._default_startup_model_option(),
+        )
+        option = (
+            stored_option
+            if isinstance(stored_option, str)
+            else self._default_startup_model_option()
+        )
+        self._startup_model_option = option
+
+        for model_kind in self._model_kinds_for_option(option):
             self.load_model(model_kind=model_kind)
 
-        result = {
-            "result": "success",
-            "loaded": self._all_startup_models_loaded_locked(),
-            "loaded_model_kinds": startup_model_kinds,
-            "startup_model_option": startup_model_option,
-            **self.status(),
-        }
-        self._emit_runtime_event(
-            "runtime_preload_completed",
-            level="minimal",
-            startup_model_option=startup_model_option,
-            startup_model_kinds=startup_model_kinds,
-        )
-        return result
-
-    def start_speech_worker(self) -> bool:
-        with self._lock:
-            if self._shutdown_requested.is_set():
-                return False
-            if self._speech_worker_started:
-                return False
-
-            self._speech_worker_thread = threading.Thread(
-                target=self._speech_worker_loop,
-                name="speak-to-user-speech-worker",
-                daemon=True,
-            )
-            self._speech_worker_started = True
-            self._speech_worker_thread.start()
-            self._emit_runtime_event("speech_worker_started", level="minimal")
-            return True
-
     def shutdown(self) -> None:
-        with self._lock:
-            self._shutdown_requested.set()
-            worker_thread = self._speech_worker_thread
+        with self._model_lock:
+            self._models.clear()
 
-        if worker_thread is not None:
-            while True:
-                try:
-                    self._speech_queue.put_nowait(None)
-                    break
-                except queue.Full:
-                    if not worker_thread.is_alive():
-                        break
-                    worker_thread.join(timeout=0.05)
-            worker_thread.join(timeout=1)
-
-        with self._lock:
-            for model_kind in list(self._model_slots):
-                self._unload_model_locked(model_kind)
-        self._emit_runtime_event("runtime_shutdown_completed", level="minimal")
-
-    def status(self) -> dict[str, Any]:
-        with self._lock:
-            return self._status_payload_locked()
+    # MARK: Model Management
 
     def available_model_ids(self) -> list[str]:
-        return [self.voice_design_model_id, self.clone_model_id]
-
-    def available_startup_model_options(self) -> list[str]:
-        return [
-            STARTUP_MODEL_OPTION_NONE,
-            STARTUP_MODEL_OPTION_ALL,
-            *self.available_model_ids(),
-        ]
+        model_ids: list[str] = []
+        if self.enable_voice_design_model:
+            model_ids.append(self.voice_design_model_id)
+        if self.enable_clone_model:
+            model_ids.append(self.clone_model_id)
+        return model_ids
 
     def model_kind_for_id(self, model_id: str) -> str:
-        normalized_model_id = model_id.strip()
-        if normalized_model_id == self.voice_design_model_id:
+        if model_id == self.voice_design_model_id:
             return VOICE_DESIGN_MODEL_KIND
-        if normalized_model_id == self.clone_model_id:
+        if model_id == self.clone_model_id:
             return CLONE_MODEL_KIND
         raise ValueError(
-            "model_id must be one of: "
-            f"{', '.join(self.available_model_ids())}"
+            "Unknown model id "
+            f"`{model_id}`. Expected one of: {', '.join(self.available_model_ids())}"
         )
 
     def missing_required_model_ids(self, *, model_kinds: list[str]) -> list[str]:
-        with self._lock:
-            return [
-                cast(str, self._model_state(model_kind)["model_id"])
-                for model_kind in model_kinds
-                if self._model_state(model_kind)["model"] is None
-            ]
+        missing: list[str] = []
+        for model_kind in model_kinds:
+            if not self._is_model_loaded(model_kind):
+                missing.append(self._model_id_for_kind(model_kind))
+        return missing
 
     def required_models_not_loaded_message(self, *, model_kinds: list[str]) -> str:
-        missing_model_ids = self.missing_required_model_ids(model_kinds=model_kinds)
-        if not missing_model_ids:
-            return ""
-        if len(missing_model_ids) == 1:
-            return (
-                f"required model `{missing_model_ids[0]}` is not loaded; "
-                "call load_model with that model_id and then retry"
-            )
-        joined_model_ids = ", ".join(f"`{model_id}`" for model_id in missing_model_ids)
-        return (
-            f"required models {joined_model_ids} are not loaded; "
-            "call load_model for each required model_id and then retry"
-        )
+        missing = self.missing_required_model_ids(model_kinds=model_kinds)
+        return "Required TTS models are not loaded yet: " + ", ".join(missing)
 
-    def load_model(self, *, model_kind: str = VOICE_DESIGN_MODEL_KIND) -> dict[str, Any]:
-        if not _runtime_dependencies_ready():
-            dependency_status = _runtime_dependency_status()
-            missing = [
-                name.removesuffix("_available")
-                for name, available in dependency_status.items()
-                if not available and name
-            ]
-            message = f"runtime dependencies are unavailable: {', '.join(sorted(missing))}"
-            with self._lock:
-                self._last_error = message
-                self._model_state(model_kind)["last_error"] = message
-            self._emit_runtime_event(
-                "model_load_failed",
-                level="minimal",
-                model_kind=model_kind,
-                error=message,
-            )
-            raise RuntimeError(message)
-
-        with self._lock:
-            slot = self._model_state(model_kind)
-            if self._shutdown_requested.is_set():
-                raise RuntimeError("runtime is shutting down")
-            if slot["model"] is not None:
-                self._touch_model_locked(model_kind)
-                self._emit_runtime_event(
-                    "model_load_skipped_already_loaded",
-                    level="debug",
-                    model_kind=model_kind,
-                    device=slot["resolved_device"],
-                )
+    def load_model(self, *, model_kind: str) -> dict[str, object]:
+        self._require_enabled_model_kind(model_kind)
+        with self._model_lock:
+            if model_kind in self._models:
                 return {
                     "result": "success",
                     "loaded": True,
-                    "info": f"{model_kind} model already loaded",
-                    **self._status_payload_locked(),
+                    "model_id": self._model_id_for_kind(model_kind),
+                    **self.status(),
                 }
 
-        try:
-            loaded_model = self._load_model_impl(model_kind)
-        except Exception as exc:
-            with self._lock:
-                self._last_error = str(exc)
-                self._model_state(model_kind)["last_error"] = str(exc)
-            self._emit_runtime_event(
-                "model_load_failed",
-                level="minimal",
-                model_kind=model_kind,
-                error=str(exc),
-            )
-            raise
-
-        with self._lock:
-            slot = self._model_state(model_kind)
-            if self._shutdown_requested.is_set():
-                self._release_model_resources(
-                    loaded_model,
-                    resolved_device=slot["resolved_device"],
+            try:
+                self._models[model_kind] = self._load_model_impl(model_kind)
+            except Exception as exc:
+                message = (
+                    f"Failed to load `{self._model_id_for_kind(model_kind)}` with mlx-audio. "
+                    "The most likely causes are a missing `mlx-audio` install, "
+                    "an invalid model id, "
+                    f"or insufficient unified memory. Original error: {exc}"
                 )
-                slot["resolved_device"] = None
-                return {
-                    "result": "success",
-                    "loaded": False,
-                    "info": f"{model_kind} model load aborted during shutdown",
-                    **self._status_payload_locked(),
-                }
+                self._last_model_error[model_kind] = message
+                raise RuntimeError(message) from exc
 
-            slot["model"] = loaded_model
-            slot["last_error"] = None
-            slot["last_loaded_at"] = _utc_now()
-            self._touch_model_locked(model_kind, slot["last_loaded_at"])
-            self._last_error = None
-            self._emit_runtime_event(
-                "model_load_completed",
-                level="minimal",
-                model_kind=model_kind,
-                device=slot["resolved_device"],
-                cpu_fallback_active=slot["cpu_fallback_active"],
-            )
+            self._last_loaded_at[model_kind] = _utc_now()
+            self._last_model_error[model_kind] = None
+            self._record_event("model_loaded", model_kind=model_kind)
             return {
                 "result": "success",
                 "loaded": True,
-                "info": f"{model_kind} model loaded",
-                **self._status_payload_locked(),
+                "model_id": self._model_id_for_kind(model_kind),
+                **self.status(),
             }
 
-    def unload_model(self, *, model_kind: str = VOICE_DESIGN_MODEL_KIND) -> dict[str, Any]:
-        with self._lock:
-            slot = self._model_state(model_kind)
-            if self._speech_current_mode == model_kind:
-                raise RuntimeError(
-                    f"{model_kind} model is busy with an active speech job and cannot be unloaded"
-                )
-            if self._queued_jobs_by_mode[model_kind] > 0:
-                raise RuntimeError(
-                    f"{model_kind} model has queued speech jobs and cannot be unloaded"
-                )
-            if slot["model"] is None:
-                self._emit_runtime_event(
-                    "model_unload_skipped_already_unloaded",
-                    level="debug",
-                    model_kind=model_kind,
-                )
-                return {
-                    "result": "success",
-                    "unloaded": False,
-                    "info": f"{model_kind} model already unloaded",
-                    **self._status_payload_locked(),
-                }
-
-            model = slot["model"]
-            resolved_device = slot["resolved_device"]
-            slot["model"] = None
-            slot["resolved_device"] = None
-            slot["last_error"] = None
-            slot["cpu_fallback_active"] = False
-            self._last_error = None
-
-        self._release_model_resources(model, resolved_device=resolved_device)
-        gc.collect()
-        self._emit_runtime_event(
-            "model_unload_completed",
-            level="minimal",
-            model_kind=model_kind,
-        )
+    def unload_model(self, *, model_kind: str) -> dict[str, object]:
+        with self._model_lock:
+            self._models.pop(model_kind, None)
+        self._record_event("model_unloaded", model_kind=model_kind)
         return {
             "result": "success",
             "unloaded": True,
-            "info": f"{model_kind} model unloaded",
+            "model_id": self._model_id_for_kind(model_kind),
             **self.status(),
         }
 
-    async def set_startup_model(self, *, state_store: Any, option: str) -> dict[str, Any]:
-        normalized_option = self._normalize_startup_model_option(option)
+    async def set_startup_model(self, *, state_store: Any, option: str) -> dict[str, object]:
+        normalized_option = option.strip()
+        if normalized_option not in self.startup_model_options():
+            raise ValueError(
+                "Invalid startup model option. Expected one of: "
+                f"{', '.join(self.startup_model_options())}"
+            )
         await state_store.put(
-            key=STARTUP_MODEL_OPTION_KEY,
-            collection=RUNTIME_CONFIGURATION_COLLECTION,
-            value=StateValue(value=normalized_option),
+            STARTUP_MODEL_KEY,
+            normalized_option,
+            collection=STARTUP_MODEL_COLLECTION,
         )
-        with self._lock:
-            self._set_startup_model_option_locked(normalized_option)
-            status_payload = self._status_payload_locked()
-        self._emit_runtime_event(
-            "startup_model_option_saved",
-            level="minimal",
-            startup_model_option=normalized_option,
-            startup_model_kinds=self._startup_model_kinds_for_option(normalized_option),
-        )
+        self._startup_model_option = normalized_option
+        self._record_event("startup_model_option_changed", option=normalized_option)
         return {
             "result": "success",
             "startup_model_option": normalized_option,
-            **status_payload,
+            **self.status(),
         }
+
+    def startup_model_options(self) -> list[str]:
+        return ["none", "all", *self.available_model_ids()]
+
+    # MARK: Speech
 
     def speak_text(
         self,
         *,
         chunks: list[str],
         voice_description: str,
-        language: str = "en",
-    ) -> dict[str, Any]:
-        normalized_description = voice_description.strip()
-        if not normalized_description:
+        language: str,
+    ) -> dict[str, object]:
+        if not voice_description.strip():
             raise ValueError("voice_description must not be empty")
-
-        return self._enqueue_speech_job(
-            mode=VOICE_DESIGN_MODEL_KIND,
-            chunks=self._normalize_chunks(chunks),
-            language=_normalize_language(language),
-            voice_description=normalized_description,
+        return self._run_speech_job(
+            mode="voice_design",
+            model_kind=VOICE_DESIGN_MODEL_KIND,
+            chunks=chunks,
+            language=language,
+            instruct=voice_description.strip(),
         )
 
     def speak_text_as_clone(
@@ -950,33 +277,18 @@ class TTSRuntime:
         *,
         chunks: list[str],
         reference_audio_path: str,
-        reference_text: str | None = None,
-        language: str = "en",
-    ) -> dict[str, Any]:
-        normalized_reference_audio_path = reference_audio_path.strip()
-        if not normalized_reference_audio_path:
-            raise ValueError("reference_audio_path must not be empty")
-
-        normalized_reference_text = reference_text.strip() if reference_text is not None else None
-        if normalized_reference_text == "":
-            normalized_reference_text = None
-
-        reference_audio = self._decode_reference_audio_file(normalized_reference_audio_path)
-        result = self._enqueue_speech_job(
-            mode=CLONE_MODEL_KIND,
-            chunks=self._normalize_chunks(chunks),
-            language=_normalize_language(language),
-            reference_audio=reference_audio,
-            reference_audio_path=normalized_reference_audio_path,
-            reference_text=normalized_reference_text,
+        reference_text: str | None,
+        language: str,
+    ) -> dict[str, object]:
+        reference_path = self._validated_reference_audio_path(reference_audio_path)
+        return self._run_speech_job(
+            mode="clone",
+            model_kind=CLONE_MODEL_KIND,
+            chunks=chunks,
+            language=language,
+            ref_audio=str(reference_path),
+            ref_text=reference_text.strip() if reference_text else None,
         )
-        result["clone_mode"] = (
-            "reference_text" if normalized_reference_text is not None else "x_vector_only"
-        )
-        result["reference_audio_path"] = normalized_reference_audio_path
-        result["reference_text_included"] = normalized_reference_text is not None
-        result["clone_model_id"] = self.clone_model_id
-        return result
 
     async def generate_speech_profile(
         self,
@@ -984,29 +296,33 @@ class TTSRuntime:
         state_store: Any,
         name: str,
         reference_audio_path: str,
-        reference_text: str | None = None,
-    ) -> dict[str, Any]:
-        normalized_name = self._normalize_profile_name(name)
-        normalized_reference_text = reference_text.strip() if reference_text is not None else None
-        if normalized_reference_text == "":
-            normalized_reference_text = None
+        reference_text: str | None,
+    ) -> dict[str, object]:
+        profile_name = _normalize_profile_name(name)
+        existing = await self._get_profile(state_store, profile_name)
+        if existing is not None:
+            raise ValueError(f"Speech profile `{profile_name}` already exists")
 
-        existing_profile = await self._load_speech_profile(
-            state_store=state_store,
-            name=normalized_name,
-        )
-        if existing_profile is not None:
-            message = f"speech profile `{normalized_name}` already exists"
-            self._speech_profile_last_error = message
-            raise RuntimeError(message)
+        source_path = self._validated_reference_audio_path(reference_audio_path)
+        self.profiles_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = self.profiles_dir / f"{profile_name}{source_path.suffix.lower() or '.wav'}"
+        shutil.copy2(source_path, stored_path)
 
-        reference_audio = self._decode_reference_audio_file(reference_audio_path)
-        return await self._create_and_store_speech_profile(
-            state_store=state_store,
-            name=normalized_name,
-            reference_audio=reference_audio,
-            reference_text=normalized_reference_text,
+        profile = SpeechProfile(
+            name=profile_name,
+            model_id=self.clone_model_id,
+            reference_audio_path=str(stored_path),
+            reference_text=reference_text.strip() if reference_text else None,
+            language="en",
+            source_kind="reference_audio",
+            created_at=_utc_now(),
         )
+        await self._put_profile(state_store, profile)
+        self._record_event("speech_profile_created", name=profile_name)
+        return {
+            "result": "success",
+            "profile": asdict(profile),
+        }
 
     async def generate_speech_profile_from_voice_design(
         self,
@@ -1015,3042 +331,440 @@ class TTSRuntime:
         name: str,
         text: str,
         voice_description: str,
-        language: str = "en",
-    ) -> dict[str, Any]:
-        normalized_name = self._normalize_profile_name(name)
-        normalized_text = text.strip()
-        if not normalized_text:
-            raise ValueError("text must not be empty")
-        if len(normalized_text) > VOICE_DESIGN_PROFILE_SEED_MAX_CHARS:
-            raise ValueError(
-                "text must be 240 characters or fewer for voice-designed profile seeds"
-            )
-        normalized_voice_description = voice_description.strip()
-        if not normalized_voice_description:
-            raise ValueError("voice_description must not be empty")
-        normalized_language = _normalize_language(language)
+        language: str,
+    ) -> dict[str, object]:
+        profile_name = _normalize_profile_name(name)
+        existing = await self._get_profile(state_store, profile_name)
+        if existing is not None:
+            raise ValueError(f"Speech profile `{profile_name}` already exists")
 
-        existing_profile = await self._load_speech_profile(
-            state_store=state_store,
-            name=normalized_name,
+        waveform, sample_rate = self._synthesize_chunks(
+            model_kind=VOICE_DESIGN_MODEL_KIND,
+            chunks=[text.strip()],
+            language=language,
+            instruct=voice_description.strip(),
         )
-        if existing_profile is not None:
-            message = f"speech profile `{normalized_name}` already exists"
-            self._speech_profile_last_error = message
-            raise RuntimeError(message)
 
-        self._emit_runtime_event(
-            "voice_designed_speech_profile_generation_started",
-            level="minimal",
-            profile_name=normalized_name,
-            language=normalized_language,
-        )
-        reference_audio = self._synthesize_voice_design_reference_audio(
-            chunks=[normalized_text],
-            voice_description=normalized_voice_description,
-            language=normalized_language,
-        )
-        temp_reference_audio_path = self._write_temp_reference_audio_file(
-            waveform=reference_audio[0],
-            sample_rate=reference_audio[1],
-        )
-        self._emit_runtime_event(
-            "voice_designed_speech_profile_temp_wav_written",
-            level="minimal",
-            profile_name=normalized_name,
-            temp_reference_audio_path=temp_reference_audio_path,
-        )
-        try:
-            result = await self._create_and_store_speech_profile(
-                state_store=state_store,
-                name=normalized_name,
-                reference_audio=self._decode_reference_audio_file(temp_reference_audio_path),
-                reference_text=normalized_text,
-                profile_source="voice_design",
-                seed_text=normalized_text,
-                voice_description=normalized_voice_description,
-            )
-        finally:
-            Path(temp_reference_audio_path).unlink(missing_ok=True)
-            self._emit_runtime_event(
-                "voice_designed_speech_profile_temp_wav_deleted",
-                level="minimal",
-                profile_name=normalized_name,
-                temp_reference_audio_path=temp_reference_audio_path,
-            )
+        self.profiles_dir.mkdir(parents=True, exist_ok=True)
+        stored_path = self.profiles_dir / f"{profile_name}.wav"
+        sf.write(stored_path, waveform, sample_rate)
 
-        result["profile_source"] = "voice_design"
-        result["seed_text_stored"] = True
-        result["voice_description_stored"] = True
-        return result
-
-    async def list_speech_profiles(self, *, state_store: Any) -> dict[str, Any]:
-        names = await self._load_speech_profile_names(state_store)
-        profiles: list[dict[str, Any]] = []
-        for name in names:
-            profile = await self._load_speech_profile(state_store=state_store, name=name)
-            if profile is None:
-                continue
-            profiles.append(self._speech_profile_metadata(profile))
-
-        self._speech_profile_count = len(profiles)
-        self._speech_profile_last_error = None
+        profile = SpeechProfile(
+            name=profile_name,
+            model_id=self.clone_model_id,
+            reference_audio_path=str(stored_path),
+            reference_text=text.strip(),
+            language=language,
+            source_kind="voice_design_seed",
+            created_at=_utc_now(),
+            seed_text=text.strip(),
+            voice_description=voice_description.strip(),
+        )
+        await self._put_profile(state_store, profile)
+        self._record_event("speech_profile_created_from_voice_design", name=profile_name)
         return {
             "result": "success",
-            "profiles": profiles,
+            "profile": asdict(profile),
+        }
+
+    async def list_speech_profiles(self, *, state_store: Any) -> dict[str, object]:
+        profiles = await self._list_profiles(state_store)
+        return {
+            "result": "success",
+            "profiles": [asdict(profile) for profile in profiles],
             "profile_count": len(profiles),
         }
 
-    async def delete_speech_profile(self, *, state_store: Any, name: str) -> dict[str, Any]:
-        normalized_name = self._normalize_profile_name(name)
-        existing_profile = await self._load_speech_profile(
-            state_store=state_store,
-            name=normalized_name,
-        )
-        if existing_profile is None:
-            message = f"speech profile `{normalized_name}` does not exist"
-            self._speech_profile_last_error = message
-            raise RuntimeError(message)
+    async def delete_speech_profile(self, *, state_store: Any, name: str) -> dict[str, object]:
+        profile_name = _normalize_profile_name(name)
+        profile = await self._get_profile(state_store, profile_name)
+        if profile is None:
+            raise ValueError(f"Speech profile `{profile_name}` does not exist")
 
-        await state_store.delete(
-            key=self._speech_profile_key(normalized_name),
-            collection=SPEECH_PROFILE_COLLECTION,
-        )
-        names = [
-            candidate
-            for candidate in await self._load_speech_profile_names(state_store)
-            if candidate != normalized_name
-        ]
-        await self._save_speech_profile_names(state_store, names)
-        self._speech_profile_count = len(names)
-        self._speech_profile_last_error = None
-        self._emit_runtime_event(
-            "speech_profile_deleted",
-            level="minimal",
-            profile_name=normalized_name,
-        )
+        await state_store.delete(profile_name, collection=PROFILE_COLLECTION)
+        profile_path = Path(profile.reference_audio_path)
+        if profile_path.exists():
+            profile_path.unlink()
+        self._record_event("speech_profile_deleted", name=profile_name)
         return {
             "result": "success",
             "deleted": True,
-            "name": normalized_name,
-            "profile_count": len(names),
+            "name": profile_name,
         }
 
-    async def speak_with_profile(
-        self,
-        *,
-        state_store: Any,
-        chunks: list[str],
-        name: str,
-        language: str = "en",
-    ) -> dict[str, Any]:
-        normalized_name = self._normalize_profile_name(name)
-        profile = await self._load_speech_profile(
-            state_store=state_store,
-            name=normalized_name,
-        )
+    async def resolve_profile(self, *, state_store: Any, name: str) -> SpeechProfile:
+        profile_name = _normalize_profile_name(name)
+        profile = await self._get_profile(state_store, profile_name)
         if profile is None:
-            message = f"speech profile `{normalized_name}` does not exist"
-            self._speech_profile_last_error = message
-            raise RuntimeError(message)
-        if profile.clone_model_id != self.clone_model_id:
-            message = (
-                f"speech profile `{normalized_name}` is bound to clone model "
-                f"`{profile.clone_model_id}`, but the active clone model is `{self.clone_model_id}`"
-            )
-            self._speech_profile_last_error = message
-            raise RuntimeError(message)
-
-        prompt_items = self._deserialize_voice_clone_prompt_items(profile.prompt_items)
-        result = self._enqueue_speech_job(
-            mode=CLONE_MODEL_KIND,
-            chunks=self._normalize_chunks(chunks),
-            language=_normalize_language(language),
-            voice_clone_prompt_items=prompt_items,
-            profile_name=normalized_name,
-        )
-        result["profile_name"] = normalized_name
-        result["clone_mode"] = profile.clone_mode
-        result["clone_model_id"] = profile.clone_model_id
-        self._speech_profile_last_error = None
-        self._emit_runtime_event(
-            "speech_profile_enqueued",
-            level="minimal",
-            profile_name=normalized_name,
-            clone_model_id=profile.clone_model_id,
-            clone_mode=profile.clone_mode,
-        )
-        return result
-
-    def play_speech_chunks(
-        self,
-        *,
-        mode: str,
-        chunks: list[str],
-        language: str = "en",
-        voice_description: str | None = None,
-        reference_audio: tuple[np.ndarray, int] | None = None,
-        reference_text: str | None = None,
-        voice_clone_prompt_items: list[Any] | None = None,
-    ) -> dict[str, Any]:
-        if not chunks:
-            raise ValueError("chunks must not be empty")
-
-        normalized_chunks = self._normalize_chunks(chunks)
-        normalized_language = _normalize_language(language)
-        if mode == VOICE_DESIGN_MODEL_KIND:
-            normalized_description = (voice_description or "").strip()
-            if not normalized_description:
-                raise ValueError("voice_description must not be empty")
-        else:
-            normalized_description = None
-            if reference_audio is None and voice_clone_prompt_items is None:
-                raise ValueError(
-                    "reference_audio or voice_clone_prompt_items must be provided "
-                    "for clone playback"
-                )
-        job_started_at = self._current_job_started_at or _utc_now()
-        total_chunk_char_count = sum(len(chunk) for chunk in normalized_chunks)
-        effective_preroll_chunks = self._effective_preroll_chunk_target(
-            len(normalized_chunks)
-        )
-        job_metrics = self._new_job_metrics(
-            mode=mode,
-            normalized_chunks=normalized_chunks,
-            effective_preroll_chunks=effective_preroll_chunks,
-            total_chunk_char_count=total_chunk_char_count,
-            job_started_at=job_started_at,
-        )
-        (
-            waveform_queue,
-            queue_sentinel,
-            producer_error,
-            synthesis_done,
-            producer_thread,
-        ) = self._start_waveform_producer(
-            mode=mode,
-            normalized_chunks=normalized_chunks,
-            normalized_language=normalized_language,
-            normalized_description=normalized_description,
-            reference_audio=reference_audio,
-            reference_text=reference_text,
-            voice_clone_prompt_items=voice_clone_prompt_items,
-            effective_preroll_chunks=effective_preroll_chunks,
-            job_metrics=job_metrics,
-        )
-
-        try:
-            if self.playback_backend == "wavbuffer":
-                result = self._play_speech_chunks_with_wavbuffer(
-                    mode=mode,
-                    normalized_chunks=normalized_chunks,
-                    normalized_language=normalized_language,
-                    waveform_queue=waveform_queue,
-                    queue_sentinel=queue_sentinel,
-                    producer_error=producer_error,
-                    effective_preroll_chunks=effective_preroll_chunks,
-                    job_metrics=job_metrics,
-                )
-            elif self.playback_backend == "null":
-                result = self._play_speech_chunks_with_null(
-                    mode=mode,
-                    normalized_chunks=normalized_chunks,
-                    normalized_language=normalized_language,
-                    waveform_queue=waveform_queue,
-                    queue_sentinel=queue_sentinel,
-                    producer_error=producer_error,
-                )
-            else:
-                result = self._play_speech_chunks_with_sounddevice(
-                    mode=mode,
-                    normalized_chunks=normalized_chunks,
-                    normalized_language=normalized_language,
-                    waveform_queue=waveform_queue,
-                    queue_sentinel=queue_sentinel,
-                    producer_error=producer_error,
-                    synthesis_done=synthesis_done,
-                    effective_preroll_chunks=effective_preroll_chunks,
-                    job_metrics=job_metrics,
-                )
-        except Exception as exc:
-            job_metrics["failure_reason"] = str(exc)
-            self._record_job_metrics(job_metrics)
-            self._emit_job_metrics_summary(job_metrics=job_metrics)
-            raise
-        finally:
-            producer_thread.join(timeout=1)
-
-        self._record_job_metrics(job_metrics)
-        self._emit_job_metrics_summary(job_metrics=job_metrics)
-        return result
-
-    def _start_waveform_producer(
-        self,
-        *,
-        mode: str,
-        normalized_chunks: list[str],
-        normalized_language: str,
-        normalized_description: str | None,
-        reference_audio: tuple[np.ndarray, int] | None,
-        reference_text: str | None,
-        voice_clone_prompt_items: list[Any] | None,
-        effective_preroll_chunks: int,
-        job_metrics: dict[str, Any],
-    ) -> tuple[
-        queue.Queue[dict[str, Any] | object],
-        object,
-        list[BaseException],
-        threading.Event,
-        threading.Thread,
-    ]:
-        producer_error: list[BaseException] = []
-        synthesis_done = threading.Event()
-        waveform_queue: queue.Queue[dict[str, Any] | object] = queue.Queue(
-            maxsize=self.playback_waveform_queue_maxsize
-        )
-        queue_sentinel = object()
-
-        def synthesize_into_queue() -> None:
-            current_chunk_index: int | None = None
-            previous_chunk_audio_ms: int | None = None
-            previous_chunk_ready_at: dt.datetime | None = None
-            try:
-                for chunk_index, text_chunk in enumerate(normalized_chunks, start=1):
-                    current_chunk_index = chunk_index
-                    self._emit_runtime_event(
-                        "speech_chunk_synthesis_started",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        chunk_char_count=len(text_chunk),
-                    )
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_chunk_synthesis_started",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                    )
-                    chunk_result: dict[str, Any] | None = None
-                    max_attempts = self.tts_chunk_regen_retries + 1
-                    for attempt in range(1, max_attempts + 1):
-                        try:
-                            chunk_result = self._synthesize_audio_chunk(
-                                mode=mode,
-                                text=text_chunk,
-                                voice_description=normalized_description,
-                                language=normalized_language,
-                                reference_audio=reference_audio,
-                                reference_text=reference_text,
-                                voice_clone_prompt_items=voice_clone_prompt_items,
-                            )
-                            break
-                        except BaseException as exc:
-                            self._emit_runtime_event(
-                                "speech_chunk_regeneration_attempt_failed",
-                                level="minimal",
-                                job_id=self._speech_current_job_id,
-                                mode=mode,
-                                chunk_index=chunk_index,
-                                chunk_count=len(normalized_chunks),
-                                attempt=attempt,
-                                max_attempts=max_attempts,
-                                error=str(exc),
-                            )
-                            if attempt >= max_attempts:
-                                raise RuntimeError(
-                                    "chunk generation failed after "
-                                    f"{max_attempts} attempt(s): {exc}"
-                                ) from exc
-                            self._emit_runtime_event(
-                                "speech_chunk_regeneration_retrying",
-                                level="minimal",
-                                job_id=self._speech_current_job_id,
-                                mode=mode,
-                                chunk_index=chunk_index,
-                                chunk_count=len(normalized_chunks),
-                                next_attempt=attempt + 1,
-                                max_attempts=max_attempts,
-                            )
-                    assert chunk_result is not None
-                    waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
-                    chunk_sample_rate = int(chunk_result["sample_rate"])
-                    chunk_sample_count = int(
-                        cast(int, chunk_result.get("sample_count", int(waveform.shape[0])))
-                    )
-                    chunk_audio_duration_seconds = float(
-                        cast(
-                            float,
-                            chunk_result.get(
-                                "audio_duration_seconds",
-                                round(chunk_sample_count / chunk_sample_rate, 3),
-                            ),
-                        )
-                    )
-                    chunk_synth_duration_ms = int(
-                        cast(int, chunk_result.get("synth_duration_ms", 0))
-                    )
-                    chunk_ready_at = _utc_now()
-                    chunk_audio_ms = int(round(chunk_audio_duration_seconds * 1000))
-                    synth_to_audio_ratio = (
-                        round(chunk_synth_duration_ms / chunk_audio_ms, 3)
-                        if chunk_audio_ms > 0
-                        else None
-                    )
-                    real_time_margin_ms = (
-                        previous_chunk_audio_ms - chunk_synth_duration_ms
-                        if previous_chunk_audio_ms is not None
-                        else None
-                    )
-                    chunk_ready_gap_ms = _duration_ms(previous_chunk_ready_at, chunk_ready_at)
-                    self._update_job_metrics_for_chunk(
-                        job_metrics=job_metrics,
-                        chunk_index=chunk_index,
-                        synth_duration_ms=chunk_synth_duration_ms,
-                        audio_duration_seconds=chunk_audio_duration_seconds,
-                        synth_to_audio_ratio=synth_to_audio_ratio,
-                        real_time_margin_ms=real_time_margin_ms,
-                        chunk_ready_at=chunk_ready_at,
-                    )
-                    self._emit_runtime_event(
-                        "speech_chunk_synthesis_completed",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        synth_duration_ms=chunk_synth_duration_ms,
-                        sample_count=chunk_sample_count,
-                        audio_duration_seconds=chunk_audio_duration_seconds,
-                    )
-                    self._emit_runtime_event(
-                        "speech_chunk_ready_for_playback",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        chunk_char_count=len(text_chunk),
-                        sample_count=chunk_sample_count,
-                        synth_duration_ms=chunk_synth_duration_ms,
-                        audio_duration_seconds=chunk_audio_duration_seconds,
-                        chunk_ready_at=chunk_ready_at.isoformat(),
-                        chunk_ready_gap_ms=chunk_ready_gap_ms,
-                        synth_to_audio_ratio=synth_to_audio_ratio,
-                        real_time_margin_ms=real_time_margin_ms,
-                        configured_preroll_chunks=self.playback_preroll_chunks,
-                        effective_preroll_chunks=effective_preroll_chunks,
-                        ready_satisfies_effective_preroll=chunk_index >= effective_preroll_chunks,
-                    )
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_chunk_synthesis_completed",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        chunk_index=chunk_index,
-                        chunk_count=len(normalized_chunks),
-                    )
-                    waveform_queue.put(
-                        {
-                            "waveform": waveform,
-                            "sample_rate": int(chunk_result["sample_rate"]),
-                            "model_id": str(chunk_result["model_id"]),
-                            "device": str(chunk_result["device"]),
-                            "language": str(chunk_result["language"]),
-                            "chunk_index": chunk_index,
-                            "chunk_count": len(normalized_chunks),
-                            "chunk_char_count": len(text_chunk),
-                            "sample_count": chunk_sample_count,
-                            "synth_duration_ms": chunk_synth_duration_ms,
-                            "audio_duration_seconds": chunk_audio_duration_seconds,
-                            "chunk_ready_at": chunk_ready_at,
-                            "synth_to_audio_ratio": synth_to_audio_ratio,
-                            "real_time_margin_ms": real_time_margin_ms,
-                            "chunk_ready_gap_ms": chunk_ready_gap_ms,
-                        }
-                    )
-                    previous_chunk_audio_ms = chunk_audio_ms
-                    previous_chunk_ready_at = chunk_ready_at
-            except BaseException as exc:
-                producer_error.append(exc)
-                if current_chunk_index is not None:
-                    job_metrics["failed_chunk_index"] = current_chunk_index
-                job_metrics["failure_reason"] = str(exc)
-                self._emit_runtime_event(
-                    "speech_chunk_producer_failed",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    error=str(exc),
-                )
-            finally:
-                synthesis_done.set()
-                waveform_queue.put(queue_sentinel)
-
-        producer_thread = threading.Thread(
-            target=synthesize_into_queue,
-            name="speak-to-user-waveform-producer",
-            daemon=True,
-        )
-        producer_thread.start()
-        return waveform_queue, queue_sentinel, producer_error, synthesis_done, producer_thread
-
-    def _effective_preroll_chunk_target(self, total_chunk_count: int) -> int:
-        if total_chunk_count <= 0:
-            raise ValueError("total_chunk_count must be greater than zero")
-        if total_chunk_count <= 2:
-            return 1
-        return min(self.playback_preroll_chunks, 2, total_chunk_count)
-
-    def _playback_start_chunk_target(self, total_chunk_count: int) -> int:
-        if total_chunk_count <= 0:
-            raise ValueError("total_chunk_count must be greater than zero")
-        if total_chunk_count <= 1:
-            return 1
-        if total_chunk_count <= 3:
-            return total_chunk_count
-        return min(4, total_chunk_count)
-
-    def _required_start_buffer_seconds(
-        self,
-        *,
-        job_metrics: dict[str, Any],
-        total_chunk_count: int,
-    ) -> float:
-        min_real_time_margin_ms = cast(int | None, job_metrics["min_real_time_margin_ms"])
-        deficit_seconds = 0.0
-        if min_real_time_margin_ms is not None and min_real_time_margin_ms < 0:
-            deficit_seconds = abs(min_real_time_margin_ms) / 1000
-        deficit_requirement = round(
-            (deficit_seconds * 1.5) + PLAYBACK_START_SAFETY_CUSHION_SECONDS,
-            3,
-        )
-
-        if total_chunk_count <= 1:
-            return 0.0
-        if total_chunk_count <= 3:
-            return 0.0
-        return max(18.0, deficit_requirement)
-
-    def _evaluate_playback_start_admission(
-        self,
-        *,
-        job_metrics: dict[str, Any],
-        total_chunk_count: int,
-        buffered_chunk_count: int,
-        buffered_audio_seconds: float,
-        synthesis_done: bool,
-    ) -> dict[str, Any]:
-        required_chunk_count = self._playback_start_chunk_target(total_chunk_count)
-        required_buffered_audio_seconds = self._required_start_buffer_seconds(
-            job_metrics=job_metrics,
-            total_chunk_count=total_chunk_count,
-        )
-        max_synth_to_audio_ratio = cast(float | None, job_metrics["max_synth_to_audio_ratio"])
-        min_real_time_margin_ms = cast(int | None, job_metrics["min_real_time_margin_ms"])
-
-        if buffered_chunk_count <= 0:
-            return {
-                "admit": False,
-                "reason": "no_buffered_audio",
-                "defer_reason": "no_buffered_audio",
-                "required_chunk_count": required_chunk_count,
-                "required_buffered_audio_seconds": required_buffered_audio_seconds,
-                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
-                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
-                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
-            }
-
-        if synthesis_done and buffered_chunk_count >= total_chunk_count:
-            return {
-                "admit": True,
-                "reason": "all_chunks_buffered",
-                "defer_reason": None,
-                "required_chunk_count": required_chunk_count,
-                "required_buffered_audio_seconds": required_buffered_audio_seconds,
-                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
-                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
-                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
-            }
-
-        if buffered_chunk_count < required_chunk_count:
-            return {
-                "admit": False,
-                "reason": "waiting_for_chunk_target",
-                "defer_reason": "waiting_for_chunk_target",
-                "required_chunk_count": required_chunk_count,
-                "required_buffered_audio_seconds": required_buffered_audio_seconds,
-                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
-                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
-                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
-            }
-
-        if buffered_audio_seconds < required_buffered_audio_seconds:
-            return {
-                "admit": False,
-                "reason": "waiting_for_safe_buffer",
-                "defer_reason": "waiting_for_safe_buffer",
-                "required_chunk_count": required_chunk_count,
-                "required_buffered_audio_seconds": required_buffered_audio_seconds,
-                "buffered_audio_seconds": round(buffered_audio_seconds, 3),
-                "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
-                "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
-            }
-
-        return {
-            "admit": True,
-            "reason": "safe_buffer_threshold_met",
-            "defer_reason": None,
-            "required_chunk_count": required_chunk_count,
-            "required_buffered_audio_seconds": required_buffered_audio_seconds,
-            "buffered_audio_seconds": round(buffered_audio_seconds, 3),
-            "worst_synth_to_audio_ratio": max_synth_to_audio_ratio,
-            "worst_negative_real_time_margin_ms": min_real_time_margin_ms,
-        }
-
-    def _new_job_metrics(
-        self,
-        *,
-        mode: str,
-        normalized_chunks: list[str],
-        effective_preroll_chunks: int,
-        total_chunk_char_count: int,
-        job_started_at: dt.datetime,
-    ) -> dict[str, Any]:
-        return {
-            "job_id": self._speech_current_job_id,
-            "mode": mode,
-            "chunk_count": len(normalized_chunks),
-            "chunk_char_count_total": total_chunk_char_count,
-            "configured_preroll_chunks": self.playback_preroll_chunks,
-            "effective_preroll_chunks": effective_preroll_chunks,
-            "effective_preroll_policy": EFFECTIVE_PREROLL_POLICY,
-            "job_started_at": job_started_at,
-            "first_chunk_ready_at": None,
-            "first_audio_started_at": None,
-            "first_audio_start_reason": None,
-            "first_audio_latency_ms": None,
-            "first_chunk_ready_to_first_audio_ms": None,
-            "max_chunk_synth_duration_ms": None,
-            "sum_chunk_synth_duration_ms": 0,
-            "max_chunk_audio_seconds": None,
-            "sum_chunk_audio_seconds": 0.0,
-            "max_synth_to_audio_ratio": None,
-            "min_real_time_margin_ms": None,
-            "failed_chunk_index": None,
-            "failure_reason": None,
-            "wavbuffer_forced_input_completed": False,
-            "completed_chunk_count": 0,
-            "startup_deferred_count": 0,
-            "max_buffered_audio_seconds_before_start": 0.0,
-            "required_buffered_audio_seconds_at_start": None,
-            "start_admission_reason": None,
-            "playback_retry_occurred": False,
-        }
-
-    def _update_job_metrics_for_chunk(
-        self,
-        *,
-        job_metrics: dict[str, Any],
-        chunk_index: int,
-        synth_duration_ms: int,
-        audio_duration_seconds: float,
-        synth_to_audio_ratio: float | None,
-        real_time_margin_ms: int | None,
-        chunk_ready_at: dt.datetime,
-    ) -> None:
-        if job_metrics["first_chunk_ready_at"] is None:
-            job_metrics["first_chunk_ready_at"] = chunk_ready_at
-        job_metrics["completed_chunk_count"] = max(
-            int(cast(int, job_metrics["completed_chunk_count"])),
-            chunk_index,
-        )
-        job_metrics["sum_chunk_synth_duration_ms"] = (
-            int(cast(int, job_metrics["sum_chunk_synth_duration_ms"])) + synth_duration_ms
-        )
-        job_metrics["sum_chunk_audio_seconds"] = (
-            float(cast(float, job_metrics["sum_chunk_audio_seconds"])) + audio_duration_seconds
-        )
-        existing_max_synth = cast(int | None, job_metrics["max_chunk_synth_duration_ms"])
-        if existing_max_synth is None or synth_duration_ms > existing_max_synth:
-            job_metrics["max_chunk_synth_duration_ms"] = synth_duration_ms
-        existing_max_audio = cast(float | None, job_metrics["max_chunk_audio_seconds"])
-        if existing_max_audio is None or audio_duration_seconds > existing_max_audio:
-            job_metrics["max_chunk_audio_seconds"] = audio_duration_seconds
-        existing_max_ratio = cast(float | None, job_metrics["max_synth_to_audio_ratio"])
-        if synth_to_audio_ratio is not None and (
-            existing_max_ratio is None or synth_to_audio_ratio > existing_max_ratio
-        ):
-            job_metrics["max_synth_to_audio_ratio"] = synth_to_audio_ratio
-        existing_min_margin = cast(int | None, job_metrics["min_real_time_margin_ms"])
-        if real_time_margin_ms is not None and (
-            existing_min_margin is None or real_time_margin_ms < existing_min_margin
-        ):
-            job_metrics["min_real_time_margin_ms"] = real_time_margin_ms
-
-    def _record_first_audio_started(
-        self,
-        *,
-        job_metrics: dict[str, Any],
-        started_at: dt.datetime,
-        reason: str,
-        player: str,
-    ) -> None:
-        if job_metrics["first_audio_started_at"] is not None:
-            return
-        job_metrics["first_audio_started_at"] = started_at
-        job_metrics["first_audio_start_reason"] = reason
-        job_metrics["wavbuffer_forced_input_completed"] = reason == "forced_input_completed"
-        job_started_at = cast(dt.datetime, job_metrics["job_started_at"])
-        first_chunk_ready_at = cast(dt.datetime | None, job_metrics["first_chunk_ready_at"])
-        first_audio_latency_ms = _duration_ms(job_started_at, started_at)
-        first_chunk_ready_to_first_audio_ms = _duration_ms(first_chunk_ready_at, started_at)
-        job_metrics["first_audio_latency_ms"] = first_audio_latency_ms
-        job_metrics["first_chunk_ready_to_first_audio_ms"] = first_chunk_ready_to_first_audio_ms
-        self._emit_runtime_event(
-            "speech_first_audio_started",
-            level="info",
-            job_id=job_metrics["job_id"],
-            mode=job_metrics["mode"],
-            player=player,
-            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
-            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
-            effective_preroll_policy=job_metrics["effective_preroll_policy"],
-            first_audio_latency_ms=first_audio_latency_ms,
-            first_chunk_ready_to_first_audio_ms=first_chunk_ready_to_first_audio_ms,
-            reason=reason,
-        )
-
-    def _record_playback_start_deferred(
-        self,
-        *,
-        job_metrics: dict[str, Any],
-        buffered_chunk_count: int,
-        buffered_audio_seconds: float,
-        admission: dict[str, Any],
-    ) -> None:
-        job_metrics["startup_deferred_count"] = (
-            int(cast(int, job_metrics["startup_deferred_count"])) + 1
-        )
-        max_buffered_audio_seconds_before_start = float(
-            cast(float, job_metrics["max_buffered_audio_seconds_before_start"])
-        )
-        if buffered_audio_seconds > max_buffered_audio_seconds_before_start:
-            job_metrics["max_buffered_audio_seconds_before_start"] = round(
-                buffered_audio_seconds,
-                3,
-            )
-        self._emit_runtime_event(
-            "speech_playback_start_deferred",
-            level="info",
-            job_id=job_metrics["job_id"],
-            mode=job_metrics["mode"],
-            chunk_count=job_metrics["chunk_count"],
-            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
-            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
-            buffered_chunk_count=buffered_chunk_count,
-            buffered_audio_seconds=round(buffered_audio_seconds, 3),
-            worst_synth_to_audio_ratio=admission["worst_synth_to_audio_ratio"],
-            worst_negative_real_time_margin_ms=admission["worst_negative_real_time_margin_ms"],
-            required_chunk_count=admission["required_chunk_count"],
-            required_buffered_audio_seconds=admission["required_buffered_audio_seconds"],
-            defer_reason=admission["defer_reason"],
-        )
-
-    def _record_playback_start_admitted(
-        self,
-        *,
-        job_metrics: dict[str, Any],
-        buffered_chunk_count: int,
-        buffered_audio_seconds: float,
-        admission: dict[str, Any],
-    ) -> None:
-        max_buffered_audio_seconds_before_start = float(
-            cast(float, job_metrics["max_buffered_audio_seconds_before_start"])
-        )
-        if buffered_audio_seconds > max_buffered_audio_seconds_before_start:
-            job_metrics["max_buffered_audio_seconds_before_start"] = round(
-                buffered_audio_seconds,
-                3,
-            )
-        job_metrics["required_buffered_audio_seconds_at_start"] = admission[
-            "required_buffered_audio_seconds"
-        ]
-        job_metrics["start_admission_reason"] = admission["reason"]
-        self._emit_runtime_event(
-            "speech_playback_start_admitted",
-            level="info",
-            job_id=job_metrics["job_id"],
-            mode=job_metrics["mode"],
-            chunk_count=job_metrics["chunk_count"],
-            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
-            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
-            buffered_chunk_count=buffered_chunk_count,
-            buffered_audio_seconds=round(buffered_audio_seconds, 3),
-            worst_synth_to_audio_ratio=admission["worst_synth_to_audio_ratio"],
-            worst_negative_real_time_margin_ms=admission["worst_negative_real_time_margin_ms"],
-            required_chunk_count=admission["required_chunk_count"],
-            required_buffered_audio_seconds=admission["required_buffered_audio_seconds"],
-            admission_reason=admission["reason"],
-        )
-
-    def _record_job_metrics(self, job_metrics: dict[str, Any]) -> None:
-        with self._lock:
-            self._last_effective_preroll_chunks = cast(
-                int | None, job_metrics["effective_preroll_chunks"]
-            )
-            self._last_first_audio_latency_ms = cast(
-                int | None, job_metrics["first_audio_latency_ms"]
-            )
-            self._last_first_chunk_ready_to_first_audio_ms = cast(
-                int | None, job_metrics["first_chunk_ready_to_first_audio_ms"]
-            )
-            self._last_failure_reason = cast(str | None, job_metrics["failure_reason"])
-
-    def _emit_job_metrics_summary(self, *, job_metrics: dict[str, Any]) -> None:
-        completed_chunk_count = max(1, int(cast(int, job_metrics["completed_chunk_count"])))
-        avg_chunk_synth_duration_ms = round(
-            int(cast(int, job_metrics["sum_chunk_synth_duration_ms"])) / completed_chunk_count, 3
-        )
-        avg_chunk_audio_seconds = round(
-            float(cast(float, job_metrics["sum_chunk_audio_seconds"])) / completed_chunk_count, 3
-        )
-        self._emit_runtime_event(
-            "speech_job_metrics_summary",
-            level="minimal",
-            job_id=job_metrics["job_id"],
-            mode=job_metrics["mode"],
-            chunk_count=job_metrics["chunk_count"],
-            chunk_char_count_total=job_metrics["chunk_char_count_total"],
-            configured_preroll_chunks=job_metrics["configured_preroll_chunks"],
-            effective_preroll_chunks=job_metrics["effective_preroll_chunks"],
-            effective_preroll_policy=job_metrics["effective_preroll_policy"],
-            first_audio_latency_ms=job_metrics["first_audio_latency_ms"],
-            first_chunk_ready_to_first_audio_ms=job_metrics[
-                "first_chunk_ready_to_first_audio_ms"
-            ],
-            max_chunk_synth_duration_ms=job_metrics["max_chunk_synth_duration_ms"],
-            avg_chunk_synth_duration_ms=avg_chunk_synth_duration_ms,
-            max_chunk_audio_seconds=job_metrics["max_chunk_audio_seconds"],
-            avg_chunk_audio_seconds=avg_chunk_audio_seconds,
-            max_synth_to_audio_ratio=job_metrics["max_synth_to_audio_ratio"],
-            min_real_time_margin_ms=job_metrics["min_real_time_margin_ms"],
-            startup_deferred_count=job_metrics["startup_deferred_count"],
-            max_buffered_audio_seconds_before_start=job_metrics[
-                "max_buffered_audio_seconds_before_start"
-            ],
-            required_buffered_audio_seconds_at_start=job_metrics[
-                "required_buffered_audio_seconds_at_start"
-            ],
-            start_admission_reason=job_metrics["start_admission_reason"],
-            failure_reason=job_metrics["failure_reason"],
-            failed_chunk_index=job_metrics["failed_chunk_index"],
-            wavbuffer_forced_input_completed=job_metrics["wavbuffer_forced_input_completed"],
-            playback_retry_occurred=job_metrics["playback_retry_occurred"],
-        )
-
-    def _play_speech_chunks_with_sounddevice(
-        self,
-        *,
-        mode: str,
-        normalized_chunks: list[str],
-        normalized_language: str,
-        waveform_queue: queue.Queue[dict[str, Any] | object],
-        queue_sentinel: object,
-        producer_error: list[BaseException],
-        synthesis_done: threading.Event,
-        effective_preroll_chunks: int,
-        job_metrics: dict[str, Any],
-    ) -> dict[str, Any]:
-        total_sample_count = 0
-        buffered_sample_count = 0
-        buffered_waveforms: list[np.ndarray] = []
-        buffered_waveform_payloads: list[dict[str, Any]] = []
-        buffered_chunk_count = 0
-        sample_rate: int | None = None
-        channel_count: int | None = None
-        model_id: str | None = None
-        device: str | None = None
-        preroll_sample_target: int | None = None
-        stream_holder: list[sd.OutputStream | None] = [None]
-
-        def close_output_stream(current_stream: sd.OutputStream) -> None:
-            self._emit_runtime_event(
-                "speech_output_stream_closing",
-                level="debug",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-            )
-            current_stream.stop()
-            current_stream.close()
-            stream_holder[0] = None
-            self._emit_runtime_event(
-                "speech_output_stream_closed",
-                level="debug",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-            )
-
-        def open_output_stream_for_playback() -> sd.OutputStream:
-            assert sample_rate is not None
-            assert channel_count is not None
-            with self._lock:
-                self._set_speech_phase_locked("opening_output")
-            self._emit_runtime_event(
-                "speech_output_stream_opening",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                sample_rate=sample_rate,
-                channel_count=channel_count,
-                buffered_chunk_count=buffered_chunk_count,
-                buffered_sample_count=buffered_sample_count,
-            )
-            self._emit_runtime_memory_snapshot(
-                level="info",
-                snapshot_event="speech_output_stream_opening",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                sample_rate=sample_rate,
-                channel_count=channel_count,
-                buffered_chunk_count=buffered_chunk_count,
-                buffered_sample_count=buffered_sample_count,
-            )
-            opened_stream = self._open_output_stream(
-                sample_rate=sample_rate,
-                channel_count=channel_count,
-            )
-            stream_holder[0] = opened_stream
-            self._emit_runtime_event(
-                "speech_output_stream_opened",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                sample_rate=sample_rate,
-                channel_count=channel_count,
-            )
-            return opened_stream
-
-        def write_chunk_with_recovery(
-            current_stream: sd.OutputStream,
-            *,
-            chunk_index: int,
-            waveform_to_write: np.ndarray,
-            chunk_started_at: dt.datetime,
-        ) -> sd.OutputStream:
-            attempt = 0
-            stream_for_write = current_stream
-            while True:
-                underflowed = self._write_output_stream_chunk(stream_for_write, waveform_to_write)
-                if not underflowed:
-                    return stream_for_write
-
-                self._emit_runtime_event(
-                    "speech_chunk_playback_underflow",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="sounddevice-stream",
-                    chunk_index=chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    retry_attempt=attempt + 1,
-                    max_retries=self.playback_underflow_retries,
-                )
-                if attempt >= self.playback_underflow_retries:
-                    raise RuntimeError(
-                        "audio output underflowed during streamed playback "
-                        f"after {attempt + 1} attempt(s)"
-                    )
-
-                close_output_stream(stream_for_write)
-                stream_for_write = open_output_stream_for_playback()
-                playback_recovery_duration_ms = _duration_ms(chunk_started_at, _utc_now())
-                job_metrics["playback_retry_occurred"] = True
-                self._emit_runtime_event(
-                    "speech_chunk_playback_retrying",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="sounddevice-stream",
-                    chunk_index=chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    retry_attempt=attempt + 1,
-                    max_retries=self.playback_underflow_retries,
-                    recovery_duration_ms=playback_recovery_duration_ms,
-                )
-                attempt += 1
-
-        try:
-            next_chunk_index = 1
-            playback_started_at: dt.datetime | None = None
-            while True:
-                with self._lock:
-                    self._set_speech_phase_locked("synthesizing")
-
-                queue_item = waveform_queue.get()
-                if queue_item is queue_sentinel:
-                    break
-
-                chunk_result = cast(dict[str, Any], queue_item)
-                waveform = cast(np.ndarray, chunk_result["waveform"])
-                (
-                    sample_rate,
-                    channel_count,
-                    model_id,
-                    device,
-                ) = self._validate_chunk_metadata(
-                    chunk_result=chunk_result,
-                    normalized_language=normalized_language,
-                    expected_sample_rate=sample_rate,
-                    expected_channel_count=channel_count,
-                    expected_model_id=model_id,
-                    expected_device=device,
-                )
-
-                if stream_holder[0] is None:
-                    buffered_waveforms.append(waveform)
-                    buffered_waveform_payloads.append(chunk_result)
-                    buffered_sample_count += int(waveform.shape[0])
-                    buffered_chunk_count += 1
-                    buffered_audio_seconds = round(
-                        sum(
-                            float(cast(float, item["audio_duration_seconds"]))
-                            for item in buffered_waveform_payloads
-                        ),
-                        3,
-                    )
-                    assert sample_rate is not None
-                    preroll_sample_target = max(
-                        1,
-                        int(sample_rate * self.playback_preroll_seconds),
-                    )
-                    have_enough_preroll_audio = buffered_sample_count >= preroll_sample_target
-                    have_enough_preroll_chunks = buffered_chunk_count >= effective_preroll_chunks
-                    admission = self._evaluate_playback_start_admission(
-                        job_metrics=job_metrics,
-                        total_chunk_count=len(normalized_chunks),
-                        buffered_chunk_count=buffered_chunk_count,
-                        buffered_audio_seconds=buffered_audio_seconds,
-                        synthesis_done=synthesis_done.is_set(),
-                    )
-                    if (
-                        not synthesis_done.is_set()
-                        and (
-                            (not have_enough_preroll_audio and not have_enough_preroll_chunks)
-                            or not admission["admit"]
-                        )
-                    ):
-                        if not admission["admit"]:
-                            self._record_playback_start_deferred(
-                                job_metrics=job_metrics,
-                                buffered_chunk_count=buffered_chunk_count,
-                                buffered_audio_seconds=buffered_audio_seconds,
-                                admission=admission,
-                            )
-                        self._emit_runtime_event(
-                            "speech_preroll_waiting",
-                            level="debug",
-                            job_id=self._speech_current_job_id,
-                            mode=mode,
-                            buffered_chunk_count=buffered_chunk_count,
-                            buffered_sample_count=buffered_sample_count,
-                            preroll_sample_target=preroll_sample_target,
-                            configured_preroll_chunks=self.playback_preroll_chunks,
-                            effective_preroll_chunks=effective_preroll_chunks,
-                            buffered_audio_seconds=buffered_audio_seconds,
-                        )
-                        continue
-
-                    if not admission["admit"]:
-                        self._record_playback_start_deferred(
-                            job_metrics=job_metrics,
-                            buffered_chunk_count=buffered_chunk_count,
-                            buffered_audio_seconds=buffered_audio_seconds,
-                            admission=admission,
-                        )
-                        raise RuntimeError(
-                            "live playback admission rejected: insufficient real-time safety margin"
-                        )
-
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_preroll_satisfied",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        buffered_chunk_count=buffered_chunk_count,
-                        buffered_sample_count=buffered_sample_count,
-                        preroll_sample_target=preroll_sample_target,
-                        configured_preroll_chunks=self.playback_preroll_chunks,
-                        effective_preroll_chunks=effective_preroll_chunks,
-                        buffered_audio_seconds=buffered_audio_seconds,
-                    )
-                    stream_holder[0] = open_output_stream_for_playback()
-                    playback_started_at = _utc_now()
-                    self._record_playback_start_admitted(
-                        job_metrics=job_metrics,
-                        buffered_chunk_count=buffered_chunk_count,
-                        buffered_audio_seconds=buffered_audio_seconds,
-                        admission=admission,
-                    )
-                    self._record_first_audio_started(
-                        job_metrics=job_metrics,
-                        started_at=playback_started_at,
-                        reason="threshold_met",
-                        player="sounddevice-stream",
-                    )
-
-                    for buffered_waveform in buffered_waveforms:
-                        with self._lock:
-                            self._set_speech_phase_locked("playing")
-                            self._speech_current_chunk_index = next_chunk_index
-                            self._speech_current_chunk_count = len(normalized_chunks)
-                            self._current_chunk_started_at = _utc_now()
-                        self._emit_runtime_event(
-                            "speech_chunk_playback_started",
-                            level="info",
-                            job_id=self._speech_current_job_id,
-                            mode=mode,
-                            player="sounddevice-stream",
-                            chunk_index=next_chunk_index,
-                            chunk_count=len(normalized_chunks),
-                            sample_count=int(buffered_waveform.shape[0]),
-                        )
-                        if next_chunk_index == 1:
-                            self._emit_runtime_memory_snapshot(
-                                level="info",
-                                snapshot_event="speech_chunk_playback_started",
-                                job_id=self._speech_current_job_id,
-                                mode=mode,
-                                player="sounddevice-stream",
-                                chunk_index=next_chunk_index,
-                                chunk_count=len(normalized_chunks),
-                            )
-                        assert self._current_chunk_started_at is not None
-                        stream_holder[0] = write_chunk_with_recovery(
-                            stream_holder[0],
-                            chunk_index=next_chunk_index,
-                            waveform_to_write=buffered_waveform,
-                            chunk_started_at=self._current_chunk_started_at,
-                        )
-                        total_sample_count += int(buffered_waveform.shape[0])
-                        self._emit_runtime_event(
-                            "speech_chunk_playback_handoff_completed",
-                            level="info",
-                            job_id=self._speech_current_job_id,
-                            mode=mode,
-                            player="sounddevice-stream",
-                            chunk_index=next_chunk_index,
-                            chunk_count=len(normalized_chunks),
-                            playback_duration_ms=_duration_ms(
-                                self._current_chunk_started_at or playback_started_at,
-                                _utc_now(),
-                            ),
-                        )
-                        next_chunk_index += 1
-                    buffered_waveforms.clear()
-                    buffered_waveform_payloads.clear()
-                    continue
-
-                assert stream_holder[0] is not None
-                with self._lock:
-                    self._set_speech_phase_locked("playing")
-                    self._speech_current_chunk_index = next_chunk_index
-                    self._speech_current_chunk_count = len(normalized_chunks)
-                    self._current_chunk_started_at = _utc_now()
-                self._emit_runtime_event(
-                    "speech_chunk_playback_started",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="sounddevice-stream",
-                    chunk_index=next_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    sample_count=int(waveform.shape[0]),
-                )
-                if next_chunk_index == 1:
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_chunk_playback_started",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        player="sounddevice-stream",
-                        chunk_index=next_chunk_index,
-                        chunk_count=len(normalized_chunks),
-                    )
-                assert self._current_chunk_started_at is not None
-                stream_holder[0] = write_chunk_with_recovery(
-                    stream_holder[0],
-                    chunk_index=next_chunk_index,
-                    waveform_to_write=waveform,
-                    chunk_started_at=self._current_chunk_started_at,
-                )
-                total_sample_count += int(waveform.shape[0])
-                self._emit_runtime_event(
-                    "speech_chunk_playback_handoff_completed",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="sounddevice-stream",
-                    chunk_index=next_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    playback_duration_ms=_duration_ms(
-                        self._current_chunk_started_at or playback_started_at,
-                        _utc_now(),
-                    ),
-                )
-                next_chunk_index += 1
-
-            if producer_error:
-                raise RuntimeError(str(producer_error[0])) from producer_error[0]
-
-            if stream_holder[0] is None:
-                if not buffered_waveforms:
-                    raise RuntimeError("no speech chunks were available for playback")
-                buffered_audio_seconds = round(
-                    sum(
-                        float(cast(float, item["audio_duration_seconds"]))
-                        for item in buffered_waveform_payloads
-                    ),
-                    3,
-                )
-                admission = self._evaluate_playback_start_admission(
-                    job_metrics=job_metrics,
-                    total_chunk_count=len(normalized_chunks),
-                    buffered_chunk_count=buffered_chunk_count,
-                    buffered_audio_seconds=buffered_audio_seconds,
-                    synthesis_done=True,
-                )
-                if not admission["admit"]:
-                    self._record_playback_start_deferred(
-                        job_metrics=job_metrics,
-                        buffered_chunk_count=buffered_chunk_count,
-                        buffered_audio_seconds=buffered_audio_seconds,
-                        admission=admission,
-                    )
-                    raise RuntimeError(
-                        "live playback admission rejected: insufficient real-time safety margin"
-                    )
-                self._emit_runtime_memory_snapshot(
-                    level="info",
-                    snapshot_event="speech_preroll_satisfied",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    buffered_chunk_count=buffered_chunk_count,
-                    buffered_sample_count=buffered_sample_count,
-                    preroll_sample_target=preroll_sample_target,
-                    configured_preroll_chunks=self.playback_preroll_chunks,
-                    effective_preroll_chunks=effective_preroll_chunks,
-                    buffered_audio_seconds=buffered_audio_seconds,
-                )
-                stream_holder[0] = open_output_stream_for_playback()
-                playback_started_at = _utc_now()
-                self._record_playback_start_admitted(
-                    job_metrics=job_metrics,
-                    buffered_chunk_count=buffered_chunk_count,
-                    buffered_audio_seconds=buffered_audio_seconds,
-                    admission=admission,
-                )
-                self._record_first_audio_started(
-                    job_metrics=job_metrics,
-                    started_at=playback_started_at,
-                    reason="all_chunks_buffered",
-                    player="sounddevice-stream",
-                )
-                for buffered_waveform in buffered_waveforms:
-                    with self._lock:
-                        self._set_speech_phase_locked("playing")
-                        self._speech_current_chunk_index = next_chunk_index
-                        self._speech_current_chunk_count = len(normalized_chunks)
-                        self._current_chunk_started_at = _utc_now()
-                    self._emit_runtime_event(
-                        "speech_chunk_playback_started",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        player="sounddevice-stream",
-                        chunk_index=next_chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        sample_count=int(buffered_waveform.shape[0]),
-                    )
-                    if next_chunk_index == 1:
-                        self._emit_runtime_memory_snapshot(
-                            level="info",
-                            snapshot_event="speech_chunk_playback_started",
-                            job_id=self._speech_current_job_id,
-                            mode=mode,
-                            player="sounddevice-stream",
-                            chunk_index=next_chunk_index,
-                            chunk_count=len(normalized_chunks),
-                        )
-                    assert self._current_chunk_started_at is not None
-                    stream_holder[0] = write_chunk_with_recovery(
-                        stream_holder[0],
-                        chunk_index=next_chunk_index,
-                        waveform_to_write=buffered_waveform,
-                        chunk_started_at=self._current_chunk_started_at,
-                    )
-                    total_sample_count += int(buffered_waveform.shape[0])
-                    self._emit_runtime_event(
-                        "speech_chunk_playback_handoff_completed",
-                        level="info",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        player="sounddevice-stream",
-                        chunk_index=next_chunk_index,
-                        chunk_count=len(normalized_chunks),
-                        playback_duration_ms=_duration_ms(
-                            self._current_chunk_started_at or playback_started_at,
-                            _utc_now(),
-                        ),
-                    )
-                    next_chunk_index += 1
-
-            assert sample_rate is not None
-            assert model_id is not None
-            assert device is not None
-            return {
-                "played": True,
-                "sample_rate": sample_rate,
-                "sample_count": total_sample_count,
-                "duration_seconds": round(total_sample_count / sample_rate, 3),
-                "model_id": model_id,
-                "device": device,
-                "language": normalized_language,
-                "player": "sounddevice-stream",
-                "mode": mode,
-            }
-        finally:
-            if stream_holder[0] is not None:
-                close_output_stream(stream_holder[0])
-
-    def _play_speech_chunks_with_wavbuffer(
-        self,
-        *,
-        mode: str,
-        normalized_chunks: list[str],
-        normalized_language: str,
-        waveform_queue: queue.Queue[dict[str, Any] | object],
-        queue_sentinel: object,
-        producer_error: list[BaseException],
-        effective_preroll_chunks: int,
-        job_metrics: dict[str, Any],
-    ) -> dict[str, Any]:
-        total_sample_count = 0
-        sample_rate: int | None = None
-        channel_count: int | None = None
-        model_id: str | None = None
-        device: str | None = None
-        process: Any | None = None
-        process_state: dict[str, Any] | None = None
-        stderr_thread: threading.Thread | None = None
-        next_chunk_index = 1
-
-        def start_process(
-            *,
-            current_sample_rate: int,
-            current_channel_count: int,
-        ) -> tuple[Any, dict[str, Any], threading.Thread]:
-            command = self._wavbuffer_command(chunk_count=len(normalized_chunks))
-            self._emit_runtime_event(
-                "speech_wavbuffer_process_starting",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                command=command,
-            )
-            self._emit_runtime_memory_snapshot(
-                level="info",
-                snapshot_event="speech_wavbuffer_process_starting",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                command=command,
-            )
-            child = self._spawn_wavbuffer_process(command)
-            state: dict[str, Any] = {
-                "lines": [],
-                "parsed_events": [],
-                "playback_started_at": None,
-                "playback_started_event": None,
-            }
-            reader_thread = threading.Thread(
-                target=self._read_wavbuffer_stderr,
-                args=(child, state, mode),
-                name="speak-to-user-wavbuffer-stderr",
-                daemon=True,
-            )
-            reader_thread.start()
-            self._emit_runtime_event(
-                "speech_wavbuffer_process_started",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                pid=getattr(child, "pid", None),
-            )
-            if self.wavbuffer_input_protocol == "service-v1":
-                assert child.stdin is not None
-                child.stdin.write(
-                    self._encode_wavbuffer_service_config_frame(
-                        chunk_count=len(normalized_chunks),
-                        sample_rate=current_sample_rate,
-                        channel_count=current_channel_count,
-                    )
-                )
-                child.stdin.flush()
-            return child, state, reader_thread
-
-        def stop_process(*, close_stdin: bool) -> tuple[int | None, str]:
-            nonlocal process, process_state, stderr_thread
-            if process is None:
-                return None, "wavbuffer process was not running"
-
-            if close_stdin and getattr(process, "stdin", None) is not None:
-                with contextlib.suppress(BrokenPipeError, OSError):
-                    process.stdin.close()
-
-            returncode = process.wait()
-            if stderr_thread is not None:
-                stderr_thread.join(timeout=1)
-            if process_state is not None:
-                playback_started_at = cast(
-                    dt.datetime | None, process_state.get("playback_started_at")
-                )
-                playback_started_event = cast(
-                    dict[str, str] | None, process_state.get("playback_started_event")
-                )
-                if playback_started_at is not None:
-                    self._record_first_audio_started(
-                        job_metrics=job_metrics,
-                        started_at=playback_started_at,
-                        reason=(
-                            playback_started_event.get("reason", "threshold_met")
-                            if playback_started_event is not None
-                            else "threshold_met"
-                        ),
-                        player="wavbuffer-subprocess",
-                    )
-            error_detail = current_process_error()
-            self._emit_runtime_event(
-                "speech_wavbuffer_process_exited",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                pid=getattr(process, "pid", None),
-                returncode=returncode,
-            )
-            process = None
-            process_state = None
-            stderr_thread = None
-            return returncode, error_detail
-
-        def current_process_error() -> str:
-            assert process_state is not None
-            lines = cast(list[str], process_state["lines"])
-            if lines:
-                return lines[-1]
-            return "wavbuffer exited without stderr output"
-
-        def write_payload_or_fail(*, payload: bytes, context: str) -> None:
-            nonlocal process, process_state, stderr_thread
-            assert process is not None
-            assert process_state is not None
-            try:
-                assert process.stdin is not None
-                process.stdin.write(payload)
-                process.stdin.flush()
-            except (BrokenPipeError, OSError) as exc:
-                _, error_detail = stop_process(close_stdin=False)
-                raise RuntimeError(
-                    f"wavbuffer input stream failed while writing {context}: {error_detail}"
-                ) from exc
-
-            if process.poll() is not None:
-                _, error_detail = stop_process(close_stdin=False)
-                raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
-
-        try:
-            while True:
-                with self._lock:
-                    self._set_speech_phase_locked("synthesizing")
-
-                queue_item = waveform_queue.get()
-                if queue_item is queue_sentinel:
-                    break
-
-                chunk_result = cast(dict[str, Any], queue_item)
-                waveform = cast(np.ndarray, chunk_result["waveform"])
-                (
-                    sample_rate,
-                    channel_count,
-                    model_id,
-                    device,
-                ) = self._validate_chunk_metadata(
-                    chunk_result=chunk_result,
-                    normalized_language=normalized_language,
-                    expected_sample_rate=sample_rate,
-                    expected_channel_count=channel_count,
-                    expected_model_id=model_id,
-                    expected_device=device,
-                )
-
-                wav_data = self._encode_waveform_as_wav_bytes(
-                    waveform=waveform,
-                    sample_rate=sample_rate,
-                )
-
-                if process is None:
-                    with self._lock:
-                        self._set_speech_phase_locked("opening_output")
-                    process, process_state, stderr_thread = start_process(
-                        current_sample_rate=sample_rate,
-                        current_channel_count=channel_count,
-                    )
-                    job_metrics["start_admission_reason"] = "swift_owned_buffering"
-
-                current_chunk_index = next_chunk_index
-                current_payload = (
-                    self._encode_wavbuffer_audio_chunk_frame(wav_data=wav_data)
-                    if self.wavbuffer_input_protocol == "service-v1"
-                    else wav_data
-                )
-
-                with self._lock:
-                    self._set_speech_phase_locked("playing")
-                    self._speech_current_chunk_index = current_chunk_index
-                    self._speech_current_chunk_count = len(normalized_chunks)
-                    self._current_chunk_started_at = _utc_now()
-                self._emit_runtime_event(
-                    "speech_chunk_playback_started",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=current_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    sample_count=int(waveform.shape[0]),
-                )
-                if current_chunk_index == 1:
-                    self._emit_runtime_memory_snapshot(
-                        level="info",
-                        snapshot_event="speech_chunk_playback_started",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        player="wavbuffer-subprocess",
-                        chunk_index=current_chunk_index,
-                        chunk_count=len(normalized_chunks),
-                    )
-                assert self._current_chunk_started_at is not None
-                write_payload_or_fail(
-                    payload=current_payload,
-                    context=f"chunk {current_chunk_index}",
-                )
-                total_sample_count += int(waveform.shape[0])
-                self._emit_runtime_event(
-                    "speech_chunk_playback_handoff_completed",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="wavbuffer-subprocess",
-                    chunk_index=current_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                    playback_duration_ms=_duration_ms(self._current_chunk_started_at, _utc_now()),
-                )
-                next_chunk_index += 1
-
-            if producer_error:
-                if process is None:
-                    raise RuntimeError(str(producer_error[0])) from producer_error[0]
-                if self.wavbuffer_input_protocol == "service-v1":
-                    write_payload_or_fail(
-                        payload=self._encode_wavbuffer_stream_failed_frame(
-                            reason=str(producer_error[0])
-                        ),
-                        context="stream failure signal",
-                    )
-                returncode, error_detail = stop_process(close_stdin=True)
-                raise RuntimeError(
-                    f"wavbuffer playback failed: {error_detail}"
-                ) from producer_error[0]
-
-            if process is None:
-                raise RuntimeError("no speech chunks were available for playback")
-
-            if self.wavbuffer_input_protocol == "service-v1":
-                write_payload_or_fail(
-                    payload=self._encode_wavbuffer_stream_end_frame(),
-                    context="stream end signal",
-                )
-
-            returncode, error_detail = stop_process(close_stdin=True)
-            if returncode not in {0, None}:
-                raise RuntimeError(f"wavbuffer playback failed: {error_detail}")
-
-            assert sample_rate is not None
-            assert model_id is not None
-            assert device is not None
-            return {
-                "played": True,
-                "sample_rate": sample_rate,
-                "sample_count": total_sample_count,
-                "duration_seconds": round(total_sample_count / sample_rate, 3),
-                "model_id": model_id,
-                "device": device,
-                "language": normalized_language,
-                "player": "wavbuffer-subprocess",
-                "mode": mode,
-            }
-        finally:
-            if process is not None:
-                stop_process(close_stdin=True)
-
-    def _play_speech_chunks_with_null(
-        self,
-        *,
-        mode: str,
-        normalized_chunks: list[str],
-        normalized_language: str,
-        waveform_queue: queue.Queue[dict[str, Any] | object],
-        queue_sentinel: object,
-        producer_error: list[BaseException],
-    ) -> dict[str, Any]:
-        total_sample_count = 0
-        sample_rate: int | None = None
-        channel_count: int | None = None
-        model_id: str | None = None
-        device: str | None = None
-        next_chunk_index = 1
-        playback_started_at: dt.datetime | None = None
-
-        while True:
-            with self._lock:
-                self._set_speech_phase_locked("synthesizing")
-
-            queue_item = waveform_queue.get()
-            if queue_item is queue_sentinel:
-                break
-
-            chunk_result = cast(dict[str, Any], queue_item)
-            waveform = cast(np.ndarray, chunk_result["waveform"])
-            (
-                sample_rate,
-                channel_count,
-                model_id,
-                device,
-            ) = self._validate_chunk_metadata(
-                chunk_result=chunk_result,
-                normalized_language=normalized_language,
-                expected_sample_rate=sample_rate,
-                expected_channel_count=channel_count,
-                expected_model_id=model_id,
-                expected_device=device,
-            )
-
-            with self._lock:
-                self._set_speech_phase_locked("playing")
-                self._speech_current_chunk_index = next_chunk_index
-                self._speech_current_chunk_count = len(normalized_chunks)
-                self._current_chunk_started_at = _utc_now()
-            self._emit_runtime_event(
-                "speech_chunk_playback_started",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                player="null-sink",
-                chunk_index=next_chunk_index,
-                chunk_count=len(normalized_chunks),
-                sample_count=int(waveform.shape[0]),
-            )
-            if next_chunk_index == 1:
-                playback_started_at = self._current_chunk_started_at
-                self._emit_runtime_memory_snapshot(
-                    level="info",
-                    snapshot_event="speech_chunk_playback_started",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    player="null-sink",
-                    chunk_index=next_chunk_index,
-                    chunk_count=len(normalized_chunks),
-                )
-
-            total_sample_count += int(waveform.shape[0])
-            self._emit_runtime_event(
-                "speech_chunk_playback_handoff_completed",
-                level="info",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                player="null-sink",
-                chunk_index=next_chunk_index,
-                chunk_count=len(normalized_chunks),
-                playback_duration_ms=_duration_ms(
-                    self._current_chunk_started_at or playback_started_at,
-                    _utc_now(),
-                ),
-            )
-            next_chunk_index += 1
-
-        if producer_error:
-            raise RuntimeError(str(producer_error[0])) from producer_error[0]
-
-        if sample_rate is None or model_id is None or device is None:
-            raise RuntimeError("no speech chunks were available for playback")
-
-        return {
-            "played": True,
-            "sample_rate": sample_rate,
-            "sample_count": total_sample_count,
-            "duration_seconds": round(total_sample_count / sample_rate, 3),
-            "model_id": model_id,
-            "device": device,
-            "language": normalized_language,
-            "player": "null-sink",
-            "mode": mode,
-            "channel_count": channel_count,
-        }
-
-    def _validate_chunk_metadata(
-        self,
-        *,
-        chunk_result: dict[str, Any],
-        normalized_language: str,
-        expected_sample_rate: int | None,
-        expected_channel_count: int | None,
-        expected_model_id: str | None,
-        expected_device: str | None,
-    ) -> tuple[int, int, str, str]:
-        waveform = cast(np.ndarray, chunk_result["waveform"])
-        current_sample_rate = int(chunk_result["sample_rate"])
-        current_channel_count = self._waveform_channel_count(waveform)
-        current_model_id = str(chunk_result["model_id"])
-        current_device = str(chunk_result["device"])
-        current_language = str(chunk_result["language"])
-
-        if current_language != normalized_language:
-            raise RuntimeError("streamed speech chunk language changed during playback")
-        if expected_sample_rate is not None and current_sample_rate != expected_sample_rate:
-            raise RuntimeError("streamed speech chunk sample rate changed during playback")
-        if expected_channel_count is not None and current_channel_count != expected_channel_count:
-            raise RuntimeError("streamed speech chunk channel count changed during playback")
-        if expected_model_id is not None and current_model_id != expected_model_id:
-            raise RuntimeError("streamed speech chunk model id changed during playback")
-        if expected_device is not None and current_device != expected_device:
-            raise RuntimeError("streamed speech chunk device changed during playback")
-
-        return current_sample_rate, current_channel_count, current_model_id, current_device
-
-    def _encode_waveform_as_wav_bytes(
-        self,
-        *,
-        waveform: np.ndarray,
-        sample_rate: int,
-    ) -> bytes:
-        if waveform.ndim == 1:
-            channel_count = 1
-            pcm_data = np.ascontiguousarray(waveform.astype(np.float32)).tobytes()
-        elif waveform.ndim == 2:
-            channel_count = int(waveform.shape[1])
-            pcm_data = np.ascontiguousarray(waveform.astype(np.float32)).tobytes()
-        else:
-            raise ValueError("waveform must be mono or multi-channel frame data")
-
-        bits_per_sample = 32
-        bytes_per_sample = bits_per_sample // 8
-        byte_rate = sample_rate * channel_count * bytes_per_sample
-        block_align = channel_count * bytes_per_sample
-        data_length = len(pcm_data)
-        riff_size = 4 + (8 + 16) + (8 + data_length)
-
-        header = b"".join(
-            [
-                b"RIFF",
-                struct.pack("<I", riff_size),
-                b"WAVE",
-                b"fmt ",
-                struct.pack(
-                    "<IHHIIHH",
-                    16,
-                    3,
-                    channel_count,
-                    sample_rate,
-                    byte_rate,
-                    block_align,
-                    bits_per_sample,
-                ),
-                b"data",
-                struct.pack("<I", data_length),
-            ]
-        )
-        return header + pcm_data
-
-    def _encode_wavbuffer_service_frame(self, *, record_type: int, payload: bytes = b"") -> bytes:
-        return b"STU1" + struct.pack("<BI", record_type, len(payload)) + payload
-
-    def _encode_wavbuffer_service_config_frame(
-        self,
-        *,
-        chunk_count: int,
-        sample_rate: int,
-        channel_count: int,
-    ) -> bytes:
-        payload = json.dumps(
-            {
-                "protocolVersion": 1,
-                "starvationTimeoutSeconds": self.wavbuffer_starvation_timeout_seconds,
-                "expectedChunkCount": chunk_count,
-                "expectedSampleRate": float(sample_rate),
-                "expectedChannelCount": channel_count,
-            },
-            sort_keys=True,
-        ).encode("utf-8")
-        return self._encode_wavbuffer_service_frame(record_type=1, payload=payload)
-
-    def _encode_wavbuffer_audio_chunk_frame(self, *, wav_data: bytes) -> bytes:
-        return self._encode_wavbuffer_service_frame(record_type=2, payload=wav_data)
-
-    def _encode_wavbuffer_stream_end_frame(self) -> bytes:
-        return self._encode_wavbuffer_service_frame(record_type=3)
-
-    def _encode_wavbuffer_stream_failed_frame(self, *, reason: str) -> bytes:
-        return self._encode_wavbuffer_service_frame(
-            record_type=4,
-            payload=reason.encode("utf-8"),
-        )
-
-    def _validate_waveform_for_playback(
-        self,
-        *,
-        waveform: np.ndarray,
-        sample_rate: int,
-    ) -> dict[str, float]:
-        waveform_array = np.asarray(waveform, dtype=np.float32)
-        if waveform_array.size <= 0:
-            raise WaveformValidationError("waveform was empty")
-        if waveform_array.ndim not in {1, 2}:
-            raise WaveformValidationError("waveform had invalid rank after coercion")
-        if not np.isfinite(waveform_array).all():
-            raise WaveformValidationError("waveform contained non-finite samples")
-        if sample_rate <= 0:
-            raise WaveformValidationError("waveform sample rate must be positive")
-
-        max_abs_sample = float(np.max(np.abs(waveform_array)))
-        if max_abs_sample > self.tts_waveform_max_abs_sample:
-            raise WaveformValidationError(
-                "waveform exceeded max abs sample "
-                f"{self.tts_waveform_max_abs_sample:.3f} ({max_abs_sample:.3f})"
-            )
-
-        clipped_fraction = float(
-            np.mean(np.abs(waveform_array) >= DEFAULT_TTS_WAVEFORM_CLIP_THRESHOLD)
-        )
-        if clipped_fraction > self.tts_waveform_max_clipped_fraction:
-            raise WaveformValidationError(
-                "waveform clipped fraction exceeded "
-                f"{self.tts_waveform_max_clipped_fraction:.3f} ({clipped_fraction:.3f})"
-            )
-
-        return {
-            "max_abs_sample": round(max_abs_sample, 6),
-            "clipped_fraction": round(clipped_fraction, 6),
-        }
-
-    def _wavbuffer_preroll_args(self, *, chunk_count: int | None = None) -> list[str]:
-        mode = self.wavbuffer_preroll_mode
-        if mode == "auto":
-            mode = "seconds"
-
-        if mode == "buffers":
-            if self.wavbuffer_input_protocol == "service-v1":
-                return ["--preroll-buffers", str(self.playback_preroll_chunks)]
-            effective_chunk_count = chunk_count if chunk_count is not None else 1
-            return [
-                "--preroll-buffers",
-                str(self._effective_preroll_chunk_target(effective_chunk_count)),
-            ]
-        return ["--preroll-seconds", str(self.playback_preroll_seconds)]
-
-    def _wavbuffer_command(self, *, chunk_count: int | None = None) -> list[str]:
-        command = [
-            self.wavbuffer_binary_path,
-            "--queue-depth",
-            str(self.wavbuffer_queue_depth),
-        ]
-        if self.wavbuffer_input_protocol == "service-v1":
-            command.extend(
-                [
-                    "--input-protocol",
-                    self.wavbuffer_input_protocol,
-                    "--starvation-timeout-seconds",
-                    str(self.wavbuffer_starvation_timeout_seconds),
-                ]
-            )
-        command.extend(self._wavbuffer_preroll_args(chunk_count=chunk_count))
-        return command
-
-    def _spawn_wavbuffer_process(self, command: list[str]) -> Any:
-        binary_path = Path(command[0]).expanduser()
-        if not binary_path.is_file():
-            raise RuntimeError(f"wavbuffer binary does not exist: {binary_path}")
-        if not os.access(binary_path, os.X_OK):
-            raise RuntimeError(f"wavbuffer binary is not executable: {binary_path}")
-
-        return subprocess.Popen(
-            [str(binary_path), *command[1:]],
-            stdin=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-    def _read_wavbuffer_stderr(
-        self,
-        process: Any,
-        state: dict[str, Any],
-        mode: str,
-    ) -> None:
-        stderr = getattr(process, "stderr", None)
-        if stderr is None:
-            return
-
-        while True:
-            line = stderr.readline()
-            if not line:
-                break
-
-            decoded_line = line.decode("utf-8", errors="replace").strip()
-            if not decoded_line:
-                continue
-
-            lines = cast(list[str], state["lines"])
-            lines.append(decoded_line)
-            if len(lines) > 20:
-                del lines[0]
-
-            parsed_event = self._parse_wavbuffer_event_line(decoded_line)
-            if parsed_event is not None:
-                cast(list[dict[str, str]], state["parsed_events"]).append(parsed_event)
-                wavbuffer_event_name = parsed_event.get("event")
-                if (
-                    wavbuffer_event_name == "playback_started"
-                    and state.get("playback_started_at") is None
-                ):
-                    state["playback_started_at"] = _utc_now()
-                    state["playback_started_event"] = dict(parsed_event)
-                self._emit_runtime_event(
-                    "speech_wavbuffer_event_received",
-                    level="info",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    wavbuffer_event=wavbuffer_event_name,
-                    wavbuffer_fields=parsed_event,
-                    raw_line=decoded_line,
-                )
-            else:
-                self._emit_runtime_event(
-                    "speech_wavbuffer_stderr_received",
-                    level="debug",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    raw_line=decoded_line,
-                )
-
-    def _parse_wavbuffer_event_line(self, line: str) -> dict[str, str] | None:
-        normalized = line.strip()
-        if not normalized.startswith("wavbuffer "):
-            return None
-
-        payload = normalized.removeprefix("wavbuffer ").strip()
-        if not payload:
-            return None
-
-        result: dict[str, str] = {}
-        for token in shlex.split(payload):
-            if "=" not in token:
-                continue
-            key, value = token.split("=", 1)
-            result[key] = value
-
-        return result or None
-
-    def _speech_worker_loop(self) -> None:
-        while True:
-            job = self._speech_queue.get()
-            if job is None:
-                self._speech_queue.task_done()
-                self._emit_runtime_event("speech_worker_stopped", level="minimal")
-                return
-
-            job_id = int(job["job_id"])
-            mode = str(job["mode"])
-            chunks = list(job["chunks"])
-            language = str(job["language"])
-
-            with self._lock:
-                if mode in self._queued_jobs_by_mode and self._queued_jobs_by_mode[mode] > 0:
-                    self._queued_jobs_by_mode[mode] -= 1
-                self._speech_in_progress = True
-                self._current_job_started_at = _utc_now()
-                self._set_speech_phase_locked("synthesizing")
-                self._speech_current_job_id = job_id
-                self._speech_current_chunk_index = 0
-                self._speech_current_chunk_count = len(chunks)
-                self._speech_current_mode = mode
-                self._speech_last_error = None
-            self._emit_runtime_event(
-                "speech_job_started",
-                level="minimal",
-                job_id=job_id,
-                mode=mode,
-                chunk_count=len(chunks),
-                queue_depth=self._speech_queue.qsize(),
-                enqueue_to_start_ms=_duration_ms(
-                    self._speech_last_enqueued_at,
-                    self._current_job_started_at,
-                ),
-            )
-
-            try:
-                if mode == VOICE_DESIGN_MODEL_KIND:
-                    self.play_speech_chunks(
-                        mode=mode,
-                        chunks=chunks,
-                        voice_description=str(job["voice_description"]),
-                        language=language,
-                    )
-                elif mode == CLONE_MODEL_KIND:
-                    self.play_speech_chunks(
-                        mode=mode,
-                        chunks=chunks,
-                        language=language,
-                        reference_audio=cast(
-                            tuple[np.ndarray, int] | None,
-                            job.get("reference_audio"),
-                        ),
-                        reference_text=cast(str | None, job.get("reference_text")),
-                        voice_clone_prompt_items=cast(
-                            list[Any] | None,
-                            job.get("voice_clone_prompt_items"),
-                        ),
-                    )
-                else:
-                    raise RuntimeError(f"unsupported speech mode `{mode}`")
-            except Exception as exc:
-                with self._lock:
-                    self._speech_jobs_failed += 1
-                    self._speech_last_error = str(exc)
-                    self._last_error = str(exc)
-                self._emit_runtime_event(
-                    "speech_job_failed",
-                    level="minimal",
-                    job_id=job_id,
-                    mode=mode,
-                    phase=self._speech_phase,
-                    error=str(exc),
-                    total_job_duration_ms=_duration_ms(self._current_job_started_at, _utc_now()),
-                )
-            else:
-                with self._lock:
-                    completed_at = _utc_now()
-                    self._speech_jobs_completed += 1
-                    self._speech_last_completed_at = completed_at
-                    self._speech_last_error = None
-                self._emit_runtime_event(
-                    "speech_job_completed",
-                    level="minimal",
-                    job_id=job_id,
-                    mode=mode,
-                    total_job_duration_ms=_duration_ms(self._current_job_started_at, completed_at),
-                )
-            finally:
-                with self._lock:
-                    self._speech_in_progress = False
-                    self._set_speech_phase_locked(DEFAULT_SPEECH_PHASE)
-                    self._speech_current_job_id = None
-                    self._speech_current_chunk_index = None
-                    self._speech_current_chunk_count = None
-                    self._speech_current_mode = None
-                    self._current_job_started_at = None
-                    self._current_chunk_started_at = None
-                self._speech_queue.task_done()
-
-    def _status_payload_locked(self) -> dict[str, Any]:
-        dependency_status = _runtime_dependency_status()
-        voice_design_state = self._model_state(VOICE_DESIGN_MODEL_KIND)
-        clone_state = self._model_state(CLONE_MODEL_KIND)
-        overall_ready = (
-            _runtime_dependencies_ready()
-            and self._last_error is None
-            and self._all_startup_models_loaded_locked()
-        )
-        return {
-            "ready": overall_ready,
-            "model_loaded": voice_design_state["model"] is not None,
-            "device_preference": self.device_preference,
-            "device": voice_design_state["resolved_device"],
-            "model_id": self.voice_design_model_id,
-            "torch_dtype": self.torch_dtype_name,
-            "cpu_fallback_active": voice_design_state["cpu_fallback_active"],
-            "playback_preroll_seconds": self.playback_preroll_seconds,
-            "playback_preroll_chunks": self.playback_preroll_chunks,
-            "playback_waveform_queue_maxsize": self.playback_waveform_queue_maxsize,
-            "playback_underflow_retries": self.playback_underflow_retries,
-            "playback_backend": self.playback_backend,
-            "wavbuffer_binary_path": self.wavbuffer_binary_path,
-            "wavbuffer_queue_depth": self.wavbuffer_queue_depth,
-            "wavbuffer_preroll_mode": self.wavbuffer_preroll_mode,
-            "wavbuffer_input_protocol": self.wavbuffer_input_protocol,
-            "wavbuffer_starvation_timeout_seconds": self.wavbuffer_starvation_timeout_seconds,
-            "effective_preroll_policy": EFFECTIVE_PREROLL_POLICY,
-            "tts_chunk_max_chars": self.tts_chunk_max_chars,
-            "tts_max_new_tokens": self.tts_max_new_tokens,
-            "tts_max_chunk_synth_seconds": self.tts_max_chunk_synth_seconds,
-            "tts_max_chunk_audio_seconds": self.tts_max_chunk_audio_seconds,
-            "tts_chunk_regen_retries": self.tts_chunk_regen_retries,
-            "tts_waveform_max_abs_sample": self.tts_waveform_max_abs_sample,
-            "tts_waveform_max_clipped_fraction": self.tts_waveform_max_clipped_fraction,
-            "output_stream_latency": self.output_stream_latency,
-            "log_level": self.log_level,
-            "last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
-            "last_loaded_at": _timestamp_value(voice_design_state["last_loaded_at"]),
-            "last_error": self._last_error,
-            "startup_model_option": self._startup_model_option,
-            "startup_model_options": self.available_startup_model_options(),
-            "startup_model_ids": [
-                self._model_state(model_kind)["model_id"]
-                for model_kind in self._startup_model_kinds_for_option(self._startup_model_option)
-            ],
-            "loaded_model_ids": [
-                slot["model_id"]
-                for slot in self._model_slots.values()
-                if slot["model"] is not None
-            ],
-            "voice_design_model_enabled": voice_design_state["startup_enabled"],
-            "voice_design_model_startup_enabled": voice_design_state["startup_enabled"],
-            "voice_design_model_loaded": voice_design_state["model"] is not None,
-            "voice_design_model_id": voice_design_state["model_id"],
-            "voice_design_device": voice_design_state["resolved_device"],
-            "voice_design_last_used_at": _timestamp_value(voice_design_state["last_used_at"]),
-            "voice_design_last_loaded_at": _timestamp_value(voice_design_state["last_loaded_at"]),
-            "voice_design_last_error": voice_design_state["last_error"],
-            "voice_design_cpu_fallback_active": voice_design_state["cpu_fallback_active"],
-            "clone_model_enabled": clone_state["startup_enabled"],
-            "clone_model_startup_enabled": clone_state["startup_enabled"],
-            "clone_model_loaded": clone_state["model"] is not None,
-            "clone_model_id": clone_state["model_id"],
-            "clone_device": clone_state["resolved_device"],
-            "clone_last_used_at": _timestamp_value(clone_state["last_used_at"]),
-            "clone_last_loaded_at": _timestamp_value(clone_state["last_loaded_at"]),
-            "clone_last_error": clone_state["last_error"],
-            "clone_cpu_fallback_active": clone_state["cpu_fallback_active"],
-            "clone_in_progress": (
-                self._speech_in_progress
-                and self._speech_current_mode == CLONE_MODEL_KIND
-            ),
-            "speech_profile_storage_ready": True,
-            "speech_profile_count": self._speech_profile_count,
-            "speech_profile_last_error": self._speech_profile_last_error,
-            "current_job_started_at": _timestamp_value(self._current_job_started_at),
-            "current_chunk_started_at": _timestamp_value(self._current_chunk_started_at),
-            "current_phase_started_at": _timestamp_value(self._current_phase_started_at),
-            "speech_last_event_at": _timestamp_value(self._speech_last_event_at),
-            "speech_last_event": self._speech_last_event,
-            "last_effective_preroll_chunks": self._last_effective_preroll_chunks,
-            "last_first_audio_latency_ms": self._last_first_audio_latency_ms,
-            "last_first_chunk_ready_to_first_audio_ms": (
-                self._last_first_chunk_ready_to_first_audio_ms
-            ),
-            "last_failure_reason": self._last_failure_reason,
-            "recent_events": list(self._recent_events),
-            **dependency_status,
-            **self._speech_status_payload_locked(),
-        }
-
-    def _speech_status_payload_locked(self) -> dict[str, Any]:
-        return {
-            "speech_in_progress": self._speech_in_progress,
-            "speech_phase": self._speech_phase,
-            "speech_current_job_id": self._speech_current_job_id,
-            "speech_current_chunk_index": self._speech_current_chunk_index,
-            "speech_current_chunk_count": self._speech_current_chunk_count,
-            "speech_current_mode": self._speech_current_mode,
-            "speech_queue_depth": self._speech_queue.qsize(),
-            "speech_queue_maxsize": self.speech_queue_maxsize,
-            "speech_jobs_queued": self._speech_jobs_queued,
-            "speech_jobs_completed": self._speech_jobs_completed,
-            "speech_jobs_failed": self._speech_jobs_failed,
-            "speech_last_enqueued_at": _timestamp_value(self._speech_last_enqueued_at),
-            "speech_last_completed_at": _timestamp_value(self._speech_last_completed_at),
-            "speech_last_error": self._speech_last_error,
-            "speech_last_event_at": _timestamp_value(self._speech_last_event_at),
-            "speech_last_event": self._speech_last_event,
-        }
-
-    def _emit_runtime_event(self, event: str, *, level: str, **details: Any) -> None:
-        if LOG_LEVEL_PRIORITY[level] > LOG_LEVEL_PRIORITY[self.log_level]:
-            return
-
-        timestamp = _utc_now()
-        payload: dict[str, Any] = {"timestamp": timestamp.isoformat(), "event": event}
-        payload.update(details)
-
-        with self._lock:
-            self._speech_last_event_at = timestamp
-            self._speech_last_event = event
-            self._recent_events.append(dict(payload))
-
-        _ORIGINAL_PRINT(json.dumps(payload, sort_keys=True), file=sys.stderr)
-
-    def _emit_runtime_memory_snapshot(
-        self,
-        *,
-        level: str,
-        snapshot_event: str,
-        **details: Any,
-    ) -> None:
-        snapshot = _current_process_memory_snapshot()
-        self._emit_runtime_event(
-            "speech_memory_snapshot",
-            level=level,
-            snapshot_event=snapshot_event,
-            **details,
-            **snapshot,
-        )
-
-    def _enqueue_speech_job(
-        self,
-        *,
-        mode: str,
-        chunks: list[str],
-        language: str,
-        voice_description: str | None = None,
-        reference_audio: tuple[np.ndarray, int] | None = None,
-        reference_audio_path: str | None = None,
-        reference_text: str | None = None,
-        voice_clone_prompt_items: list[Any] | None = None,
-        profile_name: str | None = None,
-    ) -> dict[str, Any]:
-        self.start_speech_worker()
-
-        with self._lock:
-            slot = self._model_state(mode)
-            if self._shutdown_requested.is_set():
-                raise RuntimeError("runtime is shutting down and cannot accept speech jobs")
-            if slot["model"] is None:
-                raise RuntimeError(self.required_models_not_loaded_message(model_kinds=[mode]))
-
-            job_id = self._speech_jobs_queued + 1
-            job: dict[str, Any] = {
-                "job_id": job_id,
-                "mode": mode,
-                "chunks": chunks,
-                "language": language,
-            }
-            if voice_description is not None:
-                job["voice_description"] = voice_description
-            if reference_audio is not None:
-                job["reference_audio"] = reference_audio
-            if reference_audio_path is not None:
-                job["reference_audio_path"] = reference_audio_path
-            if reference_text is not None:
-                job["reference_text"] = reference_text
-            if voice_clone_prompt_items is not None:
-                job["voice_clone_prompt_items"] = voice_clone_prompt_items
-            if profile_name is not None:
-                job["profile_name"] = profile_name
-
-            try:
-                self._speech_queue.put_nowait(job)
-            except queue.Full as exc:
-                self._speech_last_error = "speech queue is full"
-                self._last_error = self._speech_last_error
-                raise RuntimeError("speech queue is full") from exc
-
-            enqueued_at = _utc_now()
-            self._speech_jobs_queued = job_id
-            self._queued_jobs_by_mode[mode] += 1
-            self._speech_last_enqueued_at = enqueued_at
-            self._speech_last_error = None
-            self._emit_runtime_event(
-                "speech_job_queued",
-                level="minimal",
-                job_id=job_id,
-                mode=mode,
-                chunk_count=len(chunks),
-                chunk_char_count=sum(len(chunk) for chunk in chunks),
-                language=language,
-                queue_depth=self._speech_queue.qsize(),
-                reference_text_included=reference_text is not None,
-                profile_name=profile_name,
-            )
-            return {
-                "result": "success",
-                "queued": True,
-                "job_id": job_id,
-                "chunked": len(chunks) > 1,
-                "chunk_count": len(chunks),
-                "language": language,
-                "enqueued_at": enqueued_at.isoformat(),
-                "playback_mode": "in-process-queue",
-                "mode": mode,
-                **self._speech_status_payload_locked(),
-            }
-
-    def _normalize_chunks(self, chunks: list[str]) -> list[str]:
-        normalized_chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
-        if not normalized_chunks:
-            raise ValueError("chunks must not be empty")
-        return normalized_chunks
-
-    def _resolve_torch_dtype(self, torch_module: Any) -> Any | None:
-        if self.torch_dtype_name is None:
-            return None
-        if self.torch_dtype_name == "float16":
-            return torch_module.float16
-        if self.torch_dtype_name == "bfloat16":
-            return torch_module.bfloat16
-        if self.torch_dtype_name == "float32":
-            return torch_module.float32
-        raise RuntimeError("unsupported torch dtype configuration")
-
-    def _load_model_kwargs(self, model_kind: str, torch_module: Any) -> dict[str, Any]:
-        load_kwargs: dict[str, Any] = {}
-        torch_dtype = self._resolve_torch_dtype(torch_module)
-        slot = self._model_state(model_kind)
-
-        if slot["cpu_fallback_active"] and self.device_preference == "auto":
-            load_kwargs["device_map"] = "cpu"
-            load_kwargs["torch_dtype"] = torch_dtype or torch_module.float32
-            return load_kwargs
-
-        load_kwargs["device_map"] = self._resolve_device(torch_module)
-        if torch_dtype is not None:
-            load_kwargs["torch_dtype"] = torch_dtype
-        return load_kwargs
-
-    def _reload_model_with_cpu_fallback(self, model_kind: str) -> None:
-        with self._lock:
-            if self.device_preference != "auto":
-                raise RuntimeError(
-                    "CPU fallback is only supported when SPEAK_TO_USER_DEVICE=auto"
-                )
-            slot = self._model_state(model_kind)
-            previous_model = slot["model"]
-            previous_device = slot["resolved_device"]
-            slot["model"] = None
-            slot["resolved_device"] = None
-            slot["cpu_fallback_active"] = True
-        self._emit_runtime_event(
-            "model_cpu_fallback_activated",
-            level="minimal",
-            model_kind=model_kind,
-        )
-
-        self._release_model_resources(previous_model, resolved_device=previous_device)
-        gc.collect()
-
-        loaded_model = self._load_model_impl(model_kind)
-
-        with self._lock:
-            slot = self._model_state(model_kind)
-            if self._shutdown_requested.is_set():
-                self._release_model_resources(loaded_model, resolved_device=slot["resolved_device"])
-                slot["resolved_device"] = None
-                raise RuntimeError("model reload aborted during shutdown")
-
-            slot["model"] = loaded_model
-            slot["last_error"] = None
-            slot["last_loaded_at"] = _utc_now()
-            self._touch_model_locked(model_kind, slot["last_loaded_at"])
-            self._last_error = None
-
-    def _synthesize_audio_chunk(
-        self,
-        *,
-        mode: str,
-        text: str,
-        language: str,
-        voice_description: str | None = None,
-        reference_audio: tuple[np.ndarray, int] | None = None,
-        reference_text: str | None = None,
-        voice_clone_prompt_items: list[Any] | None = None,
-    ) -> dict[str, Any]:
-        with self._lock:
-            model_missing = self._model_state(mode)["model"] is None
-
-        if model_missing:
-            raise RuntimeError(self.required_models_not_loaded_message(model_kinds=[mode]))
-
-        with self._lock:
-            slot = self._model_state(mode)
-            model = slot["model"]
-
-        assert model is not None
-
-        def generate(active_model: Any) -> tuple[list[Any], int]:
-            if mode == VOICE_DESIGN_MODEL_KIND:
-                wavs, sample_rate = active_model.generate_voice_design(
-                    text=text,
-                    language=language,
-                    instruct=voice_description,
-                    max_new_tokens=self.tts_max_new_tokens,
-                    non_streaming_mode=True,
-                )
-                return cast(list[Any], wavs), int(sample_rate)
-
-            generate_kwargs: dict[str, Any] = {
-                "text": text,
-                "language": language,
-                "max_new_tokens": self.tts_max_new_tokens,
-                "non_streaming_mode": True,
-            }
-            if voice_clone_prompt_items is not None:
-                generate_kwargs["voice_clone_prompt"] = voice_clone_prompt_items
-            else:
-                assert reference_audio is not None
-                generate_kwargs["ref_audio"] = reference_audio
-                generate_kwargs["x_vector_only_mode"] = reference_text is None
-                if reference_text is not None:
-                    generate_kwargs["ref_text"] = reference_text
-            wavs, sample_rate = active_model.generate_voice_clone(**generate_kwargs)
-            return cast(list[Any], wavs), int(sample_rate)
-
-        generate_started_at = _utc_now()
-
-        try:
-            wavs, sample_rate = generate(model)
-        except Exception as exc:
-            if _meta_tensor_runtime_error(exc):
-                self._emit_runtime_event(
-                    "speech_chunk_synthesis_retrying_with_cpu_fallback",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    error=str(exc),
-                )
-                try:
-                    self._reload_model_with_cpu_fallback(mode)
-                    with self._lock:
-                        reloaded_model = self._model_state(mode)["model"]
-                    if reloaded_model is None:
-                        raise RuntimeError("CPU fallback reload completed without a loaded model")
-                    wavs, sample_rate = generate(reloaded_model)
-                except Exception as retry_exc:
-                    with self._lock:
-                        self._last_error = f"synthesis failed after CPU fallback retry: {retry_exc}"
-                        self._model_state(mode)["last_error"] = self._last_error
-                    self._emit_runtime_event(
-                        "speech_chunk_synthesis_retry_failed",
-                        level="minimal",
-                        job_id=self._speech_current_job_id,
-                        mode=mode,
-                        error=str(retry_exc),
-                    )
-                    raise RuntimeError(
-                        f"synthesis failed after CPU fallback retry: {retry_exc}"
-                    ) from retry_exc
-            else:
-                with self._lock:
-                    self._last_error = str(exc)
-                    self._model_state(mode)["last_error"] = str(exc)
-                self._emit_runtime_event(
-                    "speech_chunk_synthesis_failed",
-                    level="minimal",
-                    job_id=self._speech_current_job_id,
-                    mode=mode,
-                    error=str(exc),
-                )
-                raise
-
-        generate_completed_at = _utc_now()
-        synth_duration_ms = _duration_ms(generate_started_at, generate_completed_at)
-        if (
-            synth_duration_ms is not None
-            and synth_duration_ms > int(self.tts_max_chunk_synth_seconds * 1000)
-        ):
-            self._emit_runtime_event(
-                "speech_chunk_synthesis_guardrail_tripped",
-                level="minimal",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                guardrail="synth_duration",
-                synth_duration_ms=synth_duration_ms,
-                max_chunk_synth_seconds=self.tts_max_chunk_synth_seconds,
-                chunk_char_count=len(text),
-            )
-            raise RuntimeError(
-                "chunk synthesis exceeded "
-                f"{self.tts_max_chunk_synth_seconds:.1f}s guardrail "
-                f"({synth_duration_ms}ms)"
-            )
-
-        waveforms = [self._coerce_waveform(waveform) for waveform in wavs]
-        if not waveforms:
-            raise RuntimeError("model returned no waveform for synthesized chunk")
-
-        waveform = waveforms[0]
-        waveform_validation = self._validate_waveform_for_playback(
-            waveform=waveform,
-            sample_rate=sample_rate,
-        )
-        sample_count = int(waveform.shape[0])
-        audio_duration_seconds = sample_count / sample_rate
-        if audio_duration_seconds > self.tts_max_chunk_audio_seconds:
-            self._emit_runtime_event(
-                "speech_chunk_synthesis_guardrail_tripped",
-                level="minimal",
-                job_id=self._speech_current_job_id,
-                mode=mode,
-                guardrail="audio_duration",
-                sample_count=sample_count,
-                sample_rate=sample_rate,
-                audio_duration_seconds=round(audio_duration_seconds, 3),
-                max_chunk_audio_seconds=self.tts_max_chunk_audio_seconds,
-                chunk_char_count=len(text),
-            )
-            raise RuntimeError(
-                "chunk audio duration exceeded "
-                f"{self.tts_max_chunk_audio_seconds:.1f}s guardrail "
-                f"({audio_duration_seconds:.3f}s)"
-            )
-
-        with self._lock:
-            slot = self._model_state(mode)
-            now = _utc_now()
-            slot["last_error"] = None
-            self._last_error = None
-            self._touch_model_locked(mode, now)
-            return {
-                "waveform": waveform,
-                "sample_rate": sample_rate,
-                "model_id": slot["model_id"],
-                "device": slot["resolved_device"],
-                "language": language,
-                "synth_duration_ms": synth_duration_ms,
-                "sample_count": sample_count,
-                "audio_duration_seconds": round(audio_duration_seconds, 3),
-                "waveform_max_abs_sample": waveform_validation["max_abs_sample"],
-                "waveform_clipped_fraction": waveform_validation["clipped_fraction"],
-            }
-
-    def _load_model_impl(self, model_kind: str) -> Any:
-        with _suppress_default_stdout_prints_for_current_thread():
-            import torch
-            from qwen_tts import Qwen3TTSModel  # type: ignore[import-untyped]
-
-            load_kwargs = self._load_model_kwargs(model_kind, torch)
-            resolved_device = str(load_kwargs["device_map"])
-            self._model_state(model_kind)["resolved_device"] = resolved_device
-            return Qwen3TTSModel.from_pretrained(
-                self._model_state(model_kind)["model_id"],
-                **load_kwargs,
-            )
-
-    def _resolve_device(self, torch_module: Any) -> str:
-        if self.device_preference == "cpu":
-            return "cpu"
-        if self.device_preference == "mps":
-            if not torch_module.backends.mps.is_available():
-                raise RuntimeError("SPEAK_TO_USER_DEVICE=mps but torch MPS is unavailable")
-            return "mps"
-
-        if torch_module.backends.mps.is_available():
-            return "mps"
-        return "cpu"
-
-    def _new_model_slot(self, *, model_id: str, startup_enabled: bool) -> dict[str, Any]:
-        return {
-            "startup_enabled": startup_enabled,
-            "model_id": model_id,
-            "model": None,
-            "resolved_device": None,
-            "last_error": None,
-            "last_used_at": None,
-            "last_loaded_at": None,
-            "cpu_fallback_active": False,
-        }
-
-    def _startup_enabled_model_kinds(self) -> list[str]:
-        return [
-            model_kind
-            for model_kind, slot in self._model_slots.items()
-            if cast(bool, slot["startup_enabled"])
-        ]
-
-    def _all_startup_models_loaded_locked(self) -> bool:
-        startup_slots = [
-            slot for slot in self._model_slots.values() if cast(bool, slot["startup_enabled"])
-        ]
-        return all(slot["model"] is not None for slot in startup_slots)
-
-    def _model_state(self, model_kind: str) -> dict[str, Any]:
-        return self._model_slots[model_kind]
-
-    def _touch_model_locked(self, model_kind: str, value: dt.datetime | None = None) -> None:
-        self._model_state(model_kind)["last_used_at"] = value or _utc_now()
-
-    def _normalize_startup_model_option(self, option: str) -> str:
-        normalized_option = option.strip()
-        if normalized_option not in self.available_startup_model_options():
+            raise ValueError(f"Speech profile `{profile_name}` does not exist")
+        if profile.model_id != self.clone_model_id:
             raise ValueError(
-                "startup model option must be one of: "
-                f"{', '.join(self.available_startup_model_options())}"
+                f"Speech profile `{profile_name}` targets `{profile.model_id}`, "
+                f"but the current clone model is `{self.clone_model_id}`"
             )
-        return normalized_option
+        return profile
 
-    def _startup_model_kinds_for_option(self, option: str) -> list[str]:
-        if option == STARTUP_MODEL_OPTION_NONE:
+    def speak_with_profile(
+        self,
+        *,
+        name: str,
+        profile: SpeechProfile,
+        chunks: list[str],
+        language: str,
+    ) -> dict[str, object]:
+        del name
+        return self._run_speech_job(
+            mode="profile",
+            model_kind=CLONE_MODEL_KIND,
+            chunks=chunks,
+            language=language,
+            ref_audio=profile.reference_audio_path,
+            ref_text=profile.reference_text,
+            profile_name=profile.name,
+        )
+
+    # MARK: Status
+
+    def status(self) -> dict[str, object]:
+        with self._status_lock:
+            return {
+                "ready": True,
+                "playback_backend": self.playback_backend,
+                "state_dir": str(self.state_dir),
+                "profiles_dir": str(self.profiles_dir),
+                "startup_model_option": self._startup_model_option,
+                "startup_model_options": self.startup_model_options(),
+                "loaded_model_ids": self._loaded_model_ids(),
+                "voice_design_model_enabled": self.enable_voice_design_model,
+                "voice_design_model_loaded": self._is_model_loaded(VOICE_DESIGN_MODEL_KIND),
+                "voice_design_model_id": self.voice_design_model_id,
+                "voice_design_last_loaded_at": self._last_loaded_at[VOICE_DESIGN_MODEL_KIND],
+                "voice_design_last_used_at": self._last_used_at[VOICE_DESIGN_MODEL_KIND],
+                "voice_design_last_error": self._last_model_error[VOICE_DESIGN_MODEL_KIND],
+                "clone_model_enabled": self.enable_clone_model,
+                "clone_model_loaded": self._is_model_loaded(CLONE_MODEL_KIND),
+                "clone_model_id": self.clone_model_id,
+                "clone_last_loaded_at": self._last_loaded_at[CLONE_MODEL_KIND],
+                "clone_last_used_at": self._last_used_at[CLONE_MODEL_KIND],
+                "clone_last_error": self._last_model_error[CLONE_MODEL_KIND],
+                "speech_in_progress": self._speech_in_progress,
+                "speech_phase": self._speech_phase,
+                "speech_current_job_id": self._speech_current_job_id,
+                "speech_jobs_completed": self._speech_jobs_completed,
+                "speech_jobs_failed": self._speech_jobs_failed,
+                "speech_last_error": self._speech_last_error,
+                "speech_last_event": self._speech_last_event,
+                "speech_last_event_at": self._speech_last_event_at,
+                "tts_chunk_max_chars": self.tts_chunk_max_chars,
+                "recent_events": list(self._recent_events),
+            }
+
+    # MARK: Internal Helpers
+
+    def _default_startup_model_option(self) -> str:
+        enabled_model_ids = self.available_model_ids()
+        if not enabled_model_ids:
+            return "none"
+        if len(enabled_model_ids) > 1:
+            return "all"
+        return enabled_model_ids[0]
+
+    def _model_kinds_for_option(self, option: str) -> list[str]:
+        if option == "none":
             return []
-        if option == STARTUP_MODEL_OPTION_ALL:
-            return [VOICE_DESIGN_MODEL_KIND, CLONE_MODEL_KIND]
+        if option == "all":
+            return [self.model_kind_for_id(model_id) for model_id in self.available_model_ids()]
         return [self.model_kind_for_id(option)]
 
-    def _set_startup_model_option_locked(self, option: str) -> None:
-        self._startup_model_option = option
-        startup_model_kinds = set(self._startup_model_kinds_for_option(option))
-        for model_kind, slot in self._model_slots.items():
-            slot["startup_enabled"] = model_kind in startup_model_kinds
+    def _require_enabled_model_kind(self, model_kind: str) -> None:
+        if model_kind == VOICE_DESIGN_MODEL_KIND and not self.enable_voice_design_model:
+            raise ValueError("The voice-design model is disabled in this runtime configuration")
+        if model_kind == CLONE_MODEL_KIND and not self.enable_clone_model:
+            raise ValueError("The clone model is disabled in this runtime configuration")
 
-    async def _load_startup_model_option(self, *, state_store: Any) -> str:
-        result = await state_store.get(
-            key=STARTUP_MODEL_OPTION_KEY,
-            collection=RUNTIME_CONFIGURATION_COLLECTION,
-        )
-        stored_option = result.value if result is not None else None
+    def _model_id_for_kind(self, model_kind: str) -> str:
+        if model_kind == VOICE_DESIGN_MODEL_KIND:
+            return self.voice_design_model_id
+        if model_kind == CLONE_MODEL_KIND:
+            return self.clone_model_id
+        raise ValueError(f"Unknown model kind `{model_kind}`")
 
-        if isinstance(stored_option, str):
-            try:
-                normalized_option = self._normalize_startup_model_option(stored_option)
-            except ValueError:
-                normalized_option = self._default_startup_model_option
-                self._emit_runtime_event(
-                    "startup_model_option_invalid_in_storage",
-                    level="minimal",
-                    stored_value=stored_option,
-                    fallback_startup_model_option=normalized_option,
-                )
-            else:
-                self._emit_runtime_event(
-                    "startup_model_option_loaded_from_storage",
-                    level="debug",
-                    startup_model_option=normalized_option,
-                )
-        else:
-            normalized_option = self._default_startup_model_option
-            self._emit_runtime_event(
-                "startup_model_option_defaulted",
-                level="debug",
-                startup_model_option=normalized_option,
-            )
+    def _loaded_model_ids(self) -> list[str]:
+        with self._model_lock:
+            return [self._model_id_for_kind(kind) for kind in self._models]
 
-        with self._lock:
-            self._set_startup_model_option_locked(normalized_option)
-        return normalized_option
+    def _is_model_loaded(self, model_kind: str) -> bool:
+        with self._model_lock:
+            return model_kind in self._models
 
-    def _set_speech_phase_locked(self, phase: str) -> None:
-        if self._speech_phase != phase or self._current_phase_started_at is None:
-            self._current_phase_started_at = _utc_now()
-        self._speech_phase = phase
+    def _load_model_impl(self, model_kind: str) -> Any:
+        from mlx_audio.tts.utils import load_model
 
-    def _unload_model_locked(self, model_kind: str) -> None:
-        slot = self._model_state(model_kind)
-        model = slot["model"]
-        resolved_device = slot["resolved_device"]
-        slot["model"] = None
-        slot["resolved_device"] = None
-        self._release_model_resources(model, resolved_device=resolved_device)
+        return load_model(self._model_id_for_kind(model_kind))
 
-    def _release_model_resources(self, model: Any | None, *, resolved_device: str | None) -> None:
-        del model
-
-        try:
-            import torch
-        except ImportError:
-            return
-
-        if resolved_device == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-            torch.mps.empty_cache()
-        elif (
-            resolved_device is not None
-            and resolved_device.startswith("cuda")
-            and torch.cuda.is_available()
-        ):
-            torch.cuda.empty_cache()
-
-    def _coerce_waveform(self, waveform: Any) -> Any:
-        if hasattr(waveform, "detach"):
-            waveform = waveform.detach()
-        if hasattr(waveform, "cpu"):
-            waveform = waveform.cpu()
-        if hasattr(waveform, "numpy"):
-            waveform = waveform.numpy()
-        waveform_array = np.asarray(waveform, dtype=np.float32)
-        if waveform_array.ndim > 1:
-            waveform_array = np.squeeze(waveform_array)
-        return waveform_array
-
-    def _prepare_waveform_for_output_stream(self, waveform: Any) -> np.ndarray:
-        waveform_array = np.asarray(waveform, dtype=np.float32)
-        if waveform_array.ndim == 0:
-            raise ValueError("waveform must contain at least one frame")
-        if waveform_array.ndim == 1:
-            return np.ascontiguousarray(waveform_array)
-        if waveform_array.ndim == 2:
-            return np.ascontiguousarray(waveform_array)
-        raise ValueError("waveform must be mono or multi-channel frame data")
-
-    def _waveform_channel_count(self, waveform: np.ndarray) -> int:
-        if waveform.ndim == 1:
-            return 1
-        if waveform.ndim == 2:
-            return int(waveform.shape[1])
-        raise ValueError("waveform must be mono or multi-channel frame data")
-
-    def _decode_reference_audio_file(self, reference_audio_path: str) -> tuple[np.ndarray, int]:
-        expanded_path = Path(reference_audio_path).expanduser()
-        if not expanded_path.is_file():
-            raise ValueError(f"reference audio file does not exist: {expanded_path}")
-
-        try:
-            import soundfile as sf  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise RuntimeError(
-                "soundfile is unavailable for clone reference audio decoding"
-            ) from exc
-
-        try:
-            waveform, sample_rate = sf.read(expanded_path, dtype="float32")
-        except Exception as exc:
-            raise ValueError(f"failed to read reference audio file: {expanded_path}") from exc
-
-        waveform_array = np.asarray(waveform, dtype=np.float32)
-        if waveform_array.size == 0:
-            raise ValueError(f"reference audio file is empty: {expanded_path}")
-        return waveform_array, int(sample_rate)
-
-    def _synthesize_voice_design_reference_audio(
+    def _run_speech_job(
         self,
         *,
+        mode: str,
+        model_kind: str,
         chunks: list[str],
-        voice_description: str,
         language: str,
-    ) -> tuple[np.ndarray, int]:
-        waveforms: list[np.ndarray] = []
-        expected_sample_rate: int | None = None
+        instruct: str | None = None,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
+        profile_name: str | None = None,
+    ) -> dict[str, object]:
+        if not chunks:
+            raise ValueError("Speech request did not contain any playable text chunks")
+        if not self._is_model_loaded(model_kind):
+            raise RuntimeError(self.required_models_not_loaded_message(model_kinds=[model_kind]))
 
-        for chunk in self._normalize_chunks(chunks):
-            chunk_result = self._synthesize_audio_chunk(
-                mode=VOICE_DESIGN_MODEL_KIND,
-                text=chunk,
-                language=language,
-                voice_description=voice_description,
-            )
-            waveform = self._prepare_waveform_for_output_stream(chunk_result["waveform"])
-            sample_rate = int(chunk_result["sample_rate"])
-            if expected_sample_rate is None:
-                expected_sample_rate = sample_rate
-            elif expected_sample_rate != sample_rate:
-                raise RuntimeError("voice-designed reference audio sample rate changed")
-            waveforms.append(waveform)
-
-        if not waveforms or expected_sample_rate is None:
-            raise RuntimeError("voice-design synthesis returned no audio")
-
-        if all(waveform.ndim == 1 for waveform in waveforms):
-            combined_waveform = np.concatenate(waveforms, axis=0)
-        elif all(waveform.ndim == 2 for waveform in waveforms):
-            combined_waveform = np.concatenate(waveforms, axis=0)
-        else:
-            raise RuntimeError("voice-designed reference audio channel layout changed")
-
-        self._emit_runtime_event(
-            "voice_designed_speech_profile_synthesis_completed",
-            level="minimal",
-            sample_count=int(combined_waveform.shape[0]),
-            sample_rate=expected_sample_rate,
-        )
-        return np.ascontiguousarray(combined_waveform, dtype=np.float32), expected_sample_rate
-
-    def _write_temp_reference_audio_file(
-        self,
-        *,
-        waveform: np.ndarray,
-        sample_rate: int,
-    ) -> str:
+        job_id = str(uuid.uuid4())
+        self._begin_speech_job(job_id)
         try:
-            import soundfile as sf  # type: ignore[import-untyped]
-        except ImportError as exc:
-            raise RuntimeError(
-                "soundfile is unavailable for temporary reference audio writing"
-            ) from exc
+            waveform, sample_rate = self._synthesize_chunks(
+                model_kind=model_kind,
+                chunks=chunks,
+                language=language,
+                instruct=instruct,
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+            )
+            self._play_audio(waveform, sample_rate)
+        except Exception as exc:
+            self._finish_speech_job(
+                success=False,
+                event_name="speech_job_failed",
+                error_message=(
+                    "Speech job "
+                    f"`{job_id}` failed while using `{self._model_id_for_kind(model_kind)}`. "
+                    f"Original error: {exc}"
+                ),
+            )
+            raise
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            temp_path = temp_file.name
-        sf.write(temp_path, waveform, sample_rate, subtype="FLOAT")
-        return temp_path
-
-    def _normalize_profile_name(self, name: str) -> str:
-        normalized = name.strip()
-        if not normalized:
-            raise ValueError("name must not be empty")
-        return normalized
-
-    def _speech_profile_key(self, name: str) -> str:
-        return f"profile:{name}"
-
-    async def _load_speech_profile_names(self, state_store: Any) -> list[str]:
-        result = await state_store.get(
-            key=SPEECH_PROFILE_INDEX_KEY,
-            collection=SPEECH_PROFILE_COLLECTION,
-            default=StateValue(value={"names": []}),
-        )
-        if result is None:
-            return []
-        index = StoredSpeechProfileIndex.model_validate(result.value)
-        return list(index.names)
-
-    async def _save_speech_profile_names(self, state_store: Any, names: list[str]) -> None:
-        index = StoredSpeechProfileIndex(names=sorted(names))
-        await state_store.put(
-            key=SPEECH_PROFILE_INDEX_KEY,
-            value=StateValue(value=index.model_dump(mode="json")),
-            collection=SPEECH_PROFILE_COLLECTION,
-        )
-
-    async def _save_speech_profile(self, *, state_store: Any, profile: StoredSpeechProfile) -> None:
-        await state_store.put(
-            key=self._speech_profile_key(profile.name),
-            value=StateValue(value=profile.model_dump(mode="json")),
-            collection=SPEECH_PROFILE_COLLECTION,
-        )
-
-    async def _load_speech_profile(
-        self,
-        *,
-        state_store: Any,
-        name: str,
-    ) -> StoredSpeechProfile | None:
-        result = await state_store.get(
-            key=self._speech_profile_key(name),
-            collection=SPEECH_PROFILE_COLLECTION,
-        )
-        if result is None:
-            return None
-        return StoredSpeechProfile.model_validate(result.value)
-
-    def _speech_profile_metadata(self, profile: StoredSpeechProfile) -> dict[str, Any]:
-        return {
-            "name": profile.name,
-            "clone_model_id": profile.clone_model_id,
-            "clone_mode": profile.clone_mode,
-            "created_at": profile.created_at,
-            "updated_at": profile.updated_at,
-            "reference_text_included": profile.clone_mode == "reference_text",
-            "profile_source": profile.profile_source,
-        }
-
-    async def _create_and_store_speech_profile(
-        self,
-        *,
-        state_store: Any,
-        name: str,
-        reference_audio: tuple[np.ndarray, int],
-        reference_text: str | None = None,
-        profile_source: str | None = None,
-        seed_text: str | None = None,
-        voice_description: str | None = None,
-    ) -> dict[str, Any]:
-        prompt_items = self._create_voice_clone_prompt_items(
-            reference_audio=reference_audio,
-            reference_text=reference_text,
-        )
-        now = _utc_now()
-        profile = StoredSpeechProfile(
-            name=name,
-            clone_model_id=self.clone_model_id,
-            clone_mode="reference_text" if reference_text is not None else "x_vector_only",
-            created_at=now.isoformat(),
-            updated_at=now.isoformat(),
-            prompt_items=[
-                self._serialize_voice_clone_prompt_item(prompt_item)
-                for prompt_item in prompt_items
-            ],
-            profile_source=profile_source,
-            seed_text=seed_text,
-            voice_description=voice_description,
-        )
-
-        names = await self._load_speech_profile_names(state_store)
-        names.append(name)
-        names = sorted(set(names))
-        await self._save_speech_profile(state_store=state_store, profile=profile)
-        await self._save_speech_profile_names(state_store, names)
-
-        self._speech_profile_count = len(names)
-        self._speech_profile_last_error = None
-        self._emit_runtime_event(
-            "speech_profile_created",
-            level="minimal",
-            profile_name=name,
-            clone_model_id=self.clone_model_id,
-            clone_mode=profile.clone_mode,
-            profile_source=profile.profile_source,
+        completed_at = _utc_now()
+        self._finish_speech_job(
+            success=True,
+            event_name="speech_job_completed",
+            error_message=None,
         )
         return {
             "result": "success",
-            **self._speech_profile_metadata(profile),
+            "completed": True,
+            "job_id": job_id,
+            "mode": mode,
+            "profile_name": profile_name,
+            "chunk_count": len(chunks),
+            "language": language,
+            "playback_backend": self.playback_backend,
+            "completed_at": completed_at,
+            **self.status(),
         }
 
-    def _serialize_voice_clone_prompt_item(self, prompt_item: Any) -> StoredSpeechProfilePromptItem:
-        return StoredSpeechProfilePromptItem(
-            ref_code=self._serialize_tensor(prompt_item.ref_code)
-            if prompt_item.ref_code is not None
-            else None,
-            ref_spk_embedding=self._serialize_tensor(prompt_item.ref_spk_embedding),
-            x_vector_only_mode=bool(prompt_item.x_vector_only_mode),
-            icl_mode=bool(prompt_item.icl_mode),
-            ref_text=cast(str | None, prompt_item.ref_text),
-        )
-
-    def _deserialize_voice_clone_prompt_items(
-        self,
-        prompt_items: list[StoredSpeechProfilePromptItem],
-    ) -> list[Any]:
-        from qwen_tts.inference.qwen3_tts_model import VoiceClonePromptItem  # type: ignore[import-untyped]
-
-        return [
-            VoiceClonePromptItem(
-                ref_code=self._deserialize_tensor(prompt_item.ref_code)
-                if prompt_item.ref_code is not None
-                else None,
-                ref_spk_embedding=cast(
-                    Any,
-                    self._deserialize_tensor(prompt_item.ref_spk_embedding),
-                ),
-                x_vector_only_mode=prompt_item.x_vector_only_mode,
-                icl_mode=prompt_item.icl_mode,
-                ref_text=prompt_item.ref_text,
-            )
-            for prompt_item in prompt_items
-        ]
-
-    def _serialize_tensor(self, tensor: Any) -> SerializedTensor:
-        if hasattr(tensor, "detach"):
-            tensor = tensor.detach()
-        if hasattr(tensor, "cpu"):
-            tensor = tensor.cpu()
-        if hasattr(tensor, "tolist"):
-            data = tensor.tolist()
-        else:
-            data = np.asarray(tensor).tolist()
-        dtype_name = str(getattr(tensor, "dtype", np.asarray(tensor).dtype))
-        return SerializedTensor(dtype=dtype_name, data=cast(list[Any], data))
-
-    def _deserialize_tensor(self, serialized: SerializedTensor) -> Any:
-        import torch
-
-        return torch.tensor(
-            serialized.data,
-            dtype=self._torch_dtype_from_name(serialized.dtype, torch),
-        )
-
-    def _torch_dtype_from_name(self, dtype_name: str, torch_module: Any) -> Any:
-        name = dtype_name.removeprefix("torch.")
-        if hasattr(torch_module, name):
-            return getattr(torch_module, name)
-        if name == "float32":
-            return torch_module.float32
-        if name == "float16":
-            return torch_module.float16
-        if name == "bfloat16":
-            return torch_module.bfloat16
-        if name == "int64":
-            return torch_module.int64
-        if name == "int32":
-            return torch_module.int32
-        if name == "int16":
-            return torch_module.int16
-        if name == "int8":
-            return torch_module.int8
-        if name == "uint8":
-            return torch_module.uint8
-        raise RuntimeError(f"unsupported serialized tensor dtype `{dtype_name}`")
-
-    def _create_voice_clone_prompt_items(
+    def _synthesize_chunks(
         self,
         *,
-        reference_audio: tuple[np.ndarray, int],
-        reference_text: str | None = None,
-    ) -> list[Any]:
-        with self._lock:
-            model_missing = self._model_state(CLONE_MODEL_KIND)["model"] is None
+        model_kind: str,
+        chunks: list[str],
+        language: str,
+        instruct: str | None = None,
+        ref_audio: str | None = None,
+        ref_text: str | None = None,
+    ) -> tuple[np.ndarray, int]:
+        with self._speech_lock:
+            model = self._models.get(model_kind)
+            if model is None:
+                raise RuntimeError(
+                    self.required_models_not_loaded_message(model_kinds=[model_kind])
+                )
 
-        if model_missing:
-            raise RuntimeError(
-                self.required_models_not_loaded_message(model_kinds=[CLONE_MODEL_KIND])
-            )
+            audio_chunks: list[np.ndarray] = []
+            sample_rate: int | None = None
 
-        with self._lock:
-            model = self._model_state(CLONE_MODEL_KIND)["model"]
+            for chunk in chunks:
+                results = list(
+                    model.generate(
+                        text=chunk,
+                        lang_code=language,
+                        instruct=instruct,
+                        ref_audio=ref_audio,
+                        ref_text=ref_text,
+                        verbose=False,
+                    )
+                )
+                if not results:
+                    raise RuntimeError(
+                        f"mlx-audio returned no waveform for chunk `{chunk[:40]}`. "
+                        "The model likely rejected the prompt or terminated generation early."
+                    )
 
-        assert model is not None
+                for result in results:
+                    chunk_audio = np.asarray(result.audio, dtype=np.float32)
+                    if chunk_audio.ndim != 1:
+                        chunk_audio = chunk_audio.reshape(-1)
+                    audio_chunks.append(chunk_audio)
+                    result_sample_rate = int(getattr(result, "sample_rate", 24000))
+                    sample_rate = sample_rate or result_sample_rate
 
-        def build_prompt(active_model: Any) -> list[Any]:
-            return cast(
-                list[Any],
-                active_model.create_voice_clone_prompt(
-                    ref_audio=reference_audio,
-                    ref_text=reference_text,
-                    x_vector_only_mode=reference_text is None,
-                ),
-            )
+            self._last_used_at[model_kind] = _utc_now()
+            if sample_rate is None:
+                raise RuntimeError(
+                    "mlx-audio did not report a sample rate for the generated audio"
+                )
+            return np.concatenate(audio_chunks), sample_rate
+
+    def _play_audio(self, waveform: np.ndarray, sample_rate: int) -> None:
+        if self.playback_backend == "null":
+            return
 
         try:
-            prompt_items = build_prompt(model)
+            sd.play(waveform, samplerate=sample_rate, blocking=True)
         except Exception as exc:
-            if _meta_tensor_runtime_error(exc):
-                self._emit_runtime_event(
-                    "speech_profile_prompt_retrying_with_cpu_fallback",
-                    level="minimal",
-                    error=str(exc),
-                )
-                self._reload_model_with_cpu_fallback(CLONE_MODEL_KIND)
-                with self._lock:
-                    reloaded_model = self._model_state(CLONE_MODEL_KIND)["model"]
-                if reloaded_model is None:
-                    raise RuntimeError(
-                        "CPU fallback reload completed without a clone model"
-                    ) from exc
-                prompt_items = build_prompt(reloaded_model)
-            else:
-                self._speech_profile_last_error = str(exc)
-                self._emit_runtime_event(
-                    "speech_profile_prompt_build_failed",
-                    level="minimal",
-                    error=str(exc),
-                )
-                raise
+            raise RuntimeError(
+                "Local audio playback failed while writing the generated waveform "
+                "to the output device. "
+                f"Backend=`{self.playback_backend}`, sample_rate={sample_rate}. "
+                f"Original error: {exc}"
+            ) from exc
 
-        with self._lock:
-            self._touch_model_locked(CLONE_MODEL_KIND)
-        return prompt_items
+    def _begin_speech_job(self, job_id: str) -> None:
+        with self._status_lock:
+            self._speech_in_progress = True
+            self._speech_phase = "synthesizing"
+            self._speech_current_job_id = job_id
+            self._speech_last_error = None
+        self._record_event("speech_job_started", job_id=job_id)
 
-    def _open_output_stream(
+    def _finish_speech_job(
         self,
         *,
-        sample_rate: int,
-        channel_count: int,
-    ) -> sd.OutputStream:
-        stream = sd.OutputStream(
-            samplerate=sample_rate,
-            channels=channel_count,
-            dtype="float32",
-            latency=self.output_stream_latency,
-        )
-        stream.start()
-        return stream
+        success: bool,
+        event_name: str,
+        error_message: str | None,
+    ) -> None:
+        with self._status_lock:
+            self._speech_in_progress = False
+            self._speech_phase = "idle"
+            self._speech_current_job_id = None
+            self._speech_last_error = error_message
+            if success:
+                self._speech_jobs_completed += 1
+            else:
+                self._speech_jobs_failed += 1
+        self._record_event(event_name, error=error_message)
 
-    def _write_output_stream_chunk(
-        self,
-        stream: sd.OutputStream,
-        waveform: np.ndarray,
-    ) -> bool:
-        underflowed = stream.write(waveform)
-        return bool(underflowed)
+    def _record_event(self, event_name: str, **fields: object) -> None:
+        timestamp = _utc_now()
+        event = {"event": event_name, "timestamp": timestamp, **fields}
+        with self._status_lock:
+            self._speech_last_event = event_name
+            self._speech_last_event_at = timestamp
+            self._recent_events.append(event)
+
+    def _validated_reference_audio_path(self, raw_path: str) -> Path:
+        path = Path(raw_path.strip()).expanduser().resolve()
+        if not path.exists():
+            raise ValueError(f"Reference audio file `{path}` does not exist on disk")
+        if not path.is_file():
+            raise ValueError(f"Reference audio path `{path}` is not a regular file")
+        return path
+
+    async def _get_profile(self, state_store: Any, name: str) -> SpeechProfile | None:
+        payload = await state_store.get(name, collection=PROFILE_COLLECTION, default=None)
+        if payload is None:
+            return None
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"Speech profile `{name}` has unreadable state-store data and cannot be loaded"
+            )
+        return SpeechProfile(**payload)
+
+    async def _put_profile(self, state_store: Any, profile: SpeechProfile) -> None:
+        await state_store.put(profile.name, asdict(profile), collection=PROFILE_COLLECTION)
+
+    async def _list_profiles(self, state_store: Any) -> list[SpeechProfile]:
+        profiles: list[SpeechProfile] = []
+        metadata_dir = self.state_dir / "metadata"
+        if not metadata_dir.exists():
+            values = getattr(state_store, "values", None)
+            if isinstance(values, dict):
+                for (key, collection), payload in values.items():
+                    if collection != PROFILE_COLLECTION or not isinstance(key, str):
+                        continue
+                    if isinstance(payload, dict):
+                        profiles.append(SpeechProfile(**payload))
+            return profiles
+
+        for metadata_path in sorted(metadata_dir.glob("*.json")):
+            try:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+
+            if metadata.get("collection") != PROFILE_COLLECTION:
+                continue
+
+            key = metadata.get("key")
+            if not isinstance(key, str):
+                continue
+
+            profile = await self._get_profile(state_store, key)
+            if profile is not None:
+                profiles.append(profile)
+
+        return profiles
+
+
+# MARK: Environment Helpers
+
+def _env_bool(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean-like value such as true or false")
+
+
+def _env_positive_int(name: str, *, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return value
+
+
+def _env_state_dir(raw: str | None) -> Path:
+    value = (raw or str(DEFAULT_STATE_DIR)).strip()
+    if not value:
+        raise ValueError("SPEAK_TO_USER_STATE_DIR must not be empty")
+    return Path(value).expanduser().resolve()
+
+
+def _env_playback_backend(raw: str) -> PlaybackBackend:
+    normalized = raw.strip().lower()
+    if normalized not in {"sounddevice", "null"}:
+        raise ValueError("SPEAK_TO_USER_PLAYBACK_BACKEND must be `sounddevice` or `null`")
+    return cast(PlaybackBackend, normalized)
+
+
+def _normalize_profile_name(name: str) -> str:
+    normalized = name.strip()
+    if not normalized:
+        raise ValueError("Profile name must not be empty")
+    if "/" in normalized or "\\" in normalized:
+        raise ValueError("Profile name must not contain path separators")
+    return normalized
+
+
+def _utc_now() -> str:
+    return dt.datetime.now(dt.UTC).isoformat()

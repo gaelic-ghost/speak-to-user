@@ -1,3 +1,7 @@
+from __future__ import annotations
+
+# MARK: Imports
+
 from dataclasses import dataclass
 import json
 import os
@@ -13,29 +17,33 @@ from fastmcp.dependencies import CurrentContext
 from fastmcp.server.lifespan import lifespan
 from key_value.aio.stores.filetree.store import FileTreeStore
 
+from app.prompts import (
+    choose_speak_to_user_workflow_prompt as choose_speak_to_user_workflow_prompt_tool,
+    guide_speech_profile_workflow_prompt as guide_speech_profile_workflow_prompt_tool,
+)
+from app.resources import (
+    speech_profiles_resource as speech_profiles_resource_tool,
+    status_resource as status_resource_tool,
+    usage_guide_resource as usage_guide_resource_tool,
+)
 from app.runtime import TTSRuntime
 from app.tools import (
-    choose_speak_to_user_workflow_prompt as choose_speak_to_user_workflow_prompt_tool,
     delete_speech_profile as delete_speech_profile_tool,
     generate_speech_profile as generate_speech_profile_tool,
     generate_speech_profile_from_voice_design as generate_speech_profile_from_voice_design_tool,
-    guide_speech_profile_workflow_prompt as guide_speech_profile_workflow_prompt_tool,
     health_payload,
     load_model as load_model_tool,
     list_speech_profiles as list_speech_profiles_tool,
     speak_text as speak_text_tool,
     speak_text_as_clone as speak_text_as_clone_tool,
-    speech_profiles_resource as speech_profiles_resource_tool,
     speak_with_profile as speak_with_profile_tool,
-    status_resource as status_resource_tool,
     set_startup_model as set_startup_model_tool,
     tts_status as tts_status_tool,
     unload_model as unload_model_tool,
-    usage_guide_resource as usage_guide_resource_tool,
 )
 
 
-# MARK: Server Configuration
+# MARK: Path Bootstrap
 
 DEFAULT_HTTP_HOST = "127.0.0.1"
 DEFAULT_HTTP_PORT = 8765
@@ -55,6 +63,8 @@ LEGACY_DEFAULT_STATE_DIR = (
     / "state"
 )
 
+
+# MARK: Server Configuration
 
 @dataclass(frozen=True, slots=True)
 class ServerConfig:
@@ -204,6 +214,8 @@ def server_config_from_env() -> ServerConfig:
     )
 
 
+# MARK: MCP App Lifecycle
+
 @lifespan
 async def app_lifespan(_server: FastMCP):
     runtime = TTSRuntime.from_env()
@@ -214,6 +226,8 @@ async def app_lifespan(_server: FastMCP):
         runtime.shutdown()
 
 
+# MARK: MCP Server
+
 current_context = CurrentContext()
 mcp = FastMCP(
     "speak-to-user",
@@ -222,11 +236,15 @@ mcp = FastMCP(
 )
 
 
+# MARK: Utility Tooling
+
 @mcp.tool
 def health() -> dict[str, str]:
     """Return a lightweight health payload for smoke testing."""
     return health_payload()
 
+
+# MARK: Prompts
 
 @mcp.prompt
 def choose_speak_to_user_workflow() -> str:
@@ -239,6 +257,8 @@ def guide_speech_profile_workflow() -> str:
     """Guide an agent through profile creation and reuse decisions."""
     return guide_speech_profile_workflow_prompt_tool()
 
+
+# MARK: Resources
 
 @mcp.resource("guide://speak-to-user/usage")
 def usage_guide() -> str:
@@ -257,6 +277,8 @@ async def speech_profiles_resource(ctx: Context = current_context) -> str:
     """Provide a read-only saved-profile summary for agents."""
     return await speech_profiles_resource_tool(ctx)
 
+
+# MARK: Profile Tools
 
 @mcp.tool
 async def generate_speech_profile(
@@ -310,6 +332,8 @@ async def delete_speech_profile(
     )
 
 
+# MARK: Model Tools
+
 @mcp.tool
 def tts_status(ctx: Context = current_context) -> dict[str, object]:
     """Return current TTS runtime state."""
@@ -351,6 +375,8 @@ async def set_startup_model(
         option=option,
     )
 
+
+# MARK: Speech Tools
 
 @mcp.tool
 async def speak_text(
@@ -401,6 +427,8 @@ async def speak_with_profile(
         language=language,
     )
 
+
+# MARK: Entrypoint
 
 def main() -> None:
     config = server_config_from_env()

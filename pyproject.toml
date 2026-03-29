@@ -7,11 +7,10 @@ license = { file = "LICENSE" }
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "fastmcp>=3.1.0",
-    "qwen-tts",
-    "sounddevice>=0.5.5",
+    "mlx-audio[tts]>=0.3.0",
+    "numpy>=1.26.4",
+    "sounddevice==0.5.3",
     "soundfile>=0.13.1",
-    "torch>=2.10.0",
-    "transformers==4.57.3",
 ]
 
 [dependency-groups]
@@ -44,5 +43,5 @@ check_untyped_defs = true
 no_implicit_optional = true
 
 [[tool.mypy.overrides]]
-module = ["qwen_tts", "sounddevice", "soundfile"]
+module = ["mlx_audio", "mlx_audio.*", "sounddevice", "soundfile"]
 ignore_missing_imports = true
