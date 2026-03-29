@@ -26,7 +26,11 @@ from app.resources import (
     status_resource as status_resource_tool,
     usage_guide_resource as usage_guide_resource_tool,
 )
-from app.runtime import TTSRuntime
+from app.runtime import (
+    DEFAULT_CLONE_MODEL_ID,
+    DEFAULT_VOICE_DESIGN_MODEL_ID,
+    TTSRuntime,
+)
 from app.tools import (
     delete_speech_profile as delete_speech_profile_tool,
     generate_speech_profile as generate_speech_profile_tool,
@@ -72,6 +76,8 @@ class ServerConfig:
     port: int
     path: str
     state_dir: Path
+    voice_design_model_id: str
+    clone_model_id: str
 
 
 def _normalize_http_host(value: str) -> str:
@@ -206,11 +212,22 @@ def state_store_from_env() -> FileTreeStore:
 
 
 def server_config_from_env() -> ServerConfig:
+    state_dir = _resolved_runtime_state_dir()
     return ServerConfig(
         host=_normalize_http_host(os.getenv("SPEAK_TO_USER_HOST", DEFAULT_HTTP_HOST)),
         port=_normalize_http_port(os.getenv("SPEAK_TO_USER_PORT")),
         path=_normalize_http_path(os.getenv("SPEAK_TO_USER_MCP_PATH", DEFAULT_HTTP_PATH)),
-        state_dir=_normalize_state_dir(os.getenv("SPEAK_TO_USER_STATE_DIR")),
+        state_dir=state_dir,
+        voice_design_model_id=os.getenv(
+            "SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID",
+            DEFAULT_VOICE_DESIGN_MODEL_ID,
+        ).strip()
+        or DEFAULT_VOICE_DESIGN_MODEL_ID,
+        clone_model_id=os.getenv(
+            "SPEAK_TO_USER_CLONE_MODEL_ID",
+            DEFAULT_CLONE_MODEL_ID,
+        ).strip()
+        or DEFAULT_CLONE_MODEL_ID,
     )
 
 
@@ -218,7 +235,12 @@ def server_config_from_env() -> ServerConfig:
 
 @lifespan
 async def app_lifespan(_server: FastMCP):
-    runtime = TTSRuntime.from_env()
+    config = server_config_from_env()
+    runtime = TTSRuntime(
+        voice_design_model_id=config.voice_design_model_id,
+        clone_model_id=config.clone_model_id,
+        profiles_dir=config.state_dir / "profile_audio",
+    )
     await runtime.preload(state_store=_server._state_store)
     try:
         yield {"runtime": runtime}

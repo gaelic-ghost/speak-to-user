@@ -9,7 +9,6 @@ from typing import Any, cast
 from fastmcp import Context
 
 from app.runtime import TTSRuntime
-from app.text_chunking import chunk_text_for_tts
 
 
 # MARK: Context Helpers
@@ -124,9 +123,6 @@ async def speak_text(
     language: str = "en",
 ) -> dict[str, object]:
     runtime = _runtime_from_context(ctx)
-    normalized_text = text.strip()
-    if not normalized_text:
-        raise ValueError("text must not be empty")
     await _ensure_required_models_loaded(
         ctx,
         model_kinds=["voice_design"],
@@ -135,7 +131,7 @@ async def speak_text(
 
     return await asyncio.to_thread(
         runtime.speak_text,
-        chunks=chunk_text_for_tts(normalized_text, max_chars=runtime.tts_chunk_max_chars),
+        text=text,
         voice_description=voice_description,
         language=language,
     )
@@ -150,10 +146,6 @@ async def speak_text_as_clone(
     language: str = "en",
 ) -> dict[str, object]:
     runtime = _runtime_from_context(ctx)
-    normalized_text = text.strip()
-    if not normalized_text:
-        raise ValueError("text must not be empty")
-
     normalized_reference_audio_path = reference_audio_path.strip()
     if not normalized_reference_audio_path:
         raise ValueError("reference_audio_path must not be empty")
@@ -165,7 +157,7 @@ async def speak_text_as_clone(
 
     return await asyncio.to_thread(
         runtime.speak_text_as_clone,
-        chunks=chunk_text_for_tts(normalized_text, max_chars=runtime.tts_chunk_max_chars),
+        text=text,
         reference_audio_path=normalized_reference_audio_path,
         reference_text=reference_text,
         language=language,
@@ -252,23 +244,14 @@ async def speak_with_profile(
     language: str = "en",
 ) -> dict[str, object]:
     runtime = _runtime_from_context(ctx)
-    normalized_text = text.strip()
-    if not normalized_text:
-        raise ValueError("text must not be empty")
     await _ensure_required_models_loaded(
         ctx,
         model_kinds=["clone"],
         operation_name="speak_with_profile",
     )
-
-    profile = await runtime.resolve_profile(
+    return await runtime.speak_with_profile(
         state_store=_state_store_from_context(ctx),
         name=name,
-    )
-    return await asyncio.to_thread(
-        runtime.speak_with_profile,
-        name=name,
-        profile=profile,
-        chunks=chunk_text_for_tts(normalized_text, max_chars=runtime.tts_chunk_max_chars),
+        text=text,
         language=language,
     )

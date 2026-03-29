@@ -15,7 +15,7 @@ class StubRuntime:
     def status(self) -> dict[str, object]:
         return {
             "ready": True,
-            "playback_backend": "null",
+            "profiles_dir": "/tmp/profiles",
             "voice_design_model_id": "mlx/test-voice-design",
             "clone_model_id": "mlx/test-clone",
             "speech_in_progress": False,
@@ -50,6 +50,8 @@ def test_server_config_from_env_normalizes_values(monkeypatch) -> None:
     monkeypatch.setenv("SPEAK_TO_USER_PORT", "8766")
     monkeypatch.setenv("SPEAK_TO_USER_MCP_PATH", "custom")
     monkeypatch.setenv("SPEAK_TO_USER_STATE_DIR", "~/tmp/speak-to-user-state")
+    monkeypatch.setenv("SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID", "mlx/voice")
+    monkeypatch.setenv("SPEAK_TO_USER_CLONE_MODEL_ID", "mlx/clone")
 
     config = server.server_config_from_env()
 
@@ -57,6 +59,8 @@ def test_server_config_from_env_normalizes_values(monkeypatch) -> None:
     assert config.port == 8766
     assert config.path == "/custom"
     assert config.state_dir == Path("~/tmp/speak-to-user-state").expanduser().resolve()
+    assert config.voice_design_model_id == "mlx/voice"
+    assert config.clone_model_id == "mlx/clone"
 
 
 def test_usage_guide_mentions_profile_workflow() -> None:
@@ -70,7 +74,7 @@ def test_status_resource_returns_runtime_snapshot() -> None:
     payload = json.loads(server.status_resource(cast(Any, StubContext())))
 
     assert payload["ready"] is True
-    assert payload["playback_backend"] == "null"
+    assert payload["profiles_dir"] == "/tmp/profiles"
 
 
 def test_speech_profiles_resource_returns_json() -> None:

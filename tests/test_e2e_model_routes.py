@@ -113,10 +113,7 @@ class ManagedE2EServer:
                 "SPEAK_TO_USER_HOST": self.host,
                 "SPEAK_TO_USER_PORT": str(self.port),
                 "SPEAK_TO_USER_MCP_PATH": self.path,
-                "SPEAK_TO_USER_PLAYBACK_BACKEND": "null",
                 "SPEAK_TO_USER_STATE_DIR": str(self.state_dir),
-                "SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL": "true",
-                "SPEAK_TO_USER_ENABLE_CLONE_MODEL": "true",
             }
         )
 
@@ -250,7 +247,6 @@ def test_http_guidance_and_status_surface(managed_server: ManagedE2EServer) -> N
 
             status_payload = await _call_tool_payload(client, "tts_status")
             assert status_payload["ready"] is True
-            assert status_payload["playback_backend"] == "null"
             assert status_payload["startup_model_option"] == "all"
             assert set(cast(list[str], status_payload["loaded_model_ids"])) == {
                 cast(str, status_payload["voice_design_model_id"]),

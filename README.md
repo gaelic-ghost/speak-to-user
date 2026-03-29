@@ -2,20 +2,20 @@
 
 `speak-to-user` is a local [FastMCP](https://gofastmcp.com/) server that turns agent replies into spoken audio on Gale's Mac.
 
-This rewrite uses [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) as the synthesis runtime instead of the older `qwen-tts` stack. The repo stays intentionally small: two resident model lanes, direct playback, and file-backed reusable profiles.
+This rewrite uses [`mlx-audio`](https://github.com/Blaizzy/mlx-audio) as the synthesis runtime instead of the older `qwen-tts` stack. The repo stays intentionally small: two resident model lanes, direct playback, and reusable profile artifacts stored in FastMCP state.
 
 ## Runtime Model Roles
 
 - `speak_text` uses a voice-design model for normal narrated replies driven by `voice_description`.
 - `speak_text_as_clone` uses a clone-capable model for one-off reference-audio cloning.
-- `generate_speech_profile` stores a reusable local reference clip for repeated clone playback.
-- `generate_speech_profile_from_voice_design` creates a short synthetic seed clip first, then stores that clip as a reusable profile source.
-- `speak_with_profile` reuses a saved profile without resupplying the original clip on every request.
+- `generate_speech_profile` stores a reusable clone-conditioning artifact for repeated playback.
+- `generate_speech_profile_from_voice_design` creates a short synthetic seed clip first, then stores a reusable clone-conditioning artifact derived from that clip.
+- `speak_with_profile` reuses a saved profile without rebuilding clone conditioning from the original clip on every request.
 
 Default model ids:
 
 - voice design: `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`
-- clone: `mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-6bit`
+- clone: `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit`
 
 Both are configurable through environment variables.
 
@@ -51,9 +51,9 @@ Resources:
 
 - Playback is global and serial across connected clients.
 - `speak_text`, `speak_text_as_clone`, and `speak_with_profile` chunk long text before synthesis.
-- Profiles are persisted as metadata plus local audio files under the configured state directory.
+- Profiles are persisted as reusable clone-conditioning artifacts in the configured state store.
 - The runtime keeps model loading explicit. If a required model is missing, the MCP tool can ask whether it should be loaded before retrying.
-- The only supported playback backends are `sounddevice` and `null`.
+- Local playback uses `sounddevice`.
 
 ## Requirements
 
@@ -86,17 +86,10 @@ By default the MCP endpoint is served at `http://127.0.0.1:8765/mcp`.
 
 ## Configuration
 
-- `SPEAK_TO_USER_ENABLE_VOICE_DESIGN_MODEL`
-  Default: `true`
-- `SPEAK_TO_USER_ENABLE_CLONE_MODEL`
-  Default: `true`
 - `SPEAK_TO_USER_VOICE_DESIGN_MODEL_ID`
   Default: `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16`
 - `SPEAK_TO_USER_CLONE_MODEL_ID`
-  Default: `mlx-community/Qwen3-TTS-12Hz-0.6B-CustomVoice-6bit`
-- `SPEAK_TO_USER_PLAYBACK_BACKEND`
-  Allowed values: `sounddevice`, `null`
-  Default: `sounddevice`
+  Default: `mlx-community/Qwen3-TTS-12Hz-0.6B-Base-4bit`
 - `SPEAK_TO_USER_HOST`
   Default: `127.0.0.1`
 - `SPEAK_TO_USER_PORT`
@@ -105,8 +98,6 @@ By default the MCP endpoint is served at `http://127.0.0.1:8765/mcp`.
   Default: `/mcp`
 - `SPEAK_TO_USER_STATE_DIR`
   Default: `~/.local/gaelic-ghost/speak-to-user/profiles`
-- `SPEAK_TO_USER_TTS_CHUNK_MAX_CHARS`
-  Default: `160`
 
 ## Validation
 
