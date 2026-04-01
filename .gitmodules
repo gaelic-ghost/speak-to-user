@@ -1,0 +1,3 @@
+[submodule "packages/SpeakSwiftly"]
+	path = packages/SpeakSwiftly
+	url = https://github.com/gaelic-ghost/SpeakSwiftly.git
