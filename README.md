@@ -26,6 +26,8 @@ That means the expected workflow is:
 
 - develop `SpeakSwiftly` in its standalone repository first
 - push changes to the `SpeakSwiftly` remote
-- update the `packages/SpeakSwiftly` submodule pointer here when `speak-to-user` is ready to adopt a newer revision
+- cut or use a tagged `SpeakSwiftly` release when `speak-to-user` is ready to adopt a newer revision
+- update the `packages/SpeakSwiftly` submodule pointer here on a branch and land that bump through a pull request against the monorepo
+- use tagged releases for the monorepo itself when publishing umbrella milestones or coordinated workspace states
 
 This keeps `SpeakSwiftly` independently versioned while still letting `speak-to-user` pin an exact commit.
