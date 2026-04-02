@@ -1,3 +1,6 @@
 [submodule "packages/SpeakSwiftly"]
 	path = packages/SpeakSwiftly
 	url = https://github.com/gaelic-ghost/SpeakSwiftly.git
+[submodule "apps/speak-to-user-server"]
+	path = apps/speak-to-user-server
+	url = https://github.com/gaelic-ghost/speak-to-user-server.git
