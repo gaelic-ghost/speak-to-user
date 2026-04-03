@@ -6,6 +6,8 @@
 - Keep umbrella documentation here focused on pinned submodules, workspace structure, operating model, and cross-repository roadmap planning.
 - Do not let umbrella docs imply that a planned app, package, extension, plugin, or service already lives in this repository when it is still only a sibling repo or a roadmap item.
 - When a workspace component is still external to this monorepo, name that boundary explicitly in the docs.
+- Treat `mcps/` as the umbrella home for vendored MCP service repositories.
+- Treat `apps/` as the umbrella home for end-user apps, service hosts, and future interactive app surfaces such as MCP Apps.
 
 ## Checkout discipline
 
@@ -27,6 +29,7 @@
   - future roadmap items that do not exist as repositories or products yet
 - Treat the umbrella `ROADMAP.md` as the home for cross-repository milestones such as distribution tracks, app adoption, plugin surfaces, extensions, and feedback systems.
 - Now that `apps/SayBar` is vendored here, describe it as a current app submodule and keep deeper app implementation guidance in the standalone SayBar repository.
+- When documenting the top-level workspace shape, explain why a component lives under `packages/`, `mcps/`, or `apps/` instead of leaving that split implicit.
 
 ## Submodules
 

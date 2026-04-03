@@ -25,6 +25,7 @@ Today the workspace is intentionally small:
 - `packages/SpeakSwiftly` is the pinned speech runtime package submodule.
 - `packages/SpeakSwiftlyMCP` is the pinned Swift-native MCP host package submodule.
 - `apps/SayBar` is the pinned macOS menu bar app submodule.
+- `mcps/speak-to-user-dev` is the pinned FastMCP coordinator submodule for serialized local dev chores across the workspace.
 - `apps/speak-to-user-mcp` is the pinned Python MCP host submodule.
 - `apps/speak-to-user-server` is the pinned Python HTTP host submodule.
 
@@ -40,8 +41,9 @@ git submodule update --init --recursive
 
 That is the only required top-level setup command today. Each submodule keeps its own setup and verification instructions in its own repository documentation:
 
-- [`packages/SpeakSwiftly/README.md`](packages/SpeakSwiftly/README.md)
 - [`apps/SayBar/README.md`](apps/SayBar/README.md)
+- [`mcps/speak-to-user-dev/README.md`](mcps/speak-to-user-dev/README.md)
+- [`packages/SpeakSwiftly/README.md`](packages/SpeakSwiftly/README.md)
 - [`apps/speak-to-user-mcp/README.md`](apps/speak-to-user-mcp/README.md)
 - [`apps/speak-to-user-server/README.md`](apps/speak-to-user-server/README.md)
 
@@ -59,7 +61,8 @@ If you want to run code, build the runtime, or start a local service, use the re
 
 The intended top-level structure is:
 
-- `apps/` for end-user apps and service hosts
+- `apps/` for end-user apps, service hosts, and future interactive app surfaces such as MCP Apps
+- `mcps/` for vendored MCP service repositories that remain standalone source-of-truth service projects
 - `packages/` for reusable runtime or library dependencies
 - `skills/` for skill-related workspace assets
 - `docs/` for umbrella documentation
@@ -73,6 +76,8 @@ Current pinned workspace components:
   - Swift package submodule for the Swift-native MCP host track
 - `apps/SayBar`
   - macOS `MenuBarExtra` app submodule pinned to the standalone SayBar repository for app-level UI, settings, and service supervision work
+- `mcps/speak-to-user-dev`
+  - Python FastMCP coordinator submodule for serial local-dev workflows such as heavy e2e runs, docs sweeps, and submodule pin orchestration
 - `apps/speak-to-user-mcp`
   - Python FastMCP host submodule for spoken replies and local MCP access
 - `apps/speak-to-user-server`
@@ -80,6 +85,8 @@ Current pinned workspace components:
 
 Planned or sibling components that the umbrella roadmap also tracks:
 
+- future OpenAI MCP App surfaces
+  - interactive app UIs that may sit on top of the vendored MCP services while still living under `apps/`
 - `SpeakSwiftlyMCP`
   - the Swift-native MCP-host package sibling to the current Python MCP server
 - `SpeakSwiftlyServer`
@@ -91,6 +98,7 @@ Treat this repository as the integration and planning layer, not as the source o
 
 - Keep the clean base checkout on `main` and do feature work in fresh worktrees.
 - Update submodule pointers narrowly and intentionally.
+- Keep vendored MCP services under `mcps/` and reserve `apps/` for interactive app surfaces and service hosts.
 - Keep umbrella docs explicit about what is already vendored here versus what is still a sibling repository or planned future addition.
 - Do not let umbrella documentation imply that a planned distribution surface already exists when it is only a roadmap item.
 - Keep implementation-specific setup, build, and test instructions in the relevant submodule repositories.

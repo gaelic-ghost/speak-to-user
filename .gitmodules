@@ -16,3 +16,6 @@
 [submodule "apps/SayBar"]
 	path = apps/SayBar
 	url = https://github.com/gaelic-ghost/SayBar.git
+[submodule "mcps/speak-to-user-dev"]
+	path = mcps/speak-to-user-dev
+	url = https://github.com/gaelic-ghost/speak-to-user-dev.git
