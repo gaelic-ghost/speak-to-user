@@ -1,53 +1,111 @@
 # speak-to-user
 
-This repository is the larger umbrella workspace for apps, packages, skills, docs, and vendor code that support local speech and user-facing accessibility tooling.
+Umbrella repository for Gale's local-first speech tooling workspace across reusable runtime packages, local HTTP and MCP hosts, skills, app integrations, and future distribution surfaces.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Setup](#setup)
+- [Usage](#usage)
+- [Repository Layout](#repository-layout)
+- [Development](#development)
+- [Verification](#verification)
+- [License](#license)
+
+## Overview
+
+This repository is the integration and planning home for the broader `speak-to-user` workspace. It keeps the current source-of-truth runtime pieces pinned together while leaving room for future app, extension, plugin, and distribution work that spans multiple repositories.
+
+### Motivation
+
+The goal is to keep the accessibility stack coherent without forcing every integration decision into one codebase too early. `SpeakSwiftly` can stay independently versioned as the speech runtime, the current Python hosts can keep shipping while Swift-native siblings evolve, and the umbrella repository can track how those pieces are intended to fit together over time.
+
+Today the workspace is intentionally small:
+
+- `packages/SpeakSwiftly` is the pinned speech runtime package submodule.
+- `packages/SpeakSwiftlyMCP` is the pinned Swift-native MCP host package submodule.
+- `apps/speak-to-user-mcp` is the pinned Python MCP host submodule.
+- `apps/speak-to-user-server` is the pinned Python HTTP host submodule.
+
+The roadmap also tracks planned sibling or future workspace additions that are not yet vendored here, including `SayBar`, Swift-native server and MCP packages, editor integrations, browser surfaces, plugin distribution, and broader app distribution work.
+
+## Setup
+
+Initialize or refresh the current pinned workspace components:
+
+```bash
+git submodule update --init --recursive
+```
+
+That is the only required top-level setup command today. Each submodule keeps its own setup and verification instructions in its own repository documentation:
+
+- [`packages/SpeakSwiftly/README.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/packages/SpeakSwiftly/README.md)
+- [`apps/speak-to-user-mcp/README.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/apps/speak-to-user-mcp/README.md)
+- [`apps/speak-to-user-server/README.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/apps/speak-to-user-server/README.md)
+
+## Usage
+
+This repository is not a single runnable app or package. Its current role is:
+
+- pinning the active submodule revisions used together
+- documenting the workspace shape and future integration intent
+- landing submodule bumps and umbrella documentation changes through pull requests
+
+If you want to run code, build the runtime, or start a local service, use the relevant submodule's README instead of treating the umbrella repository itself as the executable entrypoint.
 
 ## Repository Layout
 
 The intended top-level structure is:
 
-- `apps/` for application entry points and host apps
-- `packages/` for reusable package dependencies consumed by the larger workspace
-- `skills/` for skill-related work
-- `docs/` for repository documentation
-- `vendor/` for vendored third-party or external code when needed
+- `apps/` for end-user apps and service hosts
+- `packages/` for reusable runtime or library dependencies
+- `skills/` for skill-related workspace assets
+- `docs/` for umbrella documentation
+- `vendor/` for vendored external code when needed
 
-## SpeakSwiftly
+Current pinned workspace components:
 
-`SpeakSwiftly` should live in this repository as a Git submodule at:
+- `packages/SpeakSwiftly`
+  - Swift package submodule for the speech runtime and typed `SpeakSwiftlyCore` library surface
+- `packages/SpeakSwiftlyMCP`
+  - Swift package submodule for the Swift-native MCP host track
+- `apps/speak-to-user-mcp`
+  - Python FastMCP host submodule for spoken replies and local MCP access
+- `apps/speak-to-user-server`
+  - Python FastAPI host submodule for app-friendly local HTTP access
 
-```text
-packages/SpeakSwiftly
-```
+Planned or sibling components that the umbrella roadmap also tracks:
 
-The source of truth for `SpeakSwiftly` remains its own standalone repository. The submodule in `speak-to-user` is the integration copy used by the larger workspace.
+- `SayBar`
+  - the macOS menu bar app intended to supervise local speech services
+- `SpeakSwiftlyMCP`
+  - the Swift-native MCP-host package sibling to the current Python MCP server
+- `SpeakSwiftlyServer`
+  - the Swift-native localhost HTTP server sibling to the current Python HTTP server
 
-That means the expected workflow is:
+## Development
 
-- develop `SpeakSwiftly` in its standalone repository first
-- push changes to the `SpeakSwiftly` remote
-- cut or use a tagged `SpeakSwiftly` release when `speak-to-user` is ready to adopt a newer revision
-- update the `packages/SpeakSwiftly` submodule pointer here on a branch and land that bump through a pull request against the monorepo
-- use tagged releases for the monorepo itself when publishing umbrella milestones or coordinated workspace states
+Treat this repository as the integration and planning layer, not as the source of truth for every implementation detail.
 
-This keeps `SpeakSwiftly` independently versioned while still letting `speak-to-user` pin an exact commit.
+- Keep the clean base checkout on `main` and do feature work in fresh worktrees.
+- Update submodule pointers narrowly and intentionally.
+- Keep umbrella docs explicit about what is already vendored here versus what is still a sibling repository or planned future addition.
+- Do not let umbrella documentation imply that a planned distribution surface already exists when it is only a roadmap item.
+- Keep implementation-specific setup, build, and test instructions in the relevant submodule repositories.
 
-## SpeakSwiftlyMCP
+The umbrella roadmap in [`ROADMAP.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/ROADMAP.md) tracks both current integration work and the larger slate of future distribution surfaces, including package distribution, apps, plugins, extensions, MCP Apps, and feedback tooling.
 
-`SpeakSwiftlyMCP` should live in this repository as a Git submodule at:
+## Verification
 
-```text
-packages/SpeakSwiftlyMCP
-```
+The practical top-level verification loop is:
 
-The source of truth for `SpeakSwiftlyMCP` remains its own standalone repository. The submodule in `speak-to-user` is the integration copy used by the larger workspace.
+1. Confirm the umbrella checkout is clean and on the intended branch.
+2. Run `git submodule update --init --recursive` and confirm the pinned components resolve successfully.
+3. Review the current submodule pointers and the umbrella docs together before landing workspace-level changes.
+4. Run the implementation-specific verification commands inside the affected submodule repositories when a change touches them.
 
-That means the expected workflow is:
+This repository does not currently define a single top-level build, test, or lint command because the workspace is made up of independently verified submodules.
 
-- develop `SpeakSwiftlyMCP` in its standalone repository first
-- push changes to the `SpeakSwiftlyMCP` remote
-- cut or use a tagged `SpeakSwiftlyMCP` release when `speak-to-user` is ready to adopt a newer revision
-- update the `packages/SpeakSwiftlyMCP` submodule pointer here on a branch and land that bump through a pull request against the monorepo
-- use tagged releases for the monorepo itself when publishing umbrella milestones or coordinated workspace states
+## License
 
-This keeps `SpeakSwiftlyMCP` independently versioned while still letting `speak-to-user` pin an exact commit.
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
