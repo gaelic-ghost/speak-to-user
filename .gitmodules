@@ -7,3 +7,6 @@
 [submodule "apps/speak-to-user-mcp"]
 	path = apps/speak-to-user-mcp
 	url = https://github.com/gaelic-ghost/speak-to-user-mcp.git
+[submodule "packages/SpeakSwiftlyMCP"]
+	path = packages/SpeakSwiftlyMCP
+	url = https://github.com/gaelic-ghost/SpeakSwiftlyMCP.git
