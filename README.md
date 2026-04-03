@@ -31,3 +31,23 @@ That means the expected workflow is:
 - use tagged releases for the monorepo itself when publishing umbrella milestones or coordinated workspace states
 
 This keeps `SpeakSwiftly` independently versioned while still letting `speak-to-user` pin an exact commit.
+
+## SpeakSwiftlyMCP
+
+`SpeakSwiftlyMCP` should live in this repository as a Git submodule at:
+
+```text
+packages/SpeakSwiftlyMCP
+```
+
+The source of truth for `SpeakSwiftlyMCP` remains its own standalone repository. The submodule in `speak-to-user` is the integration copy used by the larger workspace.
+
+That means the expected workflow is:
+
+- develop `SpeakSwiftlyMCP` in its standalone repository first
+- push changes to the `SpeakSwiftlyMCP` remote
+- cut or use a tagged `SpeakSwiftlyMCP` release when `speak-to-user` is ready to adopt a newer revision
+- update the `packages/SpeakSwiftlyMCP` submodule pointer here on a branch and land that bump through a pull request against the monorepo
+- use tagged releases for the monorepo itself when publishing umbrella milestones or coordinated workspace states
+
+This keeps `SpeakSwiftlyMCP` independently versioned while still letting `speak-to-user` pin an exact commit.
