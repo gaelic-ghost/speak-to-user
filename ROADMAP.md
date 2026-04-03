@@ -21,15 +21,17 @@
 - [ ] Milestone 4: Bring `SayBar` into the umbrella workspace
 - [ ] Milestone 5: macOS distribution for `SayBar.app`
 - [ ] Milestone 6: Python package distribution for `speak-to-user-mcp` and `speak-to-user-server`
-- [ ] Milestone 7: Agent-skills slate planning
-- [ ] Milestone 8: Codex and Claude plugin distribution for skills and MCPs
-- [ ] Milestone 9: MCP Apps for the MCP services
-- [ ] Milestone 10: XcodeKit extension and Xcode build plugins
-- [ ] Milestone 11: Zed extension
-- [ ] Milestone 12: Zen Browser extension and Firefox distribution
-- [ ] Milestone 13: Discord user-install app
-- [ ] Milestone 14: iOS and iPadOS system speech app
-- [ ] Milestone 15: Centralized accessible feedback and bug reporting
+- [ ] Milestone 7: `speak-to-user-dev` coordinator adoption and distribution
+- [ ] Milestone 8: Agent-skills slate planning
+- [ ] Milestone 9: Codex and Claude plugin distribution for skills and MCPs
+- [ ] Milestone 10: Codex and Claude subagent configuration management
+- [ ] Milestone 11: MCP Apps for the MCP services
+- [ ] Milestone 12: XcodeKit extension and Xcode build plugins
+- [ ] Milestone 13: Zed extension
+- [ ] Milestone 14: Zen Browser extension and Firefox distribution
+- [ ] Milestone 15: Discord user-install app
+- [ ] Milestone 16: iOS and iPadOS system speech app
+- [ ] Milestone 17: Centralized accessible feedback and bug reporting
 
 ## Milestone 0: Umbrella docs and workspace operating model
 
@@ -42,6 +44,7 @@ Scope:
 Tickets:
 
 - [x] Document the current `apps/` and `packages/` submodules.
+- [x] Document `mcps/` as the home for vendored MCP service repositories and keep `apps/` for interactive app surfaces and service hosts.
 - [x] Clarify that top-level setup is just submodule initialization today.
 - [x] Add a checklist-style umbrella roadmap for future distribution work.
 - [x] Keep implementation-specific build and run steps delegated to the relevant submodule repositories.
@@ -153,7 +156,24 @@ Exit criteria:
 
 - [ ] The umbrella roadmap covers package-distribution plans for both Python services.
 
-## Milestone 7: Agent-skills slate planning
+## Milestone 7: `speak-to-user-dev` coordinator adoption and distribution
+
+Scope:
+
+- [ ] Adopt the `speak-to-user-dev` coordinator as the vendored MCP-service home for serialized workspace development chores.
+- [ ] Keep the distinction explicit between the raw coordinator service under `mcps/` and future interactive app surfaces that may sit above it under `apps/`.
+
+Tickets:
+
+- [ ] Keep `mcps/speak-to-user-dev` pinned as the umbrella submodule path for the standalone coordinator repository.
+- [ ] Document which local-dev chores should eventually flow through the coordinator first, including heavy e2e runs, docs sweeps, and submodule pin orchestration.
+- [ ] Define the release and pin-bump expectations for `mcps/speak-to-user-dev` inside the umbrella repo.
+
+Exit criteria:
+
+- [ ] The umbrella repo treats `mcps/speak-to-user-dev` as a first-class vendored MCP-service component with clear ownership boundaries.
+
+## Milestone 8: Agent-skills slate planning
 
 Scope:
 
@@ -170,7 +190,7 @@ Exit criteria:
 
 - [ ] The workspace has an explicit skills slate instead of scattered future ideas.
 
-## Milestone 8: Codex and Claude plugin distribution for skills and MCPs
+## Milestone 9: Codex and Claude plugin distribution for skills and MCPs
 
 Scope:
 
@@ -187,7 +207,24 @@ Exit criteria:
 
 - [ ] The workspace has a documented plugin-distribution plan for Codex and Claude surfaces.
 
-## Milestone 9: MCP Apps for the MCP services
+## Milestone 10: Codex and Claude subagent configuration management
+
+Scope:
+
+- [ ] Plan how Codex agent roles and Claude Code subagents should be configured around the workspace MCP and skills surfaces.
+- [ ] Keep agent-config planning grounded in real operator workflows instead of creating redundant prompt layers.
+
+Tickets:
+
+- [ ] Define the first Codex agent-role distribution targets for workspace coordination work.
+- [ ] Define the first Claude Code subagent targets for queue-aware workspace workflows.
+- [ ] Document how those agent and subagent configs should reuse the same underlying skills and MCP tools without duplicating product logic.
+
+Exit criteria:
+
+- [ ] The workspace has an explicit agent and subagent configuration plan for Codex and Claude Code.
+
+## Milestone 11: MCP Apps for the MCP services
 
 Scope:
 
@@ -204,7 +241,7 @@ Exit criteria:
 
 - [ ] The workspace has an explicit MCP Apps plan instead of treating UI surfaces as an afterthought.
 
-## Milestone 10: XcodeKit extension and Xcode build plugins
+## Milestone 12: XcodeKit extension and Xcode build plugins
 
 Scope:
 
@@ -221,7 +258,7 @@ Exit criteria:
 
 - [ ] The workspace has a concrete Xcode extension and build-plugin plan with a defined Swift-source normalization track.
 
-## Milestone 11: Zed extension
+## Milestone 13: Zed extension
 
 Scope:
 
@@ -238,7 +275,7 @@ Exit criteria:
 
 - [ ] The workspace has a documented Zed-extension plan.
 
-## Milestone 12: Zen Browser extension and Firefox distribution
+## Milestone 14: Zen Browser extension and Firefox distribution
 
 Scope:
 
@@ -255,7 +292,7 @@ Exit criteria:
 
 - [ ] The workspace has a documented browser-extension and Firefox-distribution plan with a web-mode normalization track.
 
-## Milestone 13: Discord user-install app
+## Milestone 15: Discord user-install app
 
 Scope:
 
@@ -272,7 +309,7 @@ Exit criteria:
 
 - [ ] The workspace has a concrete Discord user-install app plan.
 
-## Milestone 14: iOS and iPadOS system speech app
+## Milestone 16: iOS and iPadOS system speech app
 
 Scope:
 
@@ -289,7 +326,7 @@ Exit criteria:
 
 - [ ] The workspace has a concrete mobile-system-speech plan instead of a vague future app idea.
 
-## Milestone 15: Centralized accessible feedback and bug reporting
+## Milestone 17: Centralized accessible feedback and bug reporting
 
 Scope:
 
