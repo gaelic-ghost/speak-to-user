@@ -24,10 +24,11 @@ Today the workspace is intentionally small:
 
 - `packages/SpeakSwiftly` is the pinned speech runtime package submodule.
 - `packages/SpeakSwiftlyMCP` is the pinned Swift-native MCP host package submodule.
+- `apps/SayBar` is the pinned macOS menu bar app submodule.
 - `apps/speak-to-user-mcp` is the pinned Python MCP host submodule.
 - `apps/speak-to-user-server` is the pinned Python HTTP host submodule.
 
-The roadmap also tracks planned sibling or future workspace additions that are not yet vendored here, including `SayBar`, Swift-native server and MCP packages, editor integrations, browser surfaces, plugin distribution, and broader app distribution work.
+The roadmap also tracks planned sibling or future workspace additions that are not yet vendored here, including the Swift-native server package, editor integrations, browser surfaces, plugin distribution, and broader app distribution work.
 
 ## Setup
 
@@ -39,9 +40,10 @@ git submodule update --init --recursive
 
 That is the only required top-level setup command today. Each submodule keeps its own setup and verification instructions in its own repository documentation:
 
-- [`packages/SpeakSwiftly/README.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/packages/SpeakSwiftly/README.md)
-- [`apps/speak-to-user-mcp/README.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/apps/speak-to-user-mcp/README.md)
-- [`apps/speak-to-user-server/README.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/apps/speak-to-user-server/README.md)
+- [`packages/SpeakSwiftly/README.md`](packages/SpeakSwiftly/README.md)
+- [`apps/SayBar/README.md`](apps/SayBar/README.md)
+- [`apps/speak-to-user-mcp/README.md`](apps/speak-to-user-mcp/README.md)
+- [`apps/speak-to-user-server/README.md`](apps/speak-to-user-server/README.md)
 
 ## Usage
 
@@ -69,6 +71,8 @@ Current pinned workspace components:
   - Swift package submodule for the speech runtime and typed `SpeakSwiftlyCore` library surface
 - `packages/SpeakSwiftlyMCP`
   - Swift package submodule for the Swift-native MCP host track
+- `apps/SayBar`
+  - macOS `MenuBarExtra` app submodule pinned to the standalone SayBar repository for app-level UI, settings, and service supervision work
 - `apps/speak-to-user-mcp`
   - Python FastMCP host submodule for spoken replies and local MCP access
 - `apps/speak-to-user-server`
@@ -76,8 +80,6 @@ Current pinned workspace components:
 
 Planned or sibling components that the umbrella roadmap also tracks:
 
-- `SayBar`
-  - the macOS menu bar app intended to supervise local speech services
 - `SpeakSwiftlyMCP`
   - the Swift-native MCP-host package sibling to the current Python MCP server
 - `SpeakSwiftlyServer`
@@ -92,8 +94,9 @@ Treat this repository as the integration and planning layer, not as the source o
 - Keep umbrella docs explicit about what is already vendored here versus what is still a sibling repository or planned future addition.
 - Do not let umbrella documentation imply that a planned distribution surface already exists when it is only a roadmap item.
 - Keep implementation-specific setup, build, and test instructions in the relevant submodule repositories.
+- Prefer bumping `apps/SayBar` to tagged standalone SayBar releases instead of arbitrary branch tips.
 
-The umbrella roadmap in [`ROADMAP.md`](/Users/galew/Workspace/speak-to-user-wt-docs-distribution/ROADMAP.md) tracks both current integration work and the larger slate of future distribution surfaces, including package distribution, apps, plugins, extensions, MCP Apps, and feedback tooling.
+The umbrella roadmap in [`ROADMAP.md`](ROADMAP.md) tracks both current integration work and the larger slate of future distribution surfaces, including package distribution, apps, plugins, extensions, MCP Apps, and feedback tooling.
 
 ## Verification
 

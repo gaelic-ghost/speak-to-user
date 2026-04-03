@@ -26,6 +26,7 @@
   - sibling repositories that are part of the broader workspace but not vendored here yet
   - future roadmap items that do not exist as repositories or products yet
 - Treat the umbrella `ROADMAP.md` as the home for cross-repository milestones such as distribution tracks, app adoption, plugin surfaces, extensions, and feedback systems.
+- Now that `apps/SayBar` is vendored here, describe it as a current app submodule and keep deeper app implementation guidance in the standalone SayBar repository.
 
 ## Submodules
 
@@ -33,3 +34,4 @@
 - Keep submodule pointer updates narrowly scoped and verify the exact target tag or commit before opening a pull request.
 - Do not edit code or docs inside a submodule from an umbrella-docs branch unless Gale explicitly asks for that submodule work too.
 - When a docs-only umbrella branch needs submodules present for context, initialize them in the worktree but leave their pointers unchanged unless the branch is specifically about a submodule bump.
+- For `apps/SayBar`, prefer pinning the submodule to tagged standalone SayBar releases and keep the standalone SayBar repository as the source of truth for app development and release notes.
