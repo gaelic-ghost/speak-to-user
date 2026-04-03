@@ -10,3 +10,6 @@
 [submodule "packages/SpeakSwiftlyMCP"]
 	path = packages/SpeakSwiftlyMCP
 	url = https://github.com/gaelic-ghost/SpeakSwiftlyMCP.git
+[submodule "packages/SpeakSwiftlyServer"]
+	path = packages/SpeakSwiftlyServer
+	url = https://github.com/gaelic-ghost/SpeakSwiftlyServer.git
