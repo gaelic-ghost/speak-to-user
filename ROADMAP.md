@@ -18,7 +18,7 @@
 - [ ] Milestone 1: `SpeakSwiftly` Swift package distribution
 - [ ] Milestone 2: `SpeakSwiftlyMCP` Swift package distribution
 - [ ] Milestone 3: `SpeakSwiftlyServer` Swift package distribution
-- [ ] Milestone 4: Bring `SayBar` into the umbrella workspace
+- [x] Milestone 4: Bring `SayBar` into the umbrella workspace
 - [ ] Milestone 5: macOS distribution for `SayBar.app`
 - [ ] Milestone 6: Python package distribution for `speak-to-user-mcp` and `speak-to-user-server`
 - [ ] Milestone 7: `speak-to-user-dev` coordinator adoption and distribution
@@ -109,18 +109,19 @@ Exit criteria:
 
 Scope:
 
-- [ ] Add the `SayBar` app to the umbrella-repo planning and integration model.
-- [ ] Decide whether `SayBar` should become a submodule, a vendored app project, or stay a sibling repository with explicit coordination rules.
+- [x] Add the `SayBar` app to the umbrella-repo planning and integration model.
+- [x] Adopt `SayBar` as an `apps/` submodule pinned to a standalone release tag.
 
 Tickets:
 
-- [ ] Document the intended relationship between `SayBar` and the current `apps/` submodules.
-- [ ] Decide where `SayBar` should live relative to the umbrella repo before broader app distribution work begins.
+- [x] Document the intended relationship between `SayBar` and the current `apps/` submodules.
+- [x] Pin `apps/SayBar` to the standalone `SayBar` `v0.0.2` release tag.
+- [x] Clarify that the standalone SayBar repository remains the source of truth for app implementation and release notes.
 - [ ] Define the first integration checkpoints for speech-server supervision, profile visibility, and queue visibility.
 
 Exit criteria:
 
-- [ ] The workspace has an explicit plan for how `SayBar` joins the umbrella repository story.
+- [x] The workspace has an explicit and implemented plan for how `SayBar` joins the umbrella repository story.
 
 ## Milestone 5: macOS distribution for `SayBar.app`
 
