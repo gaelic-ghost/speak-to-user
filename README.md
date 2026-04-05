@@ -1,6 +1,6 @@
 # speak-to-user
 
-Umbrella repository for Gale's local-first speech tooling workspace across reusable runtime packages, local HTTP and MCP hosts, skills, app integrations, and future distribution surfaces.
+Umbrella repository for Gale's local-first speech tooling workspace across reusable runtime packages, local HTTP and MCP hosts, apps, integrations, and future distribution surfaces.
 
 ## Table of Contents
 
@@ -18,18 +18,19 @@ This repository is the integration and planning home for the broader `speak-to-u
 
 ### Motivation
 
-The goal is to keep the accessibility stack coherent without forcing every integration decision into one codebase too early. `SpeakSwiftly` can stay independently versioned as the speech runtime, the current Python hosts can keep shipping while Swift-native siblings evolve, and the umbrella repository can track how those pieces are intended to fit together over time.
+The goal is to keep the accessibility stack coherent without forcing every integration decision into one codebase too early. `SpeakSwiftly` can stay independently versioned as the speech runtime, both the Python and Swift-native host tracks can evolve in parallel, and the umbrella repository can track how those pieces are intended to fit together over time.
 
 Today the workspace is intentionally small:
 
 - `packages/SpeakSwiftly` is the pinned speech runtime package submodule.
 - `packages/SpeakSwiftlyMCP` is the pinned Swift-native MCP host package submodule.
+- `packages/SpeakSwiftlyServer` is the pinned Swift-native shared HTTP-and-MCP host package submodule.
 - `apps/SayBar` is the pinned macOS menu bar app submodule.
 - `mcps/speak-to-user-dev` is the pinned FastMCP coordinator submodule for serialized local dev chores across the workspace.
 - `apps/speak-to-user-mcp` is the pinned Python MCP host submodule.
 - `apps/speak-to-user-server` is the pinned Python HTTP host submodule.
 
-The roadmap also tracks planned sibling or future workspace additions that are not yet vendored here, including the Swift-native server package, editor integrations, browser surfaces, plugin distribution, and broader app distribution work.
+The roadmap also tracks planned sibling or future workspace additions that are not yet vendored here, including editor integrations, browser surfaces, plugin distribution, and broader app distribution work.
 
 ## Setup
 
@@ -41,11 +42,13 @@ git submodule update --init --recursive
 
 That is the only required top-level setup command today. Each submodule keeps its own setup and verification instructions in its own repository documentation:
 
-- [`apps/SayBar/README.md`](apps/SayBar/README.md)
-- [`mcps/speak-to-user-dev/README.md`](mcps/speak-to-user-dev/README.md)
-- [`packages/SpeakSwiftly/README.md`](packages/SpeakSwiftly/README.md)
-- [`apps/speak-to-user-mcp/README.md`](apps/speak-to-user-mcp/README.md)
-- [`apps/speak-to-user-server/README.md`](apps/speak-to-user-server/README.md)
+- [`SayBar`](https://github.com/gaelic-ghost/SayBar)
+- [`speak-to-user-dev`](https://github.com/gaelic-ghost/speak-to-user-dev)
+- [`SpeakSwiftly`](https://github.com/gaelic-ghost/SpeakSwiftly)
+- [`SpeakSwiftlyMCP`](https://github.com/gaelic-ghost/SpeakSwiftlyMCP)
+- [`SpeakSwiftlyServer`](https://github.com/gaelic-ghost/SpeakSwiftlyServer)
+- [`speak-to-user-mcp`](https://github.com/gaelic-ghost/speak-to-user-mcp)
+- [`speak-to-user-server`](https://github.com/gaelic-ghost/speak-to-user-server)
 
 ## Usage
 
@@ -74,6 +77,8 @@ Current pinned workspace components:
   - Swift package submodule for the speech runtime and typed `SpeakSwiftlyCore` library surface
 - `packages/SpeakSwiftlyMCP`
   - Swift package submodule for the Swift-native MCP host track
+- `packages/SpeakSwiftlyServer`
+  - Swift package submodule for the Swift-native shared HTTP-and-MCP host track
 - `apps/SayBar`
   - macOS `MenuBarExtra` app submodule pinned to the standalone SayBar repository for app-level UI, settings, and service supervision work
 - `mcps/speak-to-user-dev`
@@ -89,8 +94,6 @@ Planned or sibling components that the umbrella roadmap also tracks:
   - interactive app UIs that may sit on top of the vendored MCP services while still living under `apps/`
 - `SpeakSwiftlyMCP`
   - the Swift-native MCP-host package sibling to the current Python MCP server
-- `SpeakSwiftlyServer`
-  - the Swift-native localhost HTTP server sibling to the current Python HTTP server
 
 ## Development
 
@@ -104,7 +107,7 @@ Treat this repository as the integration and planning layer, not as the source o
 - Keep implementation-specific setup, build, and test instructions in the relevant submodule repositories.
 - Prefer bumping `apps/SayBar` to tagged standalone SayBar releases instead of arbitrary branch tips.
 
-The umbrella roadmap in [`ROADMAP.md`](ROADMAP.md) tracks both current integration work and the larger slate of future distribution surfaces, including package distribution, apps, plugins, extensions, MCP Apps, and feedback tooling.
+The umbrella roadmap in [`ROADMAP.md`](https://github.com/gaelic-ghost/speak-to-user/blob/main/ROADMAP.md) tracks both current integration work and the larger slate of future distribution surfaces, including package distribution, apps, plugins, extensions, MCP Apps, and feedback tooling.
 
 ## Verification
 
@@ -119,4 +122,4 @@ This repository does not currently define a single top-level build, test, or lin
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0. See [LICENSE](https://github.com/gaelic-ghost/speak-to-user/blob/main/LICENSE) and [NOTICE](https://github.com/gaelic-ghost/speak-to-user/blob/main/NOTICE).
